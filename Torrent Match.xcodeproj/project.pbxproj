@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		119CD2762FC1516F00B5D3EE /* TorrentMatcherCore in Frameworks */ = {isa = PBXBuildFile; productRef = 119CD2752FC1516F00B5D3EE /* TorrentMatcherCore */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXContainerItemProxy section */
 		11E0FCB92FBA9FFF009D7D1C /* PBXContainerItemProxy */ = {
 			isa = PBXContainerItemProxy;
@@ -65,6 +69,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				119CD2762FC1516F00B5D3EE /* TorrentMatcherCore in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -85,12 +90,20 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
+		119CD2742FC1516F00B5D3EE /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
 		11E0FC9E2FBA9FFD009D7D1C = {
 			isa = PBXGroup;
 			children = (
 				11E0FCA92FBA9FFD009D7D1C /* Torrent Match */,
 				11E0FCBB2FBA9FFF009D7D1C /* Torrent MatchTests */,
 				11E0FCC52FBA9FFF009D7D1C /* Torrent MatchUITests */,
+				119CD2742FC1516F00B5D3EE /* Frameworks */,
 				11E0FCA82FBA9FFD009D7D1C /* Products */,
 			);
 			sourceTree = "<group>";
@@ -125,6 +138,7 @@
 			);
 			name = "Torrent Match";
 			packageProductDependencies = (
+				119CD2752FC1516F00B5D3EE /* TorrentMatcherCore */,
 			);
 			productName = "Torrent Match";
 			productReference = 11E0FCA72FBA9FFD009D7D1C /* Torrent Match.app */;
@@ -208,6 +222,9 @@
 			);
 			mainGroup = 11E0FC9E2FBA9FFD009D7D1C;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				119CD2732FC1506200B5D3EE /* XCLocalSwiftPackageReference "TorrentMatcherCore" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 11E0FCA82FBA9FFD009D7D1C /* Products */;
 			projectDirPath = "";
@@ -630,6 +647,21 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCLocalSwiftPackageReference section */
+		119CD2732FC1506200B5D3EE /* XCLocalSwiftPackageReference "TorrentMatcherCore" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = TorrentMatcherCore;
+		};
+/* End XCLocalSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		119CD2752FC1516F00B5D3EE /* TorrentMatcherCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 119CD2732FC1506200B5D3EE /* XCLocalSwiftPackageReference "TorrentMatcherCore" */;
+			productName = TorrentMatcherCore;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 11E0FC9F2FBA9FFD009D7D1C /* Project object */;
 }
