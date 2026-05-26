@@ -78,7 +78,8 @@ public enum AudioCodec: String, Codable, Sendable {
 public enum ChannelLayout: String, Codable, Sendable {
     case sevenOne = "7.1"
     case fiveOne = "5.1"
-    case twoOrUnknown = "2.0_unknown"
+    case twoZero = "2.0"
+    case unknown
 }
 
 public struct ParsedRelease: Hashable, Codable, Sendable {

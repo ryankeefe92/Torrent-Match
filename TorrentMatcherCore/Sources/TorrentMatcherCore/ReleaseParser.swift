@@ -75,12 +75,14 @@ public enum ReleaseParser {
         }
 
         let channels: ChannelLayout
-        if upper.contains("7.1") {
+        if matches(#"(^|[^A-Z0-9])(7[\.\s]?1|8CH|8 CH)([^A-Z0-9]|$)"#, in: upper) {
             channels = .sevenOne
-        } else if upper.contains("5.1") {
+        } else if matches(#"(^|[^A-Z0-9])(5[\.\s]?1|6CH|6 CH)([^A-Z0-9]|$)"#, in: upper) {
             channels = .fiveOne
+        } else if matches(#"(^|[^A-Z0-9])(2[\.\s]?0|2CH|2 CH|STEREO)([^A-Z0-9]|$)"#, in: upper) {
+            channels = .twoZero
         } else {
-            channels = .twoOrUnknown
+            channels = .unknown
         }
 
         let atmos = upper.contains("ATMOS")
@@ -99,5 +101,9 @@ public enum ReleaseParser {
     private static func containsToken(_ token: String, in text: String) -> Bool {
         let pattern = "(^|[^A-Z0-9])" + NSRegularExpression.escapedPattern(for: token) + "([^A-Z0-9]|$)"
         return text.range(of: pattern, options: .regularExpression) != nil
+    }
+
+    private static func matches(_ pattern: String, in text: String) -> Bool {
+        text.range(of: pattern, options: .regularExpression) != nil
     }
 }

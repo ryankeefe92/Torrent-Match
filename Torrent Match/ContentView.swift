@@ -200,7 +200,8 @@ enum ParserRankerAdapter {
         switch c {
         case .sevenOne: return "7.1"
         case .fiveOne: return "5.1"
-        case .twoOrUnknown: return nil
+        case .twoZero: return "2.0"
+        case .unknown: return nil
         }
     }
 

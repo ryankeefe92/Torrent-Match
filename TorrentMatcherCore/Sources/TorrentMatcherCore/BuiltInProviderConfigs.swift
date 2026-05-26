@@ -29,8 +29,23 @@ public enum BuiltInProviderConfigs {
         detailBaseURL: "https://thepiratebay.org"
     )
 
+    public static let torrentGalaxy = ProviderConfig(
+        id: "torrentgalaxy",
+        name: "TorrentGalaxy",
+        enabled: true,
+        searchURLTemplate: "https://torrentgalaxy.one/get-posts/keywords:{{query}}",
+        resultBlockPattern: "(<div class=\\\"tgxtablerow txlight\\\"[\\s\\S]*?)(?=<div class=\\\"tgxtablerow txlight\\\"|<script src=\\\"/static/tgx/js/added-date.js\\\"|$)",
+        titlePattern: "<a[^>]+class=\\\"txlight\\\"[^>]+title=\\\"([^\\\"]+)\\\"[^>]+href=\\\"/post-detail/[^\\\"]+/\\\"",
+        detailURLPattern: "<a[^>]+href=\\\"(/post-detail/[^\\\"]+/)\\\"",
+        magnetPattern: "href=\\\"(magnet:\\?[^\\\"]+)\\\"",
+        seedersPattern: "Seeders/Leechers\\\">\\[<font color=\\\"green\\\">\\s*<b>(\\d+)</b>",
+        leechersPattern: "</font>/<font color=\\\"#ff0000\\\"><b>(\\d+)</b></font>",
+        detailBaseURL: "https://torrentgalaxy.one"
+    )
+
     public static let `default`: [ProviderConfig] = [
         x1337,
-        pirateBay
+        pirateBay,
+        torrentGalaxy
     ]
 }

@@ -15,7 +15,7 @@ public struct RankerWeights: Codable, Hashable, Sendable {
         resolution: [.p2160: 100, .p1080: 92, .p720: 50, .sd: 30, .unknown: 10],
         dynamicRange: [.dolbyVision: 30, .hdr10plus: 27, .hdr10: 24, .hdr: 20, .unknown: 12, .sdr: -5],
         audioCodec: [.truehd: 42, .dtsHDMA: 36, .ddp: 32, .dd: 18, .aac: 6, .unknown: 0],
-        channels: [.sevenOne: 32, .fiveOne: 24, .twoOrUnknown: 0],
+        channels: [.sevenOne: 32, .fiveOne: 24, .twoZero: 0, .unknown: 0],
         videoCodec: [.hevc: 20, .avc: 10, .unknown: 0],
         ddpAtmosBonus: 6,
         trueHDAtmosBonus: 0
