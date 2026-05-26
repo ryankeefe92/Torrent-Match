@@ -64,7 +64,11 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw ProviderError.badStatus(provider: config.name, status: http.statusCode)
         }
-        return String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+        let html = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+        if html.contains("cf-mitigated") || html.contains("Just a moment...") || html.contains("challenges.cloudflare.com") {
+            throw ProviderError.accessBlocked(provider: config.name, reason: "Cloudflare challenge")
+        }
+        return html
     }
 
     private func extractDetailURL(from block: String) -> URL? {

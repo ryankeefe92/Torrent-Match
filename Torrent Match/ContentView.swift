@@ -10,12 +10,15 @@ import SwiftData
 import TorrentMatcherCore
 
 struct ContentView: View {
+    private let searchService = TorrentSearchService(configs: BuiltInProviderConfigs.default)
+
     // MARK: - Search / Results State
     @State private var query: String = ""
     @State private var isSearching: Bool = false
     @State private var results: [SearchResult] = []
     @State private var errorMessage: String? = nil
     @State private var selected: SearchResult? = nil
+    @State private var magnetMessage: String? = nil
 
     var sortedResults: [SearchResult] {
         results.sorted { $0.score > $1.score }
@@ -48,12 +51,19 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("Search")
+            .alert("Selected Magnet", isPresented: magnetAlertIsPresented) {
+                Button("OK") {
+                    magnetMessage = nil
+                }
+            } message: {
+                Text(magnetMessage ?? "")
+            }
             .toolbar {
                 #if os(iOS)
                 ToolbarItem(placement: .bottomBar) {
                     HStack {
                         Button {
-                            // TODO: Hook up to Transmission client using `selected`
+                            magnetMessage = selected?.magnet ?? "No magnet is available for the selected result."
                         } label: {
                             Text("Send to Transmission")
                         }
@@ -64,7 +74,7 @@ struct ContentView: View {
                 #elseif os(macOS)
                 ToolbarItem(placement: .primaryAction) {
                     Button {
-                        // TODO: Hook up to Transmission client using `selected`
+                        magnetMessage = selected?.magnet ?? "No magnet is available for the selected result."
                     } label: {
                         Text("Send to Transmission")
                     }
@@ -74,7 +84,7 @@ struct ContentView: View {
                 #else
                 ToolbarItem(placement: .automatic) {
                     Button {
-                        // TODO: Hook up to Transmission client using `selected`
+                        magnetMessage = selected?.magnet ?? "No magnet is available for the selected result."
                     } label: {
                         Text("Send to Transmission")
                     }
@@ -89,6 +99,17 @@ struct ContentView: View {
         }
     }
 
+    private var magnetAlertIsPresented: Binding<Bool> {
+        Binding(
+            get: { magnetMessage != nil },
+            set: { isPresented in
+                if !isPresented {
+                    magnetMessage = nil
+                }
+            }
+        )
+    }
+
     // MARK: - Actions
     private func performSearch() {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -101,23 +122,10 @@ struct ContentView: View {
         results = []
 
         Task { @MainActor in
-            do {
-                try await Task.sleep(nanoseconds: 400_000_000)
-                let names = SampleGenerator.makeSamples(for: trimmed)
-                let mapped: [SearchResult] = names.map { name in
-                    let (meta, score) = ParserRankerAdapter.parseAndScore(releaseName: name)
-                    return SearchResult(title: name,
-                                        source: meta.source,
-                                        resolution: meta.resolution,
-                                        dynamicRange: meta.dynamicRange,
-                                        audio: meta.audio,
-                                        channels: meta.channels,
-                                        seeders: nil,
-                                        score: score)
-                }
-                results = mapped
-            } catch {
-                errorMessage = "Search failed. Please try again."
+            let report = await searchService.searchAndRankReport(trimmed)
+            results = report.results.map(SearchResult.init)
+            if results.isEmpty, let failure = report.failures.first {
+                errorMessage = "\(failure.providerName) search is currently blocked. \(failure.message)"
             }
             isSearching = false
         }
@@ -126,30 +134,30 @@ struct ContentView: View {
 
 // MARK: - Models
 struct SearchResult: Identifiable, Hashable {
-    let id = UUID()
+    let id: UUID
     let title: String
     let source: String
     let resolution: String
     let dynamicRange: String
     let audio: String
-    let channels: String?
     let seeders: Int?
+    let leechers: Int?
+    let magnet: String?
+    let detailURL: URL?
     let score: Int
-}
 
-// MARK: - Sample Generation (no providers yet)
-enum SampleGenerator {
-    static func makeSamples(for query: String) -> [String] {
-        // Generate plausible release names derived from the query
-        // Keep it deterministic for now
-        let base = query.replacingOccurrences(of: " ", with: ".")
-        return [
-            "\(base).2023.UHD.2160p.REMUX.HEVC.TrueHD.Atmos.Dolby.Vision",
-            "\(base).2023.2160p.WEB-DL.HEVC.DDP.Atmos.HDR10",
-            "\(base).2023.1080p.BluRay.AVC.DTS-HD.MA.SDR",
-            "\(base).2023.1080p.WEBRip.x264.AAC.HDR",
-            "\(base).2023.720p.WEBRip.x264.AAC.SDR"
-        ]
+    init(ranked: RankedTorrentResult) {
+        id = ranked.id
+        title = ranked.raw.title
+        source = ranked.parsed.sourceType.rawValue.capitalized
+        resolution = ranked.parsed.resolution.rawValue
+        dynamicRange = ParserRankerAdapter.displayName(for: ranked.parsed.dynamicRange)
+        audio = ParserRankerAdapter.audioSummary(codec: ranked.parsed.audioCodec, channels: ranked.parsed.channels, atmos: ranked.parsed.atmos)
+        seeders = ranked.raw.seeders
+        leechers = ranked.raw.leechers
+        magnet = ranked.raw.magnet
+        detailURL = ranked.raw.detailURL
+        score = ranked.score
     }
 }
 
@@ -188,7 +196,7 @@ enum ParserRankerAdapter {
         return (meta, ranked.score)
     }
 
-    private static func channelsString(_ c: ChannelLayout) -> String? {
+    static func channelsString(_ c: ChannelLayout) -> String? {
         switch c {
         case .sevenOne: return "7.1"
         case .fiveOne: return "5.1"
@@ -196,7 +204,7 @@ enum ParserRankerAdapter {
         }
     }
 
-    private static func displayName(for dr: DynamicRange) -> String {
+    static func displayName(for dr: DynamicRange) -> String {
         switch dr {
         case .dolbyVision: return "Dolby Vision"
         case .hdr10plus: return "HDR10+"
@@ -207,7 +215,7 @@ enum ParserRankerAdapter {
         }
     }
 
-    private static func displayName(for ac: AudioCodec, atmos: Bool) -> String {
+    static func displayName(for ac: AudioCodec, atmos: Bool) -> String {
         let base: String
         switch ac {
         case .truehd: base = "TrueHD"
@@ -219,6 +227,14 @@ enum ParserRankerAdapter {
         }
         if atmos { return base + " Atmos" } else { return base }
     }
+
+    static func audioSummary(codec: AudioCodec, channels: ChannelLayout, atmos: Bool) -> String {
+        let audio = displayName(for: codec, atmos: atmos)
+        if let channelText = channelsString(channels) {
+            return "\(audio) \(channelText)"
+        }
+        return audio
+    }
 }
 
 // MARK: - Views
@@ -228,9 +244,23 @@ private struct SearchBar: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            TextField("Search movies or shows", text: $query)
-                .textFieldStyle(.roundedBorder)
-                .onSubmit(onSubmit)
+            ZStack(alignment: .trailing) {
+                TextField("Search movies or shows", text: $query)
+                    .textFieldStyle(.roundedBorder)
+                    .padding(.trailing, query.isEmpty ? 0 : 28)
+                    .onSubmit(onSubmit)
+
+                if !query.isEmpty {
+                    Button {
+                        query = ""
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.trailing, 10)
+                }
+            }
             Button(action: onSubmit) {
                 Label("Search", systemImage: "magnifyingglass")
             }
@@ -430,7 +460,16 @@ private struct ResultRow: View {
                         MetaChip(text: result.resolution, systemImage: "rectangle.3.group")
                         MetaChip(text: result.dynamicRange, systemImage: "circle.lefthalf.filled")
                         MetaChip(text: result.audio, systemImage: "speaker.wave.2")
-                        if let ch = result.channels { MetaChip(text: ch, systemImage: "dot.radiowaves.left.and.right") }
+                    }
+                    if result.seeders != nil || result.leechers != nil {
+                        HStack(spacing: 12) {
+                            if let seeders = result.seeders {
+                                MetaChip(text: "\(seeders)", systemImage: "arrow.up.circle")
+                            }
+                            if let leechers = result.leechers {
+                                MetaChip(text: "\(leechers)", systemImage: "arrow.down.circle")
+                            }
+                        }
                     }
                 }
             }
@@ -477,19 +516,6 @@ private extension UIApplication {
 }
 // Helper to preview ContentView with seeded results on macOS
 private struct ContentView_PreviewWrapper: View {
-    @State private var query: String = "Movie X"
-    @State private var results: [SearchResult] = SampleGenerator.makeSamples(for: "Movie X").map { name in
-        let (meta, score) = ParserRankerAdapter.parseAndScore(releaseName: name)
-        return SearchResult(title: name,
-                            source: meta.source,
-                            resolution: meta.resolution,
-                            dynamicRange: meta.dynamicRange,
-                            audio: meta.audio,
-                            channels: meta.channels,
-                            seeders: nil,
-                            score: score)
-    }
-
     var body: some View {
         ContentView()
             .onAppear { /* no-op; ContentView drives its own state */ }
@@ -501,4 +527,3 @@ private struct ContentView_PreviewWrapper: View {
     ContentView()
 #endif
 }
-

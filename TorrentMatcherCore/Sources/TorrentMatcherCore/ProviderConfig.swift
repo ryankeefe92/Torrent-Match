@@ -49,12 +49,14 @@ public enum ProviderError: Error, LocalizedError, Sendable {
     case missingURLTemplate(provider: String)
     case invalidURL(String)
     case badStatus(provider: String, status: Int)
+    case accessBlocked(provider: String, reason: String)
 
     public var errorDescription: String? {
         switch self {
         case .missingURLTemplate(let provider): return "Missing searchURLTemplate for provider: \(provider)"
         case .invalidURL(let url): return "Invalid URL: \(url)"
         case .badStatus(let provider, let status): return "Provider \(provider) returned HTTP status \(status)"
+        case .accessBlocked(let provider, let reason): return "Provider \(provider) blocked access: \(reason)"
         }
     }
 }
