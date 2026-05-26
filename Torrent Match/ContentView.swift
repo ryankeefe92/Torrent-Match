@@ -15,12 +15,10 @@ struct ContentView: View {
     @State private var isSearching: Bool = false
     @State private var results: [SearchResult] = []
     @State private var errorMessage: String? = nil
-    @State private var sortByScoreDescending: Bool = true
+    @State private var selected: SearchResult? = nil
 
     var sortedResults: [SearchResult] {
-        results.sorted { a, b in
-            sortByScoreDescending ? a.score > b.score : a.score < b.score
-        }
+        results.sorted { $0.score > $1.score }
     }
 
     var body: some View {
@@ -29,12 +27,7 @@ struct ContentView: View {
                 // Search Bar + Action
                 SearchBar(query: $query, onSubmit: performSearch)
                     .padding([.horizontal, .top])
-
-                // Toolbar-like controls row
-                ControlsBar(isSearching: isSearching,
-                            sortDescending: $sortByScoreDescending,
-                            onSearchTapped: performSearch)
-                    .padding(.horizontal)
+                    .padding(.bottom, 6)
 
                 Divider()
 
@@ -50,11 +43,46 @@ struct ContentView: View {
                         EmptyResultsView()
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else {
-                        ResultsListView(results: sortedResults)
+                        ResultsListView(results: sortedResults, selected: $selected)
                     }
                 }
             }
             .navigationTitle("Search")
+            .toolbar {
+                #if os(iOS)
+                ToolbarItem(placement: .bottomBar) {
+                    HStack {
+                        Button {
+                            // TODO: Hook up to Transmission client using `selected`
+                        } label: {
+                            Text("Send to Transmission")
+                        }
+                        .labelStyle(.titleOnly)
+                        .disabled(selected == nil)
+                    }
+                }
+                #elseif os(macOS)
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        // TODO: Hook up to Transmission client using `selected`
+                    } label: {
+                        Text("Send to Transmission")
+                    }
+                    .labelStyle(.titleOnly)
+                    .disabled(selected == nil)
+                }
+                #else
+                ToolbarItem(placement: .automatic) {
+                    Button {
+                        // TODO: Hook up to Transmission client using `selected`
+                    } label: {
+                        Text("Send to Transmission")
+                    }
+                    .labelStyle(.titleOnly)
+                    .disabled(selected == nil)
+                }
+                #endif
+            }
 #if os(macOS)
             .navigationSplitViewColumnWidth(min: 260, ideal: 320)
 #endif
@@ -65,6 +93,9 @@ struct ContentView: View {
     private func performSearch() {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !isSearching else { return }
+#if os(iOS)
+        UIApplication.shared.endEditing()
+#endif
         errorMessage = nil
         isSearching = true
         results = []
@@ -209,78 +240,6 @@ private struct SearchBar: View {
     }
 }
 
-private struct ControlsBar: View {
-    var isSearching: Bool
-    @Binding var sortDescending: Bool
-    var onSearchTapped: () -> Void
-
-    var body: some View {
-        HStack {
-            Button(action: onSearchTapped) {
-                Label(isSearching ? "Searching…" : "Search", systemImage: isSearching ? "hourglass" : "magnifyingglass")
-            }
-            .disabled(isSearching)
-
-            Spacer()
-
-            Button(action: { sortDescending.toggle() }) {
-                Label(sortDescending ? "Score: High → Low" : "Score: Low → High",
-                      systemImage: sortDescending ? "arrow.down" : "arrow.up")
-            }
-            .help("Toggle score sort order")
-        }
-        .padding(.vertical, 8)
-    }
-}
-
-private struct ResultsListView: View {
-    let results: [SearchResult]
-
-    var body: some View {
-        List(results) { result in
-            NavigationLink {
-                ResultDetailView(result: result)
-            } label: {
-                ResultRow(result: result)
-            }
-        }
-#if os(iOS) || os(watchOS) || os(tvOS)
-        .listStyle(.insetGrouped)
-#else
-        .listStyle(.automatic)
-#endif
-    }
-}
-
-private struct ResultRow: View {
-    let result: SearchResult
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            ScoreBadge(score: result.score)
-                .padding(.top, 2)
-            VStack(alignment: .leading, spacing: 6) {
-                Text(result.title)
-                    .font(.headline)
-                    .lineLimit(2)
-                HStack(spacing: 10) {
-                    MetaChip(text: result.source, systemImage: "film")
-                    MetaChip(text: result.resolution, systemImage: "rectangle.3.group")
-                    MetaChip(text: result.dynamicRange, systemImage: "circle.lefthalf.filled")
-                    MetaChip(text: result.audio, systemImage: "speaker.wave.2")
-                    if let ch = result.channels { MetaChip(text: ch, systemImage: "dot.radiowaves.left.and.right") }
-                }
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-            }
-            Spacer()
-        }
-        .contentShape(Rectangle())
-        .padding(.vertical, 6)
-    }
-}
-
 private struct MetaChip: View {
     let text: String
     let systemImage: String
@@ -289,6 +248,56 @@ private struct MetaChip: View {
         HStack(spacing: 4) {
             Image(systemName: systemImage)
             Text(text)
+        }
+        .lineLimit(1)
+        .font(.callout)
+        .foregroundStyle(.secondary)
+    }
+}
+
+private struct FlowLayout: Layout {
+    var spacing: CGFloat = 8
+    var lineSpacing: CGFloat = 4
+
+    init(spacing: CGFloat = 8, lineSpacing: CGFloat = 4) {
+        self.spacing = spacing
+        self.lineSpacing = lineSpacing
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        for sub in subviews {
+            let size = sub.sizeThatFits(.unspecified)
+            if x > 0 && x + size.width > maxWidth {
+                x = 0
+                y += rowHeight + lineSpacing
+                rowHeight = 0
+            }
+            rowHeight = max(rowHeight, size.height)
+            x += size.width + spacing
+        }
+        y += rowHeight
+        return CGSize(width: maxWidth.isFinite ? maxWidth : x, height: y)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let maxWidth = bounds.width
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        for sub in subviews {
+            let size = sub.sizeThatFits(.unspecified)
+            if x > 0 && x + size.width > maxWidth {
+                x = 0
+                y += rowHeight + lineSpacing
+                rowHeight = 0
+            }
+            sub.place(at: CGPoint(x: bounds.minX + x, y: bounds.minY + y), proposal: ProposedViewSize(width: size.width, height: size.height))
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
         }
     }
 }
@@ -300,9 +309,9 @@ private struct ScoreBadge: View {
         ZStack {
             Circle()
                 .fill(scoreColor)
-                .frame(width: 36, height: 36)
+                .frame(width: 44, height: 44)
             Text("\(score)")
-                .font(.subheadline.weight(.semibold))
+                .font(.headline.weight(.semibold))
                 .foregroundStyle(.white)
         }
         .accessibilityLabel("Score \(score)")
@@ -317,40 +326,9 @@ private struct ScoreBadge: View {
     }
 }
 
-private struct ResultDetailView: View {
-    let result: SearchResult
+// Removed ChipsFlow and HeightPreferenceKey structs as requested
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text(result.title)
-                .font(.title2.bold())
-            HStack(spacing: 12) {
-                Tag("Source", value: result.source)
-                Tag("Resolution", value: result.resolution)
-                Tag("Dynamic Range", value: result.dynamicRange)
-                Tag("Audio", value: result.audio)
-                Tag("Seeders", value: String(result.seeders ?? 0))
-                Tag("Score", value: String(result.score))
-            }
-            .font(.footnote)
-
-            Spacer()
-
-            HStack {
-                Spacer()
-                Button {
-                    // TODO: Hook up to Transmission client
-                } label: {
-                    Label("Send to Transmission", systemImage: "arrow.up.forward.app")
-                }
-                .buttonStyle(.borderedProminent)
-                Spacer()
-            }
-        }
-        .padding()
-        .navigationTitle("Result")
-    }
-}
+// Removed ResultDetailView struct as requested
 
 private struct Tag: View {
     let label: String
@@ -405,21 +383,88 @@ private struct EmptyResultsView: View {
     }
 }
 
+private struct ResultsListView: View {
+    let results: [SearchResult]
+    @Binding var selected: SearchResult?
+
+    var body: some View {
+        List(results) { result in
+            ResultRow(result: result) {
+                selected = result
+            }
+            .listRowBackground(selected?.id == result.id ? Color.accentColor.opacity(0.1) : Color.clear)
+        }
+        .listStyle(.plain)
+        .listRowInsets(EdgeInsets(top: 6, leading: 8, bottom: 6, trailing: 8))
+        .modifier(ContentMarginsZero())
+    }
+}
+
+private struct ContentMarginsZero: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 17.0, macOS 14.0, *) {
+            content.contentMargins(.all, 0)
+        } else {
+            content
+        }
+    }
+}
+
+private struct ResultRow: View {
+    let result: SearchResult
+    var onSelect: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(alignment: .top, spacing: 12) {
+                ScoreBadge(score: result.score)
+                    .padding(.top, 2)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(prettifiedTitle(result.title))
+                        .font(.headline)
+                        .lineLimit(2)
+                        .truncationMode(.tail)
+                        .allowsTightening(false)
+                    FlowLayout(spacing: 8, lineSpacing: 4) {
+                        MetaChip(text: result.source, systemImage: "film")
+                        MetaChip(text: result.resolution, systemImage: "rectangle.3.group")
+                        MetaChip(text: result.dynamicRange, systemImage: "circle.lefthalf.filled")
+                        MetaChip(text: result.audio, systemImage: "speaker.wave.2")
+                        if let ch = result.channels { MetaChip(text: ch, systemImage: "dot.radiowaves.left.and.right") }
+                    }
+                }
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { onSelect() }
+        .padding(.vertical, 4)
+    }
+    
+    private func prettifiedTitle(_ title: String) -> String {
+        var s = title.replacingOccurrences(of: ".", with: " ")
+        s = s.replacingOccurrences(of: "_", with: " ")
+        s = s.replacingOccurrences(of: "-", with: "-") // keep hyphen as a token but avoid mid-word joiners
+        // Collapse multiple spaces
+        let parts = s.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
+        return parts.joined(separator: " ")
+    }
+}
+
 fileprivate struct NavigationViewWrapper<Content: View>: View {
     let content: () -> Content
 
     var body: some View {
-#if os(macOS)
-        NavigationSplitView {
-            content()
-        } detail: {
-            Text("Select a result")
-        }
-#else
         content()
-#endif
     }
 }
+
+#if os(iOS)
+private extension UIApplication {
+    func endEditing() {
+        sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    }
+}
+#endif
 
 #Preview("macOS Wide Preview") {
 #if os(macOS)
@@ -449,5 +494,11 @@ private struct ContentView_PreviewWrapper: View {
         ContentView()
             .onAppear { /* no-op; ContentView drives its own state */ }
     }
+}
+
+#Preview("iOS Preview") {
+#if os(iOS)
+    ContentView()
+#endif
 }
 
