@@ -12,14 +12,51 @@ public final class PirateBayAPIProvider: TorrentProvider, @unchecked Sendable {
     public func search(_ query: String) async throws -> [TorrentSearchResult] {
         guard config.enabled else { return [] }
         let encodedQuery = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
-        let urlString = config.searchURLTemplate.replacingOccurrences(of: "{{query}}", with: encodedQuery)
+        let templates = [config.searchURLTemplate] + config.alternateSearchURLTemplates
+
+        let outcome = await withTaskGroup(of: Result<[TorrentSearchResult], Error>.self) { group in
+            for template in templates {
+                group.addTask {
+                    do {
+                        return .success(try await self.search(template: template, encodedQuery: encodedQuery))
+                    } catch {
+                        return .failure(error)
+                    }
+                }
+            }
+
+            var results: [TorrentSearchResult] = []
+            var firstError: Error?
+            for await categoryResult in group {
+                switch categoryResult {
+                case .success(let categoryResults):
+                    results.append(contentsOf: categoryResults)
+                case .failure(let error):
+                    if firstError == nil {
+                        firstError = error
+                    }
+                }
+            }
+
+            if results.isEmpty, let firstError {
+                return Result<[TorrentSearchResult], Error>.failure(firstError)
+            }
+            return Result<[TorrentSearchResult], Error>.success(results)
+        }
+
+        switch outcome {
+        case .success(let results):
+            return results
+        case .failure(let error):
+            throw error
+        }
+    }
+
+    private func search(template: String, encodedQuery: String) async throws -> [TorrentSearchResult] {
+        let urlString = template.replacingOccurrences(of: "{{query}}", with: encodedQuery)
         guard let url = URL(string: urlString) else { throw ProviderError.invalidURL(urlString) }
 
-        var request = URLRequest(url: url)
-        request.timeoutInterval = 20
-        request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
-
-        let (data, response) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: makeRequest(url: url))
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw ProviderError.badStatus(provider: config.name, status: http.statusCode)
         }
@@ -30,7 +67,7 @@ public final class PirateBayAPIProvider: TorrentProvider, @unchecked Sendable {
         }
 
         let results = try JSONDecoder().decode([PirateBayAPITorrent].self, from: data)
-        return results.compactMap { torrent in
+        return results.compactMap { torrent -> TorrentSearchResult? in
             guard let title = torrent.name?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !title.isEmpty,
                   torrent.id != "0" else {
@@ -53,6 +90,13 @@ public final class PirateBayAPIProvider: TorrentProvider, @unchecked Sendable {
                 provider: config.name
             )
         }
+    }
+
+    private func makeRequest(url: URL) -> URLRequest {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = TimeInterval(config.timeoutSeconds ?? 20)
+        request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+        return request
     }
 
     private func makeMagnet(infoHash: String) -> String {

@@ -19,6 +19,7 @@ struct ContentView: View {
     @State private var errorMessage: String? = nil
     @State private var selected: SearchResult? = nil
     @State private var magnetMessage: String? = nil
+    @State private var isResolvingMagnet: Bool = false
 
     var sortedResults: [SearchResult] {
         results.sorted { $0.score > $1.score }
@@ -63,33 +64,33 @@ struct ContentView: View {
                 ToolbarItem(placement: .bottomBar) {
                     HStack {
                         Button {
-                            magnetMessage = selected?.magnet ?? "No magnet is available for the selected result."
+                            sendSelectedToTransmission()
                         } label: {
-                            Text("Send to Transmission")
+                            Text(isResolvingMagnet ? "Fetching Magnet…" : "Send to Transmission")
                         }
                         .labelStyle(.titleOnly)
-                        .disabled(selected == nil)
+                        .disabled(selected == nil || isResolvingMagnet)
                     }
                 }
                 #elseif os(macOS)
                 ToolbarItem(placement: .primaryAction) {
                     Button {
-                        magnetMessage = selected?.magnet ?? "No magnet is available for the selected result."
+                        sendSelectedToTransmission()
                     } label: {
-                        Text("Send to Transmission")
+                        Text(isResolvingMagnet ? "Fetching Magnet…" : "Send to Transmission")
                     }
                     .labelStyle(.titleOnly)
-                    .disabled(selected == nil)
+                    .disabled(selected == nil || isResolvingMagnet)
                 }
                 #else
                 ToolbarItem(placement: .automatic) {
                     Button {
-                        magnetMessage = selected?.magnet ?? "No magnet is available for the selected result."
+                        sendSelectedToTransmission()
                     } label: {
-                        Text("Send to Transmission")
+                        Text(isResolvingMagnet ? "Fetching Magnet…" : "Send to Transmission")
                     }
                     .labelStyle(.titleOnly)
-                    .disabled(selected == nil)
+                    .disabled(selected == nil || isResolvingMagnet)
                 }
                 #endif
             }
@@ -130,12 +131,83 @@ struct ContentView: View {
             isSearching = false
         }
     }
+
+    private func sendSelectedToTransmission() {
+        guard let selected else { return }
+        if let magnet = selected.magnet, !magnet.isEmpty {
+            magnetMessage = magnet
+            return
+        }
+
+        isResolvingMagnet = true
+        Task { @MainActor in
+            defer { isResolvingMagnet = false }
+
+            do {
+                let magnet = try await searchService.resolveMagnet(for: selected.raw)
+                guard let magnet, !magnet.isEmpty else {
+                    magnetMessage = "No magnet is available for the selected result."
+                    return
+                }
+
+                if let index = results.firstIndex(where: { $0.id == selected.id }) {
+                    let updated = results[index].withMagnet(magnet)
+                    results[index] = updated
+                    results = dedupedResults(results)
+                    self.selected = results.first(where: { $0.id == updated.id }) ?? results.first(where: { $0.magnet?.infoHashFromMagnet == magnet.infoHashFromMagnet })
+                }
+                magnetMessage = magnet
+            } catch {
+                magnetMessage = (error as? LocalizedError)?.errorDescription ?? "Failed to fetch magnet."
+            }
+        }
+    }
+
+    private func dedupedResults(_ results: [SearchResult]) -> [SearchResult] {
+        var bestByKey: [String: SearchResult] = [:]
+        var order: [String] = []
+
+        for result in results {
+            let key = result.magnet?.infoHashFromMagnet?.lowercased() ?? result.title.normalizedDedupeKey
+            if let existing = bestByKey[key] {
+                bestByKey[key] = preferredDuplicate(between: existing, and: result)
+            } else {
+                bestByKey[key] = result
+                order.append(key)
+            }
+        }
+
+        return order.compactMap { bestByKey[$0] }
+    }
+
+    private func preferredDuplicate(between lhs: SearchResult, and rhs: SearchResult) -> SearchResult {
+        let lhsHasMagnet = lhs.magnet?.isEmpty == false
+        let rhsHasMagnet = rhs.magnet?.isEmpty == false
+
+        if lhsHasMagnet != rhsHasMagnet {
+            return lhsHasMagnet ? lhs : rhs
+        }
+
+        if lhs.score != rhs.score {
+            return lhs.score >= rhs.score ? lhs : rhs
+        }
+
+        let lhsSeeders = lhs.seeders ?? 0
+        let rhsSeeders = rhs.seeders ?? 0
+        if lhsSeeders != rhsSeeders {
+            return lhsSeeders >= rhsSeeders ? lhs : rhs
+        }
+
+        return lhs
+    }
 }
 
 // MARK: - Models
 struct SearchResult: Identifiable, Hashable {
     let id: UUID
+    let raw: TorrentSearchResult
     let title: String
+    let provider: String
     let source: String
     let resolution: String
     let dynamicRange: String
@@ -148,7 +220,9 @@ struct SearchResult: Identifiable, Hashable {
 
     init(ranked: RankedTorrentResult) {
         id = ranked.id
+        raw = ranked.raw
         title = ranked.raw.title
+        provider = ranked.raw.provider
         source = ranked.parsed.sourceType.rawValue.capitalized
         resolution = ranked.parsed.resolution.rawValue
         dynamicRange = ParserRankerAdapter.displayName(for: ranked.parsed.dynamicRange)
@@ -158,6 +232,62 @@ struct SearchResult: Identifiable, Hashable {
         magnet = ranked.raw.magnet
         detailURL = ranked.raw.detailURL
         score = ranked.score
+    }
+
+    func withMagnet(_ magnet: String) -> SearchResult {
+        SearchResult(
+            id: id,
+            raw: TorrentSearchResult(
+                id: raw.id,
+                title: raw.title,
+                magnet: magnet,
+                detailURL: raw.detailURL,
+                seeders: raw.seeders,
+                leechers: raw.leechers,
+                provider: raw.provider
+            ),
+            title: title,
+            provider: provider,
+            source: source,
+            resolution: resolution,
+            dynamicRange: dynamicRange,
+            audio: audio,
+            seeders: seeders,
+            leechers: leechers,
+            magnet: magnet,
+            detailURL: detailURL,
+            score: score
+        )
+    }
+
+    private init(
+        id: UUID,
+        raw: TorrentSearchResult,
+        title: String,
+        provider: String,
+        source: String,
+        resolution: String,
+        dynamicRange: String,
+        audio: String,
+        seeders: Int?,
+        leechers: Int?,
+        magnet: String?,
+        detailURL: URL?,
+        score: Int
+    ) {
+        self.id = id
+        self.raw = raw
+        self.title = title
+        self.provider = provider
+        self.source = source
+        self.resolution = resolution
+        self.dynamicRange = dynamicRange
+        self.audio = audio
+        self.seeders = seeders
+        self.leechers = leechers
+        self.magnet = magnet
+        self.detailURL = detailURL
+        self.score = score
     }
 }
 
@@ -464,6 +594,7 @@ private struct ResultRow: View {
                     }
                     if result.seeders != nil || result.leechers != nil {
                         HStack(spacing: 12) {
+                            MetaChip(text: result.provider, systemImage: "network")
                             if let seeders = result.seeders {
                                 MetaChip(text: "\(seeders)", systemImage: "arrow.up.circle")
                             }
