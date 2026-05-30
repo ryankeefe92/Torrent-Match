@@ -13,13 +13,18 @@ struct ContentView: View {
     private let searchService = TorrentSearchService(configs: BuiltInProviderConfigs.default)
 
     // MARK: - Search / Results State
+    @AppStorage("transmission.rpcURL") private var transmissionRPCURL: String = ""
+    @AppStorage("transmission.username") private var transmissionUsername: String = ""
+    @AppStorage("transmission.password") private var transmissionPassword: String = ""
     @State private var query: String = ""
     @State private var isSearching: Bool = false
     @State private var results: [SearchResult] = []
     @State private var errorMessage: String? = nil
     @State private var selected: SearchResult? = nil
-    @State private var magnetMessage: String? = nil
+    @State private var alertTitle: String = ""
+    @State private var alertMessage: String? = nil
     @State private var isResolvingMagnet: Bool = false
+    @State private var isPresentingTransmissionSettings: Bool = false
 
     var sortedResults: [SearchResult] {
         results.sorted { $0.score > $1.score }
@@ -52,15 +57,31 @@ struct ContentView: View {
                 }
             }
             .navigationTitle("Search")
-            .alert("Selected Magnet", isPresented: magnetAlertIsPresented) {
+            .alert(alertTitle, isPresented: alertIsPresented) {
                 Button("OK") {
-                    magnetMessage = nil
+                    alertMessage = nil
                 }
             } message: {
-                Text(magnetMessage ?? "")
+                Text(alertMessage ?? "")
+            }
+            .sheet(isPresented: $isPresentingTransmissionSettings) {
+                TransmissionSettingsView(
+                    rpcURL: $transmissionRPCURL,
+                    username: $transmissionUsername,
+                    password: $transmissionPassword
+                )
             }
             .toolbar {
                 #if os(iOS)
+                if #available(iOS 17.0, *) {
+                    ToolbarItem(placement: .topBarTrailing) {
+                        transmissionSettingsButton
+                    }
+                } else {
+                    ToolbarItem(placement: .navigationBarTrailing) {
+                        transmissionSettingsButton
+                    }
+                }
                 ToolbarItem(placement: .bottomBar) {
                     HStack {
                         Button {
@@ -73,6 +94,9 @@ struct ContentView: View {
                     }
                 }
                 #elseif os(macOS)
+                ToolbarItem(placement: .automatic) {
+                    transmissionSettingsButton
+                }
                 ToolbarItem(placement: .primaryAction) {
                     Button {
                         sendSelectedToTransmission()
@@ -83,6 +107,9 @@ struct ContentView: View {
                     .disabled(selected == nil || isResolvingMagnet)
                 }
                 #else
+                ToolbarItem(placement: .automatic) {
+                    transmissionSettingsButton
+                }
                 ToolbarItem(placement: .automatic) {
                     Button {
                         sendSelectedToTransmission()
@@ -100,15 +127,27 @@ struct ContentView: View {
         }
     }
 
-    private var magnetAlertIsPresented: Binding<Bool> {
+    private var alertIsPresented: Binding<Bool> {
         Binding(
-            get: { magnetMessage != nil },
+            get: { alertMessage != nil },
             set: { isPresented in
                 if !isPresented {
-                    magnetMessage = nil
+                    alertMessage = nil
                 }
             }
         )
+    }
+
+    private var transmissionSettingsButton: some View {
+        Button {
+            isPresentingTransmissionSettings = true
+        } label: {
+            Label("Transmission Settings", systemImage: "gearshape")
+        }
+        .labelStyle(.iconOnly)
+#if os(macOS)
+        .help("Transmission Settings")
+#endif
     }
 
     // MARK: - Actions
@@ -124,9 +163,12 @@ struct ContentView: View {
 
         Task { @MainActor in
             let report = await searchService.searchAndRankReport(trimmed)
-            results = report.results.map(SearchResult.init)
-            if results.isEmpty, let failure = report.failures.first {
-                errorMessage = "\(failure.providerName) search is currently blocked. \(failure.message)"
+            results = dedupedResults(report.results.map(SearchResult.init))
+            if results.isEmpty, !report.failures.isEmpty {
+                let details = report.failures
+                    .map { "\($0.providerName): \($0.message)" }
+                    .joined(separator: "\n")
+                errorMessage = "No results. Providers reported errors:\n\(details)\n\nThis often means the site is blocked on your current network/DNS."
             }
             isSearching = false
         }
@@ -134,8 +176,15 @@ struct ContentView: View {
 
     private func sendSelectedToTransmission() {
         guard let selected else { return }
-        if let magnet = selected.magnet, !magnet.isEmpty {
-            magnetMessage = magnet
+        let config: TransmissionConfig
+        do {
+            config = try makeTransmissionConfig()
+        } catch {
+            showAlert(
+                title: "Transmission Not Configured",
+                message: (error as? LocalizedError)?.errorDescription ?? "Enter your Transmission RPC settings first."
+            )
+            isPresentingTransmissionSettings = true
             return
         }
 
@@ -144,40 +193,141 @@ struct ContentView: View {
             defer { isResolvingMagnet = false }
 
             do {
-                let magnet = try await searchService.resolveMagnet(for: selected.raw)
-                guard let magnet, !magnet.isEmpty else {
-                    magnetMessage = "No magnet is available for the selected result."
-                    return
-                }
-
-                if let index = results.firstIndex(where: { $0.id == selected.id }) {
-                    let updated = results[index].withMagnet(magnet)
-                    results[index] = updated
-                    results = dedupedResults(results)
-                    self.selected = results.first(where: { $0.id == updated.id }) ?? results.first(where: { $0.magnet?.infoHashFromMagnet == magnet.infoHashFromMagnet })
-                }
-                magnetMessage = magnet
+                let magnet = try await resolvedMagnet(for: selected)
+                try await TransmissionClient(config: config).add(magnet: magnet)
+                showAlert(title: "Sent to Transmission", message: selected.title)
             } catch {
-                magnetMessage = (error as? LocalizedError)?.errorDescription ?? "Failed to fetch magnet."
+                showAlert(
+                    title: "Transmission Error",
+                    message: (error as? LocalizedError)?.errorDescription ?? "Failed to send torrent to Transmission."
+                )
             }
         }
     }
 
+    private func resolvedMagnet(for selected: SearchResult) async throws -> String {
+        if let magnet = selected.magnet, !magnet.isEmpty {
+            return magnet
+        }
+
+        let magnet = try await searchService.resolveMagnet(for: selected.raw)
+        guard let magnet, !magnet.isEmpty else {
+            throw TransmissionConfigurationError.missingMagnet
+        }
+
+        if let index = results.firstIndex(where: { $0.id == selected.id }) {
+            let updated = results[index].withMagnet(magnet)
+            results[index] = updated
+            results = dedupedResults(results)
+            self.selected = results.first(where: { $0.id == updated.id }) ?? results.first(where: { $0.magnet?.infoHashFromMagnet == magnet.infoHashFromMagnet })
+        }
+
+        return magnet
+    }
+
+    private func makeTransmissionConfig() throws -> TransmissionConfig {
+        let rpcURLText = transmissionRPCURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rpcURLText.isEmpty else {
+            throw TransmissionConfigurationError.missingRPCURL
+        }
+
+        let username = transmissionUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+        let password = transmissionPassword.trimmingCharacters(in: .whitespacesAndNewlines)
+        if (username.isEmpty && !password.isEmpty) || (!username.isEmpty && password.isEmpty) {
+            throw TransmissionConfigurationError.incompleteCredentials
+        }
+
+        guard let rpcURL = normalizedTransmissionRPCURL(from: rpcURLText) else {
+            throw TransmissionConfigurationError.invalidRPCURL
+        }
+
+        return TransmissionConfig(
+            rpcURL: rpcURL,
+            username: username.isEmpty ? nil : username,
+            password: password.isEmpty ? nil : password
+        )
+    }
+
+    private func normalizedTransmissionRPCURL(from rawValue: String) -> URL? {
+        let withScheme: String
+        if rawValue.contains("://") {
+            withScheme = rawValue
+        } else {
+            withScheme = "http://" + rawValue
+        }
+
+        guard var components = URLComponents(string: withScheme),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              components.host != nil else {
+            return nil
+        }
+
+        let path = components.path.trimmingCharacters(in: .whitespacesAndNewlines)
+        if path.isEmpty || path == "/" {
+            components.path = "/transmission/rpc"
+        }
+
+        return components.url
+    }
+
+    private func showAlert(title: String, message: String) {
+        alertTitle = title
+        alertMessage = message
+    }
+
     private func dedupedResults(_ results: [SearchResult]) -> [SearchResult] {
-        var bestByKey: [String: SearchResult] = [:]
-        var order: [String] = []
+        let byHash = dedupeByInfoHash(results)
+        return dedupeByNormalizedTitle(byHash)
+    }
+
+    private func dedupeByInfoHash(_ results: [SearchResult]) -> [SearchResult] {
+        var output: [SearchResult] = []
+        output.reserveCapacity(results.count)
+
+        var indexByHash: [String: Int] = [:]
+        indexByHash.reserveCapacity(results.count)
 
         for result in results {
-            let key = result.magnet?.infoHashFromMagnet?.lowercased() ?? result.title.normalizedDedupeKey
-            if let existing = bestByKey[key] {
-                bestByKey[key] = preferredDuplicate(between: existing, and: result)
+            guard let hash = result.magnet?.infoHashFromMagnet?.lowercased(), !hash.isEmpty else {
+                output.append(result)
+                continue
+            }
+
+            if let existingIndex = indexByHash[hash] {
+                output[existingIndex] = preferredDuplicate(between: output[existingIndex], and: result)
             } else {
-                bestByKey[key] = result
-                order.append(key)
+                indexByHash[hash] = output.count
+                output.append(result)
             }
         }
 
-        return order.compactMap { bestByKey[$0] }
+        return output
+    }
+
+    private func dedupeByNormalizedTitle(_ results: [SearchResult]) -> [SearchResult] {
+        var output: [SearchResult] = []
+        output.reserveCapacity(results.count)
+
+        var indexByTitle: [String: Int] = [:]
+        indexByTitle.reserveCapacity(results.count)
+
+        for result in results {
+            let key = result.title.normalizedDedupeKey
+            guard !key.isEmpty else {
+                output.append(result)
+                continue
+            }
+
+            if let existingIndex = indexByTitle[key] {
+                output[existingIndex] = preferredDuplicate(between: output[existingIndex], and: result)
+            } else {
+                indexByTitle[key] = output.count
+                output.append(result)
+            }
+        }
+
+        return output
     }
 
     private func preferredDuplicate(between lhs: SearchResult, and rhs: SearchResult) -> SearchResult {
@@ -199,6 +349,26 @@ struct ContentView: View {
         }
 
         return lhs
+    }
+}
+
+private enum TransmissionConfigurationError: LocalizedError {
+    case missingRPCURL
+    case invalidRPCURL
+    case incompleteCredentials
+    case missingMagnet
+
+    var errorDescription: String? {
+        switch self {
+        case .missingRPCURL:
+            return "Enter your Transmission RPC URL, for example http://YOUR-IP:9091/transmission/rpc."
+        case .invalidRPCURL:
+            return "The Transmission RPC URL is invalid."
+        case .incompleteCredentials:
+            return "Enter both a username and password, or leave both blank."
+        case .missingMagnet:
+            return "No magnet is available for the selected result."
+        }
     }
 }
 
@@ -625,7 +795,54 @@ fileprivate struct NavigationViewWrapper<Content: View>: View {
     let content: () -> Content
 
     var body: some View {
-        content()
+        NavigationStack {
+            content()
+        }
+    }
+}
+
+private struct TransmissionSettingsView: View {
+    @Binding var rpcURL: String
+    @Binding var username: String
+    @Binding var password: String
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Connection") {
+                    TextField("RPC URL", text: $rpcURL)
+#if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+#endif
+                    TextField("Username (Optional)", text: $username)
+#if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+#endif
+                    SecureField("Password (Optional)", text: $password)
+                }
+
+                Section("Tip") {
+                    Text("If you enter only a host like 100.64.0.10:9091, the app will use http and append /transmission/rpc automatically.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Transmission")
+#if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+#endif
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+        .frame(minWidth: 420, minHeight: 240)
     }
 }
 

@@ -34,9 +34,13 @@ public final class TransmissionClient: @unchecked Sendable {
             "arguments": ["filename": magnet]
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
-        let (_, response) = try await session.data(for: request)
+        let (data, response) = try await session.data(for: request)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw TransmissionError.badStatus(http.statusCode)
+        }
+        let rpcResponse = try JSONDecoder().decode(TransmissionRPCResponse.self, from: data)
+        guard rpcResponse.result == "success" else {
+            throw TransmissionError.rpcFailure(rpcResponse.result)
         }
     }
 
@@ -49,6 +53,9 @@ public final class TransmissionClient: @unchecked Sendable {
         let (_, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw TransmissionError.missingSessionID }
         if let id = http.value(forHTTPHeaderField: "X-Transmission-Session-Id") { return id }
+        if !(200..<300).contains(http.statusCode) {
+            throw TransmissionError.badStatus(http.statusCode)
+        }
         throw TransmissionError.missingSessionID
     }
 
@@ -62,11 +69,17 @@ public final class TransmissionClient: @unchecked Sendable {
 public enum TransmissionError: Error, LocalizedError, Sendable {
     case missingSessionID
     case badStatus(Int)
+    case rpcFailure(String)
 
     public var errorDescription: String? {
         switch self {
         case .missingSessionID: return "Transmission session ID was not returned."
         case .badStatus(let status): return "Transmission returned HTTP status \(status)."
+        case .rpcFailure(let message): return "Transmission RPC failed: \(message)."
         }
     }
+}
+
+private struct TransmissionRPCResponse: Decodable {
+    let result: String
 }

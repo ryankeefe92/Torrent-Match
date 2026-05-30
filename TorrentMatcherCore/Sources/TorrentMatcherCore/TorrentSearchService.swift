@@ -117,46 +117,7 @@ public final class TorrentSearchService: @unchecked Sendable {
     }
 
     private func dedupe(_ results: [TorrentSearchResult]) -> [TorrentSearchResult] {
-        var bestByKey: [String: TorrentSearchResult] = [:]
-        var order: [String] = []
-
-        for result in results {
-            let key = result.magnet?.infoHashFromMagnet?.lowercased() ?? result.title.normalizedDedupeKey
-            if let existing = bestByKey[key] {
-                bestByKey[key] = preferredDuplicate(between: existing, and: result)
-            } else {
-                bestByKey[key] = result
-                order.append(key)
-            }
-        }
-
-        return order.compactMap { bestByKey[$0] }
-    }
-
-    private func preferredDuplicate(between lhs: TorrentSearchResult, and rhs: TorrentSearchResult) -> TorrentSearchResult {
-        let lhsHasMagnet = lhs.magnet?.isEmpty == false
-        let rhsHasMagnet = rhs.magnet?.isEmpty == false
-
-        if lhsHasMagnet != rhsHasMagnet {
-            return lhsHasMagnet ? lhs : rhs
-        }
-
-        let lhsRanked = TorrentRanker.score(lhs, weights: weights)
-        let rhsRanked = TorrentRanker.score(rhs, weights: weights)
-
-        if lhsRanked.excluded != rhsRanked.excluded {
-            return lhsRanked.excluded ? rhs : lhs
-        }
-
-        if lhsRanked.score != rhsRanked.score {
-            return lhsRanked.score >= rhsRanked.score ? lhs : rhs
-        }
-
-        if lhs.seeders != rhs.seeders {
-            return lhs.seeders >= rhs.seeders ? lhs : rhs
-        }
-
-        return lhs
+        TorrentResultDedupe.dedupe(results, weights: weights)
     }
 
     private func filterResults(_ results: [TorrentSearchResult], matching query: String) -> [TorrentSearchResult] {
