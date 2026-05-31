@@ -9,22 +9,38 @@ public struct RankerWeights: Codable, Hashable, Sendable {
     public var videoCodec: [VideoCodec: Int]
     public var ddpAtmosBonus: Int
     public var trueHDAtmosBonus: Int
+    public var topTierUHDRemuxBonus: Int
+    public var imaxBonus: Int
 
     public static let appleTVDefault = RankerWeights(
-        source: [.remux: 90, .bluray: 68, .webdl: 42, .webrip: 22, .unknown: 0],
-        resolution: [.p2160: 100, .p1080: 92, .p720: 50, .sd: 30, .unknown: 10],
-        dynamicRange: [.dolbyVision: 30, .hdr10plus: 27, .hdr10: 24, .hdr: 20, .unknown: 12, .sdr: -5],
-        audioCodec: [.truehd: 42, .dtsHDMA: 36, .ddp: 32, .dd: 18, .aac: 6, .unknown: 0],
-        channels: [.sevenOne: 32, .fiveOne: 24, .twoZero: 0, .unknown: 0],
-        videoCodec: [.hevc: 20, .avc: 10, .unknown: 0],
-        ddpAtmosBonus: 6,
-        trueHDAtmosBonus: 0
+        source: [.remux: 90, .bluray: 68, .webdl: 42, .webrip: 22, .dvd: 16, .hdtv: 14, .cam: 7, .unknown: 22],
+        resolution: [.p2160: 100, .p1080: 85, .likely1080: 80, .p720: 50, .sd: 30, .unknown: 10],
+        dynamicRange: [.dolbyVision: 21, .hdr10plus: 19, .hdr10: 16, .hdr: 12, .likelyHDR: 10, .unknown: 8, .sdr: 8],
+        audioCodec: [.truehd: 42, .dtsHDMA: 42, .pcm: 42, .ddp: 35, .dts: 30, .dd: 21, .aac: 12, .unknown: 12],
+        channels: [.sevenOne: 32, .fiveOne: 24, .twoZero: 5, .mono: 0, .unknown: 4],
+        videoCodec: [.hevc: 16, .avc: 8, .unknown: 0],
+        ddpAtmosBonus: 9,
+        trueHDAtmosBonus: 0,
+        topTierUHDRemuxBonus: 100,
+        imaxBonus: 8
     )
 }
 
 public enum TorrentRanker {
     public static func score(_ result: TorrentSearchResult, weights: RankerWeights = .appleTVDefault) -> RankedTorrentResult {
         let parsed = ReleaseParser.parse(result.title)
+
+        let upperTitle = result.title.uppercased()
+        if upperTitle.range(of: #"(^|[^A-Z0-9])(VC(?:\s|-)?1|DIV-?X|X(?:\s|-)?VID|WMV(?:3)?)([^A-Z0-9]|$)"#, options: .regularExpression) != nil ||
+            upperTitle.contains("WINDOWS MEDIA VIDEO") {
+            return RankedTorrentResult(
+                raw: result,
+                parsed: parsed,
+                score: Int.min / 2,
+                notes: ["Excluded: unsupported legacy codec in title"],
+                excluded: true
+            )
+        }
 
         if parsed.videoCodec == .av1 {
             return RankedTorrentResult(
@@ -70,6 +86,17 @@ public enum TorrentRanker {
         }
 
         add("Video codec", parsed.videoCodec, weights.videoCodec[parsed.videoCodec])
+
+        if parsed.imax {
+            score += weights.imaxBonus
+            notes.append("IMAX bonus: +\(weights.imaxBonus)")
+        }
+
+        if parsed.sourceType == .remux && parsed.resolution == .p2160 {
+            score += weights.topTierUHDRemuxBonus
+            notes.append("Top tier bonus: +\(weights.topTierUHDRemuxBonus) for UHD Remux")
+        }
+
         notes.append("Availability: \(result.seeders) seeders / \(result.leechers) leechers; used only for tie-breaks")
 
         return RankedTorrentResult(raw: result, parsed: parsed, score: score, notes: notes, excluded: false)

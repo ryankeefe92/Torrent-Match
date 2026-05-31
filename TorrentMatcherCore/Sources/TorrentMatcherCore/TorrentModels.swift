@@ -8,6 +8,7 @@ public struct TorrentSearchResult: Identifiable, Hashable, Sendable {
     public let seeders: Int
     public let leechers: Int
     public let provider: String
+    public let size: String?
 
     public init(
         id: UUID = UUID(),
@@ -16,7 +17,8 @@ public struct TorrentSearchResult: Identifiable, Hashable, Sendable {
         detailURL: URL?,
         seeders: Int,
         leechers: Int,
-        provider: String
+        provider: String,
+        size: String? = nil
     ) {
         self.id = id
         self.title = title
@@ -25,6 +27,7 @@ public struct TorrentSearchResult: Identifiable, Hashable, Sendable {
         self.seeders = seeders
         self.leechers = leechers
         self.provider = provider
+        self.size = size
     }
 }
 
@@ -47,12 +50,13 @@ public struct RankedTorrentResult: Identifiable, Hashable, Sendable {
 }
 
 public enum SourceType: String, Codable, Sendable {
-    case remux, bluray, webdl, webrip, unknown
+    case remux, bluray, webdl, webrip, dvd, hdtv, cam, unknown
 }
 
 public enum Resolution: String, Codable, Sendable {
     case p2160 = "2160p"
     case p1080 = "1080p"
+    case likely1080 = "likely_1080p"
     case p720 = "720p"
     case sd
     case unknown
@@ -63,6 +67,7 @@ public enum DynamicRange: String, Codable, Sendable {
     case hdr10plus
     case hdr10
     case hdr
+    case likelyHDR = "likely_hdr"
     case unknown
     case sdr
 }
@@ -72,13 +77,14 @@ public enum VideoCodec: String, Codable, Sendable {
 }
 
 public enum AudioCodec: String, Codable, Sendable {
-    case truehd, dtsHDMA = "dts_hd_ma", ddp, dd, aac, unknown
+    case truehd, dtsHDMA = "dts_hd_ma", pcm, ddp, dts, dd, aac, unknown
 }
 
 public enum ChannelLayout: String, Codable, Sendable {
     case sevenOne = "7.1"
     case fiveOne = "5.1"
     case twoZero = "2.0"
+    case mono
     case unknown
 }
 
@@ -90,6 +96,7 @@ public struct ParsedRelease: Hashable, Codable, Sendable {
     public let audioCodec: AudioCodec
     public let channels: ChannelLayout
     public let atmos: Bool
+    public let imax: Bool
 
     public init(
         sourceType: SourceType,
@@ -98,7 +105,8 @@ public struct ParsedRelease: Hashable, Codable, Sendable {
         videoCodec: VideoCodec,
         audioCodec: AudioCodec,
         channels: ChannelLayout,
-        atmos: Bool
+        atmos: Bool,
+        imax: Bool = false
     ) {
         self.sourceType = sourceType
         self.resolution = resolution
@@ -107,5 +115,6 @@ public struct ParsedRelease: Hashable, Codable, Sendable {
         self.audioCodec = audioCodec
         self.channels = channels
         self.atmos = atmos
+        self.imax = imax
     }
 }

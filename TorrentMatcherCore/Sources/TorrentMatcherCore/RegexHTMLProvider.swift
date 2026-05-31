@@ -118,6 +118,7 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
             let seeders = RegexTools.firstCapture(pattern: config.seedersPattern, in: block).flatMap(Int.init) ?? 0
             let leechers = RegexTools.firstCapture(pattern: config.leechersPattern, in: block).flatMap(Int.init) ?? 0
             guard !(seeders == 0 && leechers < 2) else { continue }
+            let size = config.sizePattern.flatMap { RegexTools.firstCapture(pattern: $0, in: block) }?.htmlDecoded.cleanedText
 
             let inlineMagnet = config.magnetPattern.flatMap { RegexTools.firstCapture(pattern: $0, in: block) }?.htmlDecoded
             let detailURL = extractDetailURL(from: block)
@@ -138,7 +139,8 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
                 detailURL: detailURL,
                 seeders: seeders,
                 leechers: leechers,
-                provider: config.name
+                provider: config.name,
+                size: size
             ))
         }
         return results

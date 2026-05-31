@@ -19,6 +19,7 @@ public enum ProviderConfigTester {
             let title = RegexTools.firstCapture(pattern: config.titlePattern, in: block)?.htmlDecoded.cleanedText ?? ""
             let seeders = RegexTools.firstCapture(pattern: config.seedersPattern, in: block).flatMap(Int.init) ?? 0
             let leechers = RegexTools.firstCapture(pattern: config.leechersPattern, in: block).flatMap(Int.init) ?? 0
+            let size = config.sizePattern.flatMap { RegexTools.firstCapture(pattern: $0, in: block) }?.htmlDecoded.cleanedText
             let magnet = config.magnetPattern.flatMap { RegexTools.firstCapture(pattern: $0, in: block) }?.htmlDecoded
             let detailURLString = config.detailURLPattern.flatMap { RegexTools.firstCapture(pattern: $0, in: block) }?.htmlDecoded
             let detailURL = detailURLString.flatMap(URL.init(string:))
@@ -32,7 +33,8 @@ public enum ProviderConfigTester {
                 detailURL: detailURL,
                 seeders: seeders,
                 leechers: leechers,
-                provider: config.name
+                provider: config.name,
+                size: size
             ))
         }
 

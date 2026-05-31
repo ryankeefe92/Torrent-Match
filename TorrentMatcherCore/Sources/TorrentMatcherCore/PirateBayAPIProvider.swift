@@ -87,7 +87,8 @@ public final class PirateBayAPIProvider: TorrentProvider, @unchecked Sendable {
                 detailURL: detailURL,
                 seeders: seeders,
                 leechers: leechers,
-                provider: config.name
+                provider: config.name,
+                size: torrent.size.flatMap(Self.formattedByteSize)
             )
         }
     }
@@ -113,6 +114,17 @@ public final class PirateBayAPIProvider: TorrentProvider, @unchecked Sendable {
         let displayName = config.name.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? config.name
         return "magnet:?xt=urn:btih:\(infoHash)&dn=\(displayName)&\(trackerQuery)"
     }
+
+    private static func formattedByteSize(_ rawValue: String) -> String? {
+        guard let bytes = Double(rawValue.trimmingCharacters(in: .whitespacesAndNewlines)),
+              bytes > 0 else { return nil }
+        let formatter = ByteCountFormatter()
+        formatter.allowedUnits = [.useGB, .useMB, .useKB]
+        formatter.countStyle = .file
+        formatter.includesUnit = true
+        formatter.includesCount = true
+        return formatter.string(fromByteCount: Int64(bytes))
+    }
 }
 
 private struct PirateBayAPITorrent: Decodable {
@@ -121,6 +133,7 @@ private struct PirateBayAPITorrent: Decodable {
     let infoHash: String?
     let leechers: String?
     let seeders: String?
+    let size: String?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -128,5 +141,6 @@ private struct PirateBayAPITorrent: Decodable {
         case infoHash = "info_hash"
         case leechers
         case seeders
+        case size
     }
 }

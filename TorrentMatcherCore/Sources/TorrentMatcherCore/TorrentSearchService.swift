@@ -43,7 +43,18 @@ public final class TorrentSearchService: @unchecked Sendable {
     }
 
     public func searchAndRankReport(_ query: String) async -> RankedSearchReport {
-        let report = await searchReport(query)
+        let report = await searchReport(query, onProgress: nil)
+        return RankedSearchReport(
+            results: TorrentRanker.rank(report.results, hideExcluded: true, weights: weights),
+            failures: report.failures
+        )
+    }
+
+    public func searchAndRankReport(
+        _ query: String,
+        onProgress: (@Sendable (_ foundSoFar: Int) -> Void)?
+    ) async -> RankedSearchReport {
+        let report = await searchReport(query, onProgress: onProgress)
         return RankedSearchReport(
             results: TorrentRanker.rank(report.results, hideExcluded: true, weights: weights),
             failures: report.failures
@@ -51,7 +62,7 @@ public final class TorrentSearchService: @unchecked Sendable {
     }
 
     public func searchAll(_ query: String) async -> [TorrentSearchResult] {
-        let report = await searchReport(query)
+        let report = await searchReport(query, onProgress: nil)
         return report.results
     }
 
@@ -62,7 +73,10 @@ public final class TorrentSearchService: @unchecked Sendable {
         return try await provider.resolveMagnet(for: result)
     }
 
-    private func searchReport(_ query: String) async -> (results: [TorrentSearchResult], failures: [ProviderFailure]) {
+    private func searchReport(
+        _ query: String,
+        onProgress: (@Sendable (_ foundSoFar: Int) -> Void)?
+    ) async -> (results: [TorrentSearchResult], failures: [ProviderFailure]) {
         let collected = await withTaskGroup(of: ([TorrentSearchResult], ProviderFailure?).self) { group in
             for provider in providers {
                 group.addTask {
@@ -81,6 +95,7 @@ public final class TorrentSearchService: @unchecked Sendable {
             var failures: [ProviderFailure] = []
             for await outcome in group {
                 collected.append(contentsOf: outcome.0)
+                onProgress?(rankedResultCount(collected, matching: query))
                 if let failure = outcome.1 {
                     failures.append(failure)
                 }
@@ -100,20 +115,7 @@ public final class TorrentSearchService: @unchecked Sendable {
         query: String,
         timeoutOverride: Int?
     ) async throws -> [TorrentSearchResult] {
-        let timeoutSeconds = timeoutOverride ?? provider.config.timeoutSeconds ?? providerTimeoutSeconds
-        return try await withThrowingTaskGroup(of: [TorrentSearchResult].self) { group in
-            group.addTask {
-                try await provider.search(query)
-            }
-            group.addTask {
-                try await Task.sleep(nanoseconds: UInt64(timeoutSeconds) * 1_000_000_000)
-                throw ProviderError.timedOut(provider: provider.config.name, seconds: timeoutSeconds)
-            }
-
-            let results = try await group.next() ?? []
-            group.cancelAll()
-            return results
-        }
+        try await provider.search(query)
     }
 
     private func dedupe(_ results: [TorrentSearchResult]) -> [TorrentSearchResult] {
@@ -131,6 +133,10 @@ public final class TorrentSearchService: @unchecked Sendable {
             }
             return true
         }
+    }
+
+    private func rankedResultCount(_ results: [TorrentSearchResult], matching query: String) -> Int {
+        TorrentRanker.rank(dedupe(filterResults(results, matching: query)), hideExcluded: true, weights: weights).count
     }
 
     private static func provider(for config: ProviderConfig) -> TorrentProvider {

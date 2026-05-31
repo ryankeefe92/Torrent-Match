@@ -18,6 +18,7 @@ struct ContentView: View {
     @AppStorage("transmission.password") private var transmissionPassword: String = ""
     @State private var query: String = ""
     @State private var isSearching: Bool = false
+    @State private var foundSoFar: Int = 0
     @State private var results: [SearchResult] = []
     @State private var errorMessage: String? = nil
     @State private var selected: SearchResult? = nil
@@ -46,7 +47,7 @@ struct ContentView: View {
                         ErrorStateView(message: message, retry: performSearch)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else if isSearching {
-                        ProgressView("Searching providers…")
+                        ProgressView("Searching providers… \(releaseCountText(foundSoFar)) found")
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else if sortedResults.isEmpty {
                         EmptyResultsView()
@@ -56,7 +57,7 @@ struct ContentView: View {
                     }
                 }
             }
-            .navigationTitle("Search")
+            .navigationTitle("")
             .alert(alertTitle, isPresented: alertIsPresented) {
                 Button("OK") {
                     alertMessage = nil
@@ -159,11 +160,17 @@ struct ContentView: View {
 #endif
         errorMessage = nil
         isSearching = true
+        foundSoFar = 0
         results = []
 
         Task { @MainActor in
-            let report = await searchService.searchAndRankReport(trimmed)
+            let report = await searchService.searchAndRankReport(trimmed) { found in
+                Task { @MainActor in
+                    foundSoFar = found
+                }
+            }
             results = dedupedResults(report.results.map(SearchResult.init))
+            foundSoFar = results.count
             if results.isEmpty, !report.failures.isEmpty {
                 let details = report.failures
                     .map { "\($0.providerName): \($0.message)" }
@@ -203,6 +210,10 @@ struct ContentView: View {
                 )
             }
         }
+    }
+
+    private func releaseCountText(_ count: Int) -> String {
+        count == 1 ? "1 release" : "\(count) releases"
     }
 
     private func resolvedMagnet(for selected: SearchResult) async throws -> String {
@@ -381,7 +392,10 @@ struct SearchResult: Identifiable, Hashable {
     let source: String
     let resolution: String
     let dynamicRange: String
+    let codec: String
     let audio: String
+    let imax: Bool
+    let size: String?
     let seeders: Int?
     let leechers: Int?
     let magnet: String?
@@ -393,10 +407,13 @@ struct SearchResult: Identifiable, Hashable {
         raw = ranked.raw
         title = ranked.raw.title
         provider = ranked.raw.provider
-        source = ranked.parsed.sourceType.rawValue.capitalized
-        resolution = ranked.parsed.resolution.rawValue
+        source = ParserRankerAdapter.displayName(for: ranked.parsed.sourceType)
+        resolution = ParserRankerAdapter.displayName(for: ranked.parsed.resolution)
         dynamicRange = ParserRankerAdapter.displayName(for: ranked.parsed.dynamicRange)
+        codec = ParserRankerAdapter.displayName(for: ranked.parsed.videoCodec)
         audio = ParserRankerAdapter.audioSummary(codec: ranked.parsed.audioCodec, channels: ranked.parsed.channels, atmos: ranked.parsed.atmos)
+        imax = ranked.parsed.imax
+        size = ranked.raw.size
         seeders = ranked.raw.seeders
         leechers = ranked.raw.leechers
         magnet = ranked.raw.magnet
@@ -414,14 +431,18 @@ struct SearchResult: Identifiable, Hashable {
                 detailURL: raw.detailURL,
                 seeders: raw.seeders,
                 leechers: raw.leechers,
-                provider: raw.provider
+                provider: raw.provider,
+                size: raw.size
             ),
             title: title,
             provider: provider,
             source: source,
             resolution: resolution,
             dynamicRange: dynamicRange,
+            codec: codec,
             audio: audio,
+            imax: imax,
+            size: size,
             seeders: seeders,
             leechers: leechers,
             magnet: magnet,
@@ -438,7 +459,10 @@ struct SearchResult: Identifiable, Hashable {
         source: String,
         resolution: String,
         dynamicRange: String,
+        codec: String,
         audio: String,
+        imax: Bool,
+        size: String?,
         seeders: Int?,
         leechers: Int?,
         magnet: String?,
@@ -452,7 +476,10 @@ struct SearchResult: Identifiable, Hashable {
         self.source = source
         self.resolution = resolution
         self.dynamicRange = dynamicRange
+        self.codec = codec
         self.audio = audio
+        self.imax = imax
+        self.size = size
         self.seeders = seeders
         self.leechers = leechers
         self.magnet = magnet
@@ -486,8 +513,8 @@ enum ParserRankerAdapter {
         let ranked = TorrentRanker.score(mockRaw)
 
         let meta = ParsedMeta(
-            source: parsed.sourceType.rawValue.capitalized,
-            resolution: parsed.resolution.rawValue,
+            source: displayName(for: parsed.sourceType),
+            resolution: displayName(for: parsed.resolution),
             dynamicRange: displayName(for: parsed.dynamicRange),
             audio: displayName(for: parsed.audioCodec, atmos: parsed.atmos),
             channels: channelsString(parsed.channels),
@@ -501,7 +528,32 @@ enum ParserRankerAdapter {
         case .sevenOne: return "7.1"
         case .fiveOne: return "5.1"
         case .twoZero: return "2.0"
+        case .mono: return "Mono"
         case .unknown: return nil
+        }
+    }
+
+    static func displayName(for source: SourceType) -> String {
+        switch source {
+        case .remux: return "Remux"
+        case .bluray: return "BluRay"
+        case .webdl: return "WEB-DL"
+        case .webrip: return "WEBRip"
+        case .dvd: return "DVD"
+        case .hdtv: return "HDTV"
+        case .cam: return "CAM"
+        case .unknown: return "Unknown"
+        }
+    }
+
+    static func displayName(for resolution: Resolution) -> String {
+        switch resolution {
+        case .p2160: return "2160p"
+        case .p1080: return "1080p"
+        case .likely1080: return "Likely 1080p"
+        case .p720: return "720p"
+        case .sd: return "SD"
+        case .unknown: return "Unknown"
         }
     }
 
@@ -511,7 +563,17 @@ enum ParserRankerAdapter {
         case .hdr10plus: return "HDR10+"
         case .hdr10: return "HDR10"
         case .hdr: return "HDR"
+        case .likelyHDR: return "Likely HDR"
         case .sdr: return "SDR"
+        case .unknown: return "Unknown"
+        }
+    }
+
+    static func displayName(for videoCodec: VideoCodec) -> String {
+        switch videoCodec {
+        case .hevc: return "HEVC"
+        case .avc: return "x264"
+        case .av1: return "AV1"
         case .unknown: return "Unknown"
         }
     }
@@ -520,8 +582,10 @@ enum ParserRankerAdapter {
         let base: String
         switch ac {
         case .truehd: base = "TrueHD"
-        case .dtsHDMA: base = "DTS-HD MA"
+        case .dtsHDMA: base = "DTS MA"
+        case .pcm: base = "PCM"
         case .ddp: base = "DDP"
+        case .dts: base = "DTS"
         case .dd: base = "DD/AC3"
         case .aac: base = "AAC"
         case .unknown: base = "Unknown"
@@ -549,6 +613,7 @@ private struct SearchBar: View {
                 TextField("Search movies or shows", text: $query)
                     .textFieldStyle(.roundedBorder)
                     .padding(.trailing, query.isEmpty ? 0 : 28)
+                    .submitLabel(.search)
                     .onSubmit(onSubmit)
 
                 if !query.isEmpty {
@@ -753,14 +818,21 @@ private struct ResultRow: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(prettifiedTitle(result.title))
                         .font(.headline)
-                        .lineLimit(2)
+                        .lineLimit(3)
                         .truncationMode(.tail)
                         .allowsTightening(false)
                     FlowLayout(spacing: 8, lineSpacing: 4) {
                         MetaChip(text: result.source, systemImage: "film")
                         MetaChip(text: result.resolution, systemImage: "rectangle.3.group")
                         MetaChip(text: result.dynamicRange, systemImage: "circle.lefthalf.filled")
+                        MetaChip(text: result.codec, systemImage: "play.rectangle")
                         MetaChip(text: result.audio, systemImage: "speaker.wave.2")
+                        if result.imax {
+                            MetaChip(text: "IMAX", systemImage: "rectangle.expand.vertical")
+                        }
+                        if let size = result.size, !size.isEmpty {
+                            MetaChip(text: size, systemImage: "externaldrive")
+                        }
                     }
                     if result.seeders != nil || result.leechers != nil {
                         HStack(spacing: 12) {

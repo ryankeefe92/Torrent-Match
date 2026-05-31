@@ -14,6 +14,7 @@ public struct ProviderConfig: Codable, Identifiable, Hashable, Sendable {
     public let fetchMagnetFromDetailDuringSearch: Bool
     public let seedersPattern: String
     public let leechersPattern: String
+    public let sizePattern: String?
     public let detailBaseURL: String?
     public let searchPageCount: Int?
 
@@ -30,6 +31,7 @@ public struct ProviderConfig: Codable, Identifiable, Hashable, Sendable {
         fetchMagnetFromDetailDuringSearch: Bool = true,
         seedersPattern: String,
         leechersPattern: String,
+        sizePattern: String? = nil,
         detailBaseURL: String?,
         timeoutSeconds: Int? = nil,
         searchPageCount: Int? = nil
@@ -47,6 +49,7 @@ public struct ProviderConfig: Codable, Identifiable, Hashable, Sendable {
         self.fetchMagnetFromDetailDuringSearch = fetchMagnetFromDetailDuringSearch
         self.seedersPattern = seedersPattern
         self.leechersPattern = leechersPattern
+        self.sizePattern = sizePattern
         self.detailBaseURL = detailBaseURL
         self.searchPageCount = searchPageCount
     }

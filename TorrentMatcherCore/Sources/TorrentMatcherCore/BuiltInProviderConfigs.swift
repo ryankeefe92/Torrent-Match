@@ -19,6 +19,7 @@ public enum BuiltInProviderConfigs {
         fetchMagnetFromDetailDuringSearch: false,
         seedersPattern: #"<td[^>]*class=[\"'][^\"']*seeds[^\"']*[\"'][^>]*>\s*(\d+)\s*</td>"#,
         leechersPattern: #"<td[^>]*class=[\"'][^\"']*leeches[^\"']*[\"'][^>]*>\s*(\d+)\s*</td>"#,
+        sizePattern: #"<td[^>]*class=[\"'][^\"']*size[^\"']*[\"'][^>]*>\s*([^<]+?)\s*(?:<span|</td>)"#,
         detailBaseURL: "https://13377x.click",
         timeoutSeconds: 35,
         searchPageCount: 3
@@ -40,6 +41,7 @@ public enum BuiltInProviderConfigs {
         fetchMagnetFromDetailDuringSearch: false,
         seedersPattern: "",
         leechersPattern: "",
+        sizePattern: nil,
         detailBaseURL: "https://thepiratebay.org",
         timeoutSeconds: 12
     )
@@ -57,6 +59,7 @@ public enum BuiltInProviderConfigs {
         fetchMagnetFromDetailDuringSearch: false,
         seedersPattern: "Seeders/Leechers\\\">\\[<font color=\\\"green\\\">\\s*<b>(\\d+)</b>",
         leechersPattern: "</font>/<font color=\\\"#ff0000\\\"><b>(\\d+)</b></font>",
+        sizePattern: "Size\\\">\\s*([^<\\[]+)",
         detailBaseURL: "https://torrentgalaxy.one",
         timeoutSeconds: 12,
         searchPageCount: 3
