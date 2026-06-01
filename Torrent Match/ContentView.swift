@@ -11,6 +11,7 @@ import TorrentMatcherCore
 
 struct ContentView: View {
     private let searchService = TorrentSearchService(configs: BuiltInProviderConfigs.default)
+    private let maxConcurrentMagnetPrefetches = 8
 
     // MARK: - Search / Results State
     @AppStorage("transmission.rpcURL") private var transmissionRPCURL: String = ""
@@ -26,7 +27,9 @@ struct ContentView: View {
     @State private var alertMessage: String? = nil
     @State private var transmissionSendPhase: TransmissionSendPhase = .idle
     @State private var isPresentingTransmissionSettings: Bool = false
-    @State private var magnetPrefetchTask: Task<Void, Never>? = nil
+    @State private var magnetPrefetchQueue: [MagnetPrefetchCandidate] = []
+    @State private var activeMagnetPrefetchTasks: [String: Task<Void, Never>] = [:]
+    @State private var attemptedMagnetPrefetchKeys: Set<String> = []
     @State private var selectedMagnetPrefetchTask: Task<Void, Never>? = nil
 
     var sortedResults: [SearchResult] {
@@ -64,8 +67,18 @@ struct ContentView: View {
                         ErrorStateView(message: message, retry: performSearch)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else if isSearching {
-                        SearchProgressView(foundCount: foundSoFar)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        if sortedResults.isEmpty {
+                            SearchProgressView(foundCount: foundSoFar)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        } else {
+                            VStack(spacing: 0) {
+                                SearchProgressHeader(foundCount: foundSoFar)
+                                    .padding(.horizontal)
+                                    .padding(.vertical, 8)
+                                Divider()
+                                ResultsListView(results: sortedResults, selected: $selected)
+                            }
+                        }
                     } else if sortedResults.isEmpty {
                         EmptyResultsView()
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -183,13 +196,16 @@ struct ContentView: View {
         foundSoFar = 0
         results = []
         selected = nil
-        magnetPrefetchTask?.cancel()
+        cancelMagnetPrefetchPipeline()
         selectedMagnetPrefetchTask?.cancel()
 
         Task { @MainActor in
-            let report = await searchService.searchAndRankReport(trimmed) { found in
+            let report = await searchService.searchAndRankReport(trimmed) { update in
                 Task { @MainActor in
-                    foundSoFar = found
+                    foundSoFar = update.foundSoFar
+                    results = dedupedResults(update.results.map(SearchResult.init))
+                    reconcileSelectedResult()
+                    prefetchMagnetsIfNeeded(from: results)
                 }
             }
             results = dedupedResults(report.results.map(SearchResult.init))
@@ -201,7 +217,8 @@ struct ContentView: View {
                 errorMessage = "No results. Providers reported errors:\n\(details)\n\nThis often means the site is blocked on your current network/DNS."
             }
             isSearching = false
-            prefetchTopMagnets(from: results)
+            reconcileSelectedResult()
+            prefetchMagnetsIfNeeded(from: results)
         }
     }
 
@@ -259,17 +276,30 @@ struct ContentView: View {
         return magnet
     }
 
-    private func prefetchTopMagnets(from searchResults: [SearchResult]) {
-        magnetPrefetchTask?.cancel()
+    private func prefetchMagnetsIfNeeded(from searchResults: [SearchResult]) {
         let candidates = magnetPrefetchCandidates(from: searchResults)
         guard !candidates.isEmpty else { return }
 
-        magnetPrefetchTask = Task { @MainActor in
-            for candidate in candidates {
-                guard !Task.isCancelled else { return }
-                await warmMagnet(for: candidate)
+        for candidate in candidates {
+            let key = magnetPrefetchDedupKey(for: candidate)
+            guard activeMagnetPrefetchTasks[key] == nil else { continue }
+            guard !attemptedMagnetPrefetchKeys.contains(key) else { continue }
+
+            if let existingIndex = magnetPrefetchQueue.firstIndex(where: { $0.key == key }) {
+                magnetPrefetchQueue[existingIndex] = MagnetPrefetchCandidate(key: key, result: candidate)
+            } else {
+                magnetPrefetchQueue.append(MagnetPrefetchCandidate(key: key, result: candidate))
             }
         }
+
+        magnetPrefetchQueue.sort { lhs, rhs in
+            if lhs.result.score != rhs.result.score {
+                return lhs.result.score > rhs.result.score
+            }
+            return lhs.result.title < rhs.result.title
+        }
+
+        startQueuedMagnetPrefetchesIfNeeded()
     }
 
     private func prefetchSelectedMagnet(for searchResult: SearchResult?) {
@@ -287,14 +317,20 @@ struct ContentView: View {
             .sorted { $0.score > $1.score }
             .filter(shouldPrefetchMagnet)
             .filter { result in
-                let key: String
-                if let detailURL = result.detailURL?.absoluteString {
-                    key = "\(result.provider)|\(detailURL)"
-                } else {
-                    key = "\(result.provider)|\(result.id.uuidString)"
-                }
+                let key = magnetPrefetchDedupKey(for: result)
                 return seenResolutionKeys.insert(key).inserted
             }
+    }
+
+    private func magnetPrefetchDedupKey(for result: SearchResult) -> String {
+        let normalizedTitle = result.title.normalizedDedupeKey
+        if !normalizedTitle.isEmpty {
+            return normalizedTitle
+        }
+        if let detailURL = result.detailURL?.absoluteString, !detailURL.isEmpty {
+            return detailURL
+        }
+        return result.id.uuidString
     }
 
     private func shouldPrefetchMagnet(for searchResult: SearchResult) -> Bool {
@@ -306,7 +342,9 @@ struct ContentView: View {
             guard let magnet = try await searchService.resolveMagnet(for: searchResult.raw),
                   !magnet.isEmpty,
                   !Task.isCancelled else { return }
-            applyResolvedMagnet(magnet, to: searchResult.id)
+            await MainActor.run {
+                applyResolvedMagnet(magnet, to: searchResult.id)
+            }
         } catch {
             return
         }
@@ -320,6 +358,59 @@ struct ContentView: View {
         results = dedupedResults(results)
         if selected?.id == resultID {
             selected = results.first(where: { $0.id == updated.id })
+        }
+    }
+
+    private func cancelMagnetPrefetchPipeline() {
+        activeMagnetPrefetchTasks.values.forEach { $0.cancel() }
+        activeMagnetPrefetchTasks.removeAll()
+        magnetPrefetchQueue.removeAll()
+        attemptedMagnetPrefetchKeys.removeAll()
+    }
+
+    private func startQueuedMagnetPrefetchesIfNeeded() {
+        while activeMagnetPrefetchTasks.count < maxConcurrentMagnetPrefetches {
+            guard let nextCandidate = nextMagnetPrefetchCandidate() else { return }
+
+            let key = nextCandidate.key
+            attemptedMagnetPrefetchKeys.insert(key)
+            activeMagnetPrefetchTasks[key] = Task {
+                defer {
+                    Task { @MainActor in
+                        activeMagnetPrefetchTasks[key] = nil
+                        startQueuedMagnetPrefetchesIfNeeded()
+                    }
+                }
+                guard !Task.isCancelled else { return }
+                await warmMagnet(for: nextCandidate.result)
+            }
+        }
+    }
+
+    private func nextMagnetPrefetchCandidate() -> MagnetPrefetchCandidate? {
+        while !magnetPrefetchQueue.isEmpty {
+            let candidate = magnetPrefetchQueue.removeFirst()
+            let latestCandidate = latestMagnetPrefetchCandidate(forKey: candidate.key)
+            if let latestCandidate {
+                return MagnetPrefetchCandidate(key: candidate.key, result: latestCandidate)
+            }
+        }
+        return nil
+    }
+
+    private func latestMagnetPrefetchCandidate(forKey key: String) -> SearchResult? {
+        magnetPrefetchCandidates(from: results).first { magnetPrefetchDedupKey(for: $0) == key }
+    }
+
+    private func reconcileSelectedResult() {
+        guard let selected else { return }
+        if let refreshed = results.first(where: { $0.id == selected.id }) {
+            self.selected = refreshed
+            return
+        }
+        if let magnetHash = selected.magnet?.infoHashFromMagnet,
+           let refreshed = results.first(where: { $0.magnet?.infoHashFromMagnet == magnetHash }) {
+            self.selected = refreshed
         }
     }
 
@@ -536,6 +627,11 @@ struct ContentView: View {
     }
 }
 
+private struct MagnetPrefetchCandidate {
+    let key: String
+    let result: SearchResult
+}
+
 private enum TransmissionConfigurationError: LocalizedError {
     case missingRPCURL
     case invalidRPCURL
@@ -574,6 +670,36 @@ private struct SearchProgressView: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
+        }
+    }
+
+    private func animatedDots(for date: Date) -> String {
+        let phase = Int(date.timeIntervalSinceReferenceDate * 2).quotientAndRemainder(dividingBy: 3).remainder + 1
+        return String(repeating: ".", count: phase)
+    }
+
+    private func releaseCountText(_ count: Int) -> String {
+        count == 1 ? "1 result found" : "\(count) results found"
+    }
+}
+
+private struct SearchProgressHeader: View {
+    let foundCount: Int
+
+    var body: some View {
+        HStack(spacing: 12) {
+            ProgressView()
+                .controlSize(.small)
+            VStack(alignment: .leading, spacing: 2) {
+                TimelineView(.periodic(from: .now, by: 0.5)) { context in
+                    Text("Searching providers\(animatedDots(for: context.date))")
+                }
+                .font(.callout.weight(.medium))
+                Text(releaseCountText(foundCount))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
         }
     }
 
@@ -752,7 +878,7 @@ enum ParserRankerAdapter {
 
     static func displayName(for resolution: Resolution) -> String {
         switch resolution {
-        case .p2160: return "2160p"
+        case .p2160: return "4K"
         case .p1080: return "1080p"
         case .likely1080: return "Likely 1080p"
         case .p720: return "720p"
@@ -776,7 +902,7 @@ enum ParserRankerAdapter {
     static func displayName(for videoCodec: VideoCodec) -> String {
         switch videoCodec {
         case .hevc: return "HEVC"
-        case .avc: return "x264"
+        case .avc: return "h264"
         case .av1: return "AV1"
         case .unknown: return "Unknown"
         }
@@ -790,19 +916,22 @@ enum ParserRankerAdapter {
         case .pcm: base = "PCM"
         case .ddp: base = "DDP"
         case .dts: base = "DTS"
-        case .dd: base = "DD/AC3"
+        case .dd: base = "DD"
         case .aac: base = "AAC"
         case .unknown: base = "Unknown"
         }
-        if atmos { return base + " Atmos" } else { return base }
+        return base
     }
 
     static func audioSummary(codec: AudioCodec, channels: ChannelLayout, atmos: Bool) -> String {
-        let audio = displayName(for: codec, atmos: atmos)
+        var parts: [String] = [displayName(for: codec, atmos: false)]
         if let channelText = channelsString(channels) {
-            return "\(audio) \(channelText)"
+            parts.append(channelText)
         }
-        return audio
+        if atmos {
+            parts.append("Atmos")
+        }
+        return parts.joined(separator: " ")
     }
 }
 
@@ -1034,13 +1163,13 @@ private struct ResultRow: View {
                         if result.imax {
                             MetaChip(text: "IMAX", systemImage: "rectangle.expand.vertical")
                         }
-                        if let size = result.size, !size.isEmpty {
-                            MetaChip(text: size, systemImage: "externaldrive")
-                        }
                     }
-                    if result.seeders != nil || result.leechers != nil {
+                    if result.seeders != nil || result.leechers != nil || (result.size?.isEmpty == false) {
                         HStack(spacing: 12) {
                             MetaChip(text: result.provider, systemImage: "network")
+                            if let size = result.size, !size.isEmpty {
+                                MetaChip(text: size, systemImage: "externaldrive")
+                            }
                             if let seeders = result.seeders {
                                 MetaChip(text: "\(seeders)", systemImage: "arrow.up.circle")
                             }

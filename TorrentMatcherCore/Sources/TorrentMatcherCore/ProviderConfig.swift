@@ -57,11 +57,18 @@ public struct ProviderConfig: Codable, Identifiable, Hashable, Sendable {
 
 public protocol TorrentProvider: Sendable {
     var config: ProviderConfig { get }
-    func search(_ query: String) async throws -> [TorrentSearchResult]
+    func search(
+        _ query: String,
+        onProgress: (@Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)?
+    ) async throws -> [TorrentSearchResult]
     func resolveMagnet(for result: TorrentSearchResult) async throws -> String?
 }
 
 public extension TorrentProvider {
+    func search(_ query: String) async throws -> [TorrentSearchResult] {
+        try await search(query, onProgress: nil)
+    }
+
     func resolveMagnet(for result: TorrentSearchResult) async throws -> String? {
         result.magnet
     }

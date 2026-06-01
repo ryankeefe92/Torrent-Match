@@ -5,12 +5,11 @@ public enum BuiltInProviderConfigs {
         id: "1337x",
         name: "1337x",
         enabled: true,
-        searchURLTemplate: "https://13377x.click/sort-search/{{query}}/seeders/desc/{{page}}/",
+        searchURLTemplate: "https://www.1337xx.to/category-search/{{query}}/Movies/{{page}}/",
         alternateSearchURLTemplates: [
-            "https://13377x.click/sort-category-search/{{query}}/Movies/seeders/desc/{{page}}/",
-            "https://13377x.click/search/{{query}}/{{page}}/",
+            "https://www.1337xx.to/sort-category-search/{{query}}/Movies/seeders/desc/{{page}}/",
             "https://13377x.click/category-search/{{query}}/Movies/{{page}}/",
-            "https://13377x.click/srch?search={{query}}"
+            "https://13377x.click/sort-category-search/{{query}}/Movies/seeders/desc/{{page}}/"
         ],
         resultBlockPattern: #"<tr[^>]*>([\s\S]*?)</tr>"#,
         titlePattern: #"<a[^>]+href=[\"'](?:https?://[^\"']+)?/torrent/[^\"']+[\"'][^>]*>([^<]+)</a>"#,
@@ -20,7 +19,7 @@ public enum BuiltInProviderConfigs {
         seedersPattern: #"<td[^>]*class=[\"'][^\"']*seeds[^\"']*[\"'][^>]*>\s*(\d+)\s*</td>"#,
         leechersPattern: #"<td[^>]*class=[\"'][^\"']*leeches[^\"']*[\"'][^>]*>\s*(\d+)\s*</td>"#,
         sizePattern: #"<td[^>]*class=[\"'][^\"']*size[^\"']*[\"'][^>]*>\s*([^<]+?)\s*(?:<span|</td>)"#,
-        detailBaseURL: "https://13377x.click",
+        detailBaseURL: "https://www.1337xx.to",
         timeoutSeconds: 30,
         searchPageCount: 3
     )
@@ -59,7 +58,7 @@ public enum BuiltInProviderConfigs {
         fetchMagnetFromDetailDuringSearch: false,
         seedersPattern: "Seeders/Leechers\\\">\\[<font color=\\\"green\\\">\\s*<b>(\\d+)</b>",
         leechersPattern: "</font>/<font color=\\\"#ff0000\\\"><b>(\\d+)</b></font>",
-        sizePattern: "Size\\\">\\s*([^<\\[]+)",
+        sizePattern: #"<span[^>]*class=\"badge badge-secondary[^\"]*\"[^>]*>\s*([^<]+?)\s*</span>"#,
         detailBaseURL: "https://torrentgalaxy.one",
         timeoutSeconds: 30,
         searchPageCount: 3

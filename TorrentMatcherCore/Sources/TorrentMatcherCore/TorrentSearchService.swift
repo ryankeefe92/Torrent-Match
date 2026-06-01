@@ -20,6 +20,16 @@ public struct RankedSearchReport: Sendable {
     }
 }
 
+public struct RankedSearchUpdate: Sendable {
+    public let results: [RankedTorrentResult]
+    public let foundSoFar: Int
+
+    public init(results: [RankedTorrentResult], foundSoFar: Int) {
+        self.results = results
+        self.foundSoFar = foundSoFar
+    }
+}
+
 public final class TorrentSearchService: @unchecked Sendable {
     private let providers: [TorrentProvider]
     private let weights: RankerWeights
@@ -57,9 +67,9 @@ public final class TorrentSearchService: @unchecked Sendable {
     }
 
     public func searchAndRankReport(_ query: String) async -> RankedSearchReport {
-        let report = await searchReport(query, onProgress: nil)
+        let report = await searchReport(query, onProgress: nil, onUpdate: nil)
         return RankedSearchReport(
-            results: TorrentRanker.rank(report.results, hideExcluded: true, weights: weights),
+            results: rankVisibleResults(report.results, matching: query, weights: weights),
             failures: report.failures
         )
     }
@@ -68,15 +78,26 @@ public final class TorrentSearchService: @unchecked Sendable {
         _ query: String,
         onProgress: (@Sendable (_ foundSoFar: Int) -> Void)?
     ) async -> RankedSearchReport {
-        let report = await searchReport(query, onProgress: onProgress)
+        let report = await searchReport(query, onProgress: onProgress, onUpdate: nil)
         return RankedSearchReport(
-            results: TorrentRanker.rank(report.results, hideExcluded: true, weights: weights),
+            results: rankVisibleResults(report.results, matching: query, weights: weights),
+            failures: report.failures
+        )
+    }
+
+    public func searchAndRankReport(
+        _ query: String,
+        onUpdate: (@Sendable (_ update: RankedSearchUpdate) -> Void)?
+    ) async -> RankedSearchReport {
+        let report = await searchReport(query, onProgress: nil, onUpdate: onUpdate)
+        return RankedSearchReport(
+            results: rankVisibleResults(report.results, matching: query, weights: weights),
             failures: report.failures
         )
     }
 
     public func searchAll(_ query: String) async -> [TorrentSearchResult] {
-        let report = await searchReport(query, onProgress: nil)
+        let report = await searchReport(query, onProgress: nil, onUpdate: nil)
         return report.results
     }
 
@@ -112,18 +133,36 @@ public final class TorrentSearchService: @unchecked Sendable {
 
     private func searchReport(
         _ query: String,
-        onProgress: (@Sendable (_ foundSoFar: Int) -> Void)?
+        onProgress: (@Sendable (_ foundSoFar: Int) -> Void)?,
+        onUpdate: (@Sendable (_ update: RankedSearchUpdate) -> Void)?
     ) async -> (results: [TorrentSearchResult], failures: [ProviderFailure]) {
+        let progressTracker = SearchProgressTracker(query: query, weights: weights)
         let collected = await withTaskGroup(of: ([TorrentSearchResult], ProviderFailure?).self) { group in
             for provider in providers {
                 group.addTask {
+                    let partialCollector = PartialResultCollector()
                     do {
-                        return (try await self.searchWithTimeout(provider: provider, query: query), nil)
+                        return (
+                            try await self.searchWithTimeout(provider: provider, query: query) { addedResults in
+                                await partialCollector.append(addedResults)
+                                let update = await progressTracker.append(addedResults)
+                                if let onProgress {
+                                    onProgress(update.foundSoFar)
+                                }
+                                if let onUpdate {
+                                    onUpdate(update)
+                                }
+                            },
+                            nil
+                        )
                     }
                     catch {
                         let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
                         print("Provider failed: \(provider.config.name) - \(message)")
-                        return ([], ProviderFailure(providerName: provider.config.name, message: message))
+                        return (
+                            await partialCollector.snapshot(),
+                            ProviderFailure(providerName: provider.config.name, message: message)
+                        )
                     }
                 }
             }
@@ -132,29 +171,32 @@ public final class TorrentSearchService: @unchecked Sendable {
             var failures: [ProviderFailure] = []
             for await outcome in group {
                 collected.append(contentsOf: outcome.0)
-                onProgress?(rankedResultCount(collected, matching: query))
                 if let failure = outcome.1 {
                     failures.append(failure)
                 }
             }
             return (collected, failures)
         }
-        let filtered = filterResults(collected.0, matching: query)
-        return (dedupe(filtered), collected.1)
-    }
-
-    private func searchWithTimeout(provider: TorrentProvider, query: String) async throws -> [TorrentSearchResult] {
-        try await searchWithTimeout(provider: provider, query: query, timeoutOverride: nil)
+        return (dedupe(filterResults(collected.0, matching: query)), collected.1)
     }
 
     private func searchWithTimeout(
         provider: TorrentProvider,
         query: String,
-        timeoutOverride: Int?
+        onProgress: (@Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)?
+    ) async throws -> [TorrentSearchResult] {
+        try await searchWithTimeout(provider: provider, query: query, timeoutOverride: nil, onProgress: onProgress)
+    }
+
+    private func searchWithTimeout(
+        provider: TorrentProvider,
+        query: String,
+        timeoutOverride: Int?,
+        onProgress: (@Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)? = nil
     ) async throws -> [TorrentSearchResult] {
         let seconds = timeoutOverride ?? effectiveTimeout(for: provider, cap: providerTimeoutSeconds)
         return try await withProviderTimeout(provider: provider, seconds: seconds) {
-            try await provider.search(query)
+            try await provider.search(query, onProgress: onProgress)
         }
     }
 
@@ -194,24 +236,11 @@ public final class TorrentSearchService: @unchecked Sendable {
     }
 
     private func dedupe(_ results: [TorrentSearchResult]) -> [TorrentSearchResult] {
-        TorrentResultDedupe.dedupe(results, weights: weights)
+        dedupeResults(results, weights: weights)
     }
 
     private func filterResults(_ results: [TorrentSearchResult], matching query: String) -> [TorrentSearchResult] {
-        let queryTokens = query.searchMatchTokens
-        guard !queryTokens.isEmpty else { return results }
-        return results.filter { result in
-            guard result.title.matchesSearchQueryTokens(queryTokens),
-                  result.title.matchesMovieTitleIdentity(queryTokens: queryTokens) else { return false }
-            if result.provider == "1337x" {
-                return result.title.isLikelyMovieReleaseTitle
-            }
-            return true
-        }
-    }
-
-    private func rankedResultCount(_ results: [TorrentSearchResult], matching query: String) -> Int {
-        TorrentRanker.rank(dedupe(filterResults(results, matching: query)), hideExcluded: true, weights: weights).count
+        filterSearchResults(results, matching: query)
     }
 
     private static func provider(for config: ProviderConfig) -> TorrentProvider {
@@ -222,6 +251,62 @@ public final class TorrentSearchService: @unchecked Sendable {
             return RegexHTMLProvider(config: config)
         }
     }
+}
+
+private actor SearchProgressTracker {
+    private let query: String
+    private let weights: RankerWeights
+    private var results: [TorrentSearchResult] = []
+
+    init(query: String, weights: RankerWeights) {
+        self.query = query
+        self.weights = weights
+    }
+
+    func append(_ addedResults: [TorrentSearchResult]) -> RankedSearchUpdate {
+        results.append(contentsOf: addedResults)
+        let ranked = rankVisibleResults(results, matching: query, weights: weights)
+        return RankedSearchUpdate(results: ranked, foundSoFar: ranked.count)
+    }
+}
+
+private actor PartialResultCollector {
+    private var results: [TorrentSearchResult] = []
+
+    func append(_ addedResults: [TorrentSearchResult]) {
+        results.append(contentsOf: addedResults)
+    }
+
+    func snapshot() -> [TorrentSearchResult] {
+        results
+    }
+}
+
+private func filterSearchResults(_ results: [TorrentSearchResult], matching query: String) -> [TorrentSearchResult] {
+    let queryTokens = query.searchMatchTokens
+    guard !queryTokens.isEmpty else { return results }
+    return results.filter { result in
+        guard result.title.matchesSearchQueryTokens(queryTokens),
+              result.title.matchesMovieTitleIdentity(queryTokens: queryTokens) else { return false }
+        if result.provider == "1337x" {
+            return result.title.isLikelyMovieReleaseTitle
+        }
+        return true
+    }
+}
+
+private func dedupeResults(_ results: [TorrentSearchResult], weights: RankerWeights) -> [TorrentSearchResult] {
+    TorrentResultDedupe.dedupe(results, weights: weights)
+}
+
+private func rankVisibleResults(
+    _ results: [TorrentSearchResult],
+    matching query: String,
+    weights: RankerWeights
+) -> [RankedTorrentResult] {
+    let filtered = filterSearchResults(results, matching: query)
+    let deduped = dedupeResults(filtered, weights: weights)
+    return TorrentRanker.rank(deduped, hideExcluded: true, weights: weights)
 }
 
 private actor MagnetResolutionCache {
@@ -303,12 +388,14 @@ private extension String {
             guard let queryYear else { return true }
             return titleTokens.contains(queryYear)
         }
-        guard queryTitleTokens.count <= titleTokens.count else { return false }
 
-        for startIndex in 0...(titleTokens.count - queryTitleTokens.count) {
-            let endIndex = startIndex + queryTitleTokens.count
-            guard titleTokens[startIndex..<endIndex].elementsEqual(queryTitleTokens) else { continue }
-            if titleMatchesExpectedReleaseContinuation(
+        for startIndex in titleTokens.indices {
+            guard titleTokens[startIndex] == queryTitleTokens[0] else { continue }
+            if let endIndex = matchedQueryTitleEndIndex(
+                titleTokens: titleTokens,
+                queryTitleTokens: queryTitleTokens,
+                startingAt: startIndex
+            ), titleMatchesExpectedReleaseContinuation(
                 titleTokens: titleTokens,
                 after: endIndex,
                 requiredYear: queryYear
@@ -365,13 +452,16 @@ private extension String {
         let titleTokens = searchMatchTokens
         let queryTitleTokens = queryTokens.filter { !Self.isReleaseYearToken($0) }
         guard !titleTokens.isEmpty,
-              !queryTitleTokens.isEmpty,
-              queryTitleTokens.count <= titleTokens.count else { return [] }
+              !queryTitleTokens.isEmpty else { return [] }
 
         var years: [String] = []
-        for startIndex in 0...(titleTokens.count - queryTitleTokens.count) {
-            let endIndex = startIndex + queryTitleTokens.count
-            guard titleTokens[startIndex..<endIndex].elementsEqual(queryTitleTokens) else { continue }
+        for startIndex in titleTokens.indices {
+            guard titleTokens[startIndex] == queryTitleTokens[0],
+                  let endIndex = matchedQueryTitleEndIndex(
+                    titleTokens: titleTokens,
+                    queryTitleTokens: queryTitleTokens,
+                    startingAt: startIndex
+                  ) else { continue }
 
             var currentIndex = endIndex
             while currentIndex < titleTokens.count {
@@ -389,12 +479,48 @@ private extension String {
         return years
     }
 
+    private func matchedQueryTitleEndIndex(
+        titleTokens: [String],
+        queryTitleTokens: [String],
+        startingAt startIndex: Int
+    ) -> Int? {
+        var titleIndex = startIndex
+        var queryIndex = 0
+
+        while titleIndex < titleTokens.count && queryIndex < queryTitleTokens.count {
+            let titleToken = titleTokens[titleIndex]
+            let queryToken = queryTitleTokens[queryIndex]
+            if titleToken == queryToken {
+                titleIndex += 1
+                queryIndex += 1
+                continue
+            }
+
+            if queryIndex > 0 && Self.isIntraTitleBridgeToken(titleToken) {
+                titleIndex += 1
+                continue
+            }
+
+            return nil
+        }
+
+        guard queryIndex == queryTitleTokens.count else { return nil }
+        return titleIndex
+    }
+
     private static func isTitleYearBridgeToken(_ token: String) -> Bool {
         [
-            "anniversary", "collector", "collectors", "criterion", "cut", "dc", "directors", "director", "edition",
-            "extended", "final", "remaster", "remastered", "restored", "restoration",
-            "s", "special", "the", "theatrical", "ultimate", "uncut", "unrated"
+            "a", "an", "and", "anniversary", "collector", "collectors", "criterion", "cut", "dc", "directors",
+            "director", "edition", "extended", "final", "for", "in", "of", "on", "part", "pt", "remaster",
+            "remastered", "restored", "restoration", "s", "special", "the", "theatrical", "to", "ultimate",
+            "uncut", "unrated"
         ].contains(token) || token.range(of: #"^\d+(?:st|nd|rd|th)$"#, options: .regularExpression) != nil
+    }
+
+    private static func isIntraTitleBridgeToken(_ token: String) -> Bool {
+        isTitleYearBridgeToken(token) || [
+            "chapter", "episode", "la", "le"
+        ].contains(token)
     }
 
     private static func isReleaseMarker(in tokens: [String], at index: Int) -> Bool {
@@ -440,7 +566,8 @@ private extension String {
 
         let movieMarkers = [
             "2160P", "1080P", "720P", "BLURAY", "BDRIP", "WEBRIP", "WEB-DL", "WEBDL",
-            "HDRIP", "DVDRIP", "HMAX", "REMUX", "HDR", "DV", "DOVI"
+            "HDRIP", "DVDRIP", "HMAX", "REMUX", "HDR", "DV", "DOVI", "X264", "X265",
+            "H264", "H265", "DDP", "TRUEHD", "DTS"
         ]
         return movieMarkers.contains(where: upper.contains)
     }

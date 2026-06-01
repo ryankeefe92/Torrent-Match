@@ -9,34 +9,44 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
         self.session = session
     }
 
-    public func search(_ query: String) async throws -> [TorrentSearchResult] {
+    public func search(
+        _ query: String,
+        onProgress: (@Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)?
+    ) async throws -> [TorrentSearchResult] {
         guard config.enabled else { return [] }
         guard !config.searchURLTemplate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ProviderError.missingURLTemplate(provider: config.name)
         }
 
-        let encodedQuery = encodedSearchQuery(query)
+        let encodedQueries = encodedSearchQueries(query)
         let searchResult = await withTaskGroup(of: SearchTemplateResult.self) { group in
-            for template in allSearchURLTemplates {
+            for hostTemplates in searchTemplateGroups() {
                 group.addTask {
-                    do {
-                        let results = try await self.fetchSearchResults(template: template, encodedQuery: encodedQuery)
-                        return SearchTemplateResult(results: results, error: nil)
-                    } catch {
-                        return SearchTemplateResult(results: [], error: error)
-                    }
+                    await self.searchTemplateGroup(
+                        hostTemplates,
+                        encodedQueries: encodedQueries,
+                        onProgress: onProgress
+                    )
                 }
             }
 
+            var collectedResults: [TorrentSearchResult] = []
             var lastError: Error?
             for await result in group {
                 if !result.results.isEmpty {
-                    group.cancelAll()
-                    return result
+                    if self.prefersFirstUsableTemplateGroup {
+                        group.cancelAll()
+                        return result
+                    }
+                    collectedResults.append(contentsOf: result.results)
                 }
                 if let error = result.error {
                     lastError = error
                 }
+            }
+
+            if !collectedResults.isEmpty {
+                return SearchTemplateResult(results: collectedResults, error: nil)
             }
 
             return SearchTemplateResult(results: [], error: lastError)
@@ -68,49 +78,146 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
         [config.searchURLTemplate] + config.alternateSearchURLTemplates
     }
 
-    private func fetchSearchResults(template: String, encodedQuery: String) async throws -> [TorrentSearchResult] {
-        let pageCount = searchPageCount(for: template)
+    private var prefersFirstUsableTemplateGroup: Bool {
+        config.id == "1337x"
+    }
 
-        if pageCount == 1 {
-            let url = try searchURL(template: template, encodedQuery: encodedQuery, page: 1)
-            let html = try await fetchText(url)
-            let blocks = RegexTools.captureMatches(pattern: config.resultBlockPattern, in: html)
-            return try await parseResults(from: blocks)
+    private func searchTemplateGroups() -> [[String]] {
+        let grouped = Dictionary(grouping: allSearchURLTemplates) { template in
+            URL(string: template)?.host ?? template
         }
 
-        let pageFetch = await withTaskGroup(of: SearchPageResult.self) { group in
-            for page in 1...pageCount {
-                group.addTask {
-                    do {
-                        let url = try self.searchURL(template: template, encodedQuery: encodedQuery, page: page)
-                        let html = try await self.fetchText(url)
-                        let blocks = RegexTools.captureMatches(pattern: self.config.resultBlockPattern, in: html)
-                        return SearchPageResult(page: page, results: try await self.parseResults(from: blocks), errorMessage: nil)
-                    } catch {
-                        return SearchPageResult(page: page, results: [], errorMessage: self.errorMessage(from: error))
+        return grouped
+            .sorted { lhs, rhs in
+                let lhsIsPrimary = lhs.value.contains(config.searchURLTemplate)
+                let rhsIsPrimary = rhs.value.contains(config.searchURLTemplate)
+                if lhsIsPrimary != rhsIsPrimary {
+                    return lhsIsPrimary && !rhsIsPrimary
+                }
+                return lhs.key < rhs.key
+            }
+            .map(\.value)
+    }
+
+    private func searchTemplateGroup(
+        _ templates: [String],
+        encodedQueries: [String],
+        onProgress: (@Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)?
+    ) async -> SearchTemplateResult {
+        await withTaskGroup(of: SearchTemplateResult.self) { group in
+            for encodedQuery in encodedQueries {
+                for template in templates {
+                    group.addTask {
+                        do {
+                            let results = try await self.fetchSearchResults(
+                                template: template,
+                                encodedQuery: encodedQuery,
+                                onProgress: onProgress
+                            )
+                            return SearchTemplateResult(results: results, error: nil)
+                        } catch {
+                            return SearchTemplateResult(results: [], error: error)
+                        }
                     }
                 }
             }
 
-            var resultsByPage: [Int: [TorrentSearchResult]] = [:]
-            var firstErrorMessage: String?
+            var collectedResults: [TorrentSearchResult] = []
+            var lastError: Error?
             for await result in group {
-                resultsByPage[result.page] = result.results
-                if firstErrorMessage == nil {
-                    firstErrorMessage = result.errorMessage
+                if !result.results.isEmpty {
+                    collectedResults.append(contentsOf: result.results)
+                    if self.prefersFirstUsableTemplateGroup {
+                        // 1337x can have many slow/blocked templates; once any template yields parseable
+                        // rows we return immediately and cancel the rest.
+                        group.cancelAll()
+                        return SearchTemplateResult(results: collectedResults, error: nil)
+                    }
+                }
+                if let error = result.error {
+                    lastError = error
+                }
+            }
+
+            if !collectedResults.isEmpty {
+                return SearchTemplateResult(results: collectedResults, error: nil)
+            }
+            return SearchTemplateResult(results: [], error: lastError)
+        }
+    }
+
+    private func fetchSearchResults(
+        template: String,
+        encodedQuery: String,
+        onProgress: (@Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)?
+    ) async throws -> [TorrentSearchResult] {
+        let pageCount = searchPageCount(for: template)
+        let requestTimeoutSeconds = searchRequestTimeoutSeconds()
+
+        if pageCount == 1 {
+            let url = try searchURL(template: template, encodedQuery: encodedQuery, page: 1)
+            let html = try await fetchText(url, timeoutSeconds: requestTimeoutSeconds)
+            let blocks = RegexTools.captureMatches(pattern: config.resultBlockPattern, in: html)
+            return try await parseResults(from: blocks, onProgress: onProgress)
+        }
+
+        let pageFetch = await withTaskGroup(of: SearchPageEvent.self) { group in
+            for page in 1...pageCount {
+                group.addTask {
+                    do {
+                        let url = try self.searchURL(template: template, encodedQuery: encodedQuery, page: page)
+                        let html = try await self.fetchText(url, timeoutSeconds: requestTimeoutSeconds)
+                        let blocks = RegexTools.captureMatches(pattern: self.config.resultBlockPattern, in: html)
+                        return .page(SearchPageResult(page: page, results: try await self.parseResults(from: blocks, onProgress: onProgress), errorMessage: nil))
+                    } catch {
+                        return .page(SearchPageResult(page: page, results: [], errorMessage: self.errorMessage(from: error)))
+                    }
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(self.searchCollectionTimeoutSeconds()) * 1_000_000_000)
+                return .timeout
+            }
+
+            var resultsByPage: [Int: [TorrentSearchResult]] = [:]
+            var pagesSeen: Set<Int> = []
+            var firstErrorMessage: String?
+            var hitCollectionTimeout = false
+            for await event in group {
+                switch event {
+                case .page(let result):
+                    resultsByPage[result.page] = result.results
+                    pagesSeen.insert(result.page)
+                    if firstErrorMessage == nil {
+                        firstErrorMessage = result.errorMessage
+                    }
+                    if pagesSeen.count >= pageCount {
+                        // All page fetches have completed; don't wait for the collection timeout task.
+                        group.cancelAll()
+                    }
+                case .timeout:
+                    hitCollectionTimeout = true
+                    group.cancelAll()
                 }
             }
 
             return (
                 results: (1...pageCount).flatMap { resultsByPage[$0] ?? [] },
-                firstErrorMessage: firstErrorMessage
+                firstErrorMessage: firstErrorMessage,
+                hitCollectionTimeout: hitCollectionTimeout
             )
         }
 
-        if pageFetch.results.isEmpty, let firstErrorMessage = pageFetch.firstErrorMessage {
+        if !pageFetch.results.isEmpty {
+            return pageFetch.results
+        }
+        if pageFetch.hitCollectionTimeout {
+            throw ProviderError.timedOut(provider: config.name, seconds: searchCollectionTimeoutSeconds())
+        }
+        if let firstErrorMessage = pageFetch.firstErrorMessage {
             throw ProviderError.accessBlocked(provider: config.name, reason: firstErrorMessage)
         }
-        return pageFetch.results
+        return []
     }
 
     private func searchPageCount(for template: String) -> Int {
@@ -128,15 +235,28 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
         return url
     }
 
-    private func parseResults(from blocks: [String]) async throws -> [TorrentSearchResult] {
+    private func parseResults(
+        from blocks: [String],
+        onProgress: (@Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)?
+    ) async throws -> [TorrentSearchResult] {
         var results: [TorrentSearchResult] = []
         for block in blocks {
             guard let title = RegexTools.firstCapture(pattern: config.titlePattern, in: block)?.htmlDecoded.cleanedText,
                   !title.isEmpty else { continue }
 
-            let seeders = RegexTools.firstCapture(pattern: config.seedersPattern, in: block).flatMap(Int.init) ?? 0
-            let leechers = RegexTools.firstCapture(pattern: config.leechersPattern, in: block).flatMap(Int.init) ?? 0
-            guard !(seeders == 0 && leechers < 2) else { continue }
+            let seedersCapture = RegexTools.firstCapture(pattern: config.seedersPattern, in: block)
+            let leechersCapture = RegexTools.firstCapture(pattern: config.leechersPattern, in: block)
+            let parsedSeeders = seedersCapture.flatMap(Int.init)
+            let parsedLeechers = leechersCapture.flatMap(Int.init)
+
+            let seeders = parsedSeeders ?? 0
+            let leechers = parsedLeechers ?? 0
+
+            // Only apply this low-activity drop heuristic when we successfully parsed both values.
+            // Some providers change markup; defaulting to 0/0 and then dropping silently causes false-empty searches.
+            if parsedSeeders != nil && parsedLeechers != nil {
+                guard !(seeders == 0 && leechers < 2) else { continue }
+            }
             let size = config.sizePattern.flatMap { RegexTools.firstCapture(pattern: $0, in: block) }?.htmlDecoded.cleanedText
 
             let inlineMagnet = config.magnetPattern.flatMap { RegexTools.firstCapture(pattern: $0, in: block) }?.htmlDecoded
@@ -152,7 +272,7 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
                 magnet = nil
             }
 
-            results.append(TorrentSearchResult(
+            let result = TorrentSearchResult(
                 title: title,
                 magnet: magnet,
                 detailURL: detailURL,
@@ -160,7 +280,11 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
                 leechers: leechers,
                 provider: config.name,
                 size: size
-            ))
+            )
+            results.append(result)
+            if let onProgress {
+                await onProgress([result])
+            }
         }
         return results
     }
@@ -238,11 +362,34 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
         return URL(string: "\(scheme)://\(host)/")
     }
 
-    private func encodedSearchQuery(_ query: String) -> String {
-        let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
-        guard config.id == "1337x" else { return encoded }
+    private func encodedSearchQueries(_ query: String) -> [String] {
+        searchQueryVariants(query)
+            .map { $0.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? $0 }
+            .uniquedPreservingOrder()
+    }
 
-        return encoded.replacingOccurrences(of: "%20", with: "+")
+    private func searchQueryVariants(_ query: String) -> [String] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [query] }
+        guard config.id == "1337x" else { return [trimmed] }
+
+        let tokens = trimmed.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
+        guard tokens.count > 1,
+              ["a", "an", "the"].contains(tokens[0].lowercased()) else {
+            return [trimmed]
+        }
+
+        return [trimmed, tokens.dropFirst().joined(separator: " ")]
+    }
+
+    private func searchRequestTimeoutSeconds() -> Int {
+        let providerTimeout = config.timeoutSeconds ?? 20
+        return max(5, providerTimeout - 2)
+    }
+
+    private func searchCollectionTimeoutSeconds() -> Int {
+        let providerTimeout = config.timeoutSeconds ?? 20
+        return max(5, providerTimeout - 3)
     }
 }
 
@@ -252,7 +399,19 @@ private struct SearchPageResult: Sendable {
     let errorMessage: String?
 }
 
+private enum SearchPageEvent: Sendable {
+    case page(SearchPageResult)
+    case timeout
+}
+
 private struct SearchTemplateResult: Sendable {
     let results: [TorrentSearchResult]
     let error: Error?
+}
+
+private extension Array where Element: Hashable {
+    func uniquedPreservingOrder() -> [Element] {
+        var seen = Set<Element>()
+        return filter { seen.insert($0).inserted }
+    }
 }

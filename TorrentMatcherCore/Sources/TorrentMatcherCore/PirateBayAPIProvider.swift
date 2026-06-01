@@ -9,7 +9,10 @@ public final class PirateBayAPIProvider: TorrentProvider, @unchecked Sendable {
         self.session = session
     }
 
-    public func search(_ query: String) async throws -> [TorrentSearchResult] {
+    public func search(
+        _ query: String,
+        onProgress: (@Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)?
+    ) async throws -> [TorrentSearchResult] {
         guard config.enabled else { return [] }
         let encodedQuery = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
         let templates = [config.searchURLTemplate] + config.alternateSearchURLTemplates
@@ -18,7 +21,7 @@ public final class PirateBayAPIProvider: TorrentProvider, @unchecked Sendable {
             for template in templates {
                 group.addTask {
                     do {
-                        return .success(try await self.search(template: template, encodedQuery: encodedQuery))
+                        return .success(try await self.search(template: template, encodedQuery: encodedQuery, onProgress: onProgress))
                     } catch {
                         return .failure(error)
                     }
@@ -52,7 +55,11 @@ public final class PirateBayAPIProvider: TorrentProvider, @unchecked Sendable {
         }
     }
 
-    private func search(template: String, encodedQuery: String) async throws -> [TorrentSearchResult] {
+    private func search(
+        template: String,
+        encodedQuery: String,
+        onProgress: (@Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)?
+    ) async throws -> [TorrentSearchResult] {
         let urlString = template.replacingOccurrences(of: "{{query}}", with: encodedQuery)
         guard let url = URL(string: urlString) else { throw ProviderError.invalidURL(urlString) }
 
@@ -67,21 +74,24 @@ public final class PirateBayAPIProvider: TorrentProvider, @unchecked Sendable {
         }
 
         let results = try JSONDecoder().decode([PirateBayAPITorrent].self, from: data)
-        return results.compactMap { torrent -> TorrentSearchResult? in
+        var output: [TorrentSearchResult] = []
+        output.reserveCapacity(results.count)
+
+        for torrent in results {
             guard let title = torrent.name?.trimmingCharacters(in: .whitespacesAndNewlines),
                   !title.isEmpty,
                   torrent.id != "0" else {
-                return nil
+                continue
             }
 
             let seeders = Int(torrent.seeders ?? "") ?? 0
             let leechers = Int(torrent.leechers ?? "") ?? 0
-            guard !(seeders == 0 && leechers < 2) else { return nil }
+            guard !(seeders == 0 && leechers < 2) else { continue }
 
             let magnet = torrent.infoHash.flatMap(makeMagnet(infoHash:))
             let detailURL = URL(string: "https://thepiratebay.org/description.php?id=\(torrent.id)")
 
-            return TorrentSearchResult(
+            let result = TorrentSearchResult(
                 title: title,
                 magnet: magnet,
                 detailURL: detailURL,
@@ -90,7 +100,12 @@ public final class PirateBayAPIProvider: TorrentProvider, @unchecked Sendable {
                 provider: config.name,
                 size: torrent.size.flatMap(Self.formattedByteSize)
             )
+            output.append(result)
+            if let onProgress {
+                await onProgress([result])
+            }
         }
+        return output
     }
 
     private func makeRequest(url: URL) -> URLRequest {

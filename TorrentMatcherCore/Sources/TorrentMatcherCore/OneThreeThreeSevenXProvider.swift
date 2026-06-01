@@ -8,7 +8,10 @@ public final class OneThreeThreeSevenXProvider: TorrentProvider, @unchecked Send
         self.config = config
     }
 
-    public func search(_ query: String) async throws -> [TorrentSearchResult] {
+    public func search(
+        _ query: String,
+        onProgress: (@Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)?
+    ) async throws -> [TorrentSearchResult] {
         guard config.enabled else { return [] }
         guard !config.searchURLTemplate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ProviderError.missingURLTemplate(provider: config.name)
@@ -30,7 +33,7 @@ public final class OneThreeThreeSevenXProvider: TorrentProvider, @unchecked Send
                             return SearchTemplateResult(results: [], error: nil)
                         }
                         return SearchTemplateResult(
-                            results: try await self.parseResults(from: blocks, referer: url),
+                            results: try await self.parseResults(from: blocks, referer: url, onProgress: onProgress),
                             error: nil
                         )
                     } catch {
@@ -63,15 +66,28 @@ public final class OneThreeThreeSevenXProvider: TorrentProvider, @unchecked Send
         [config.searchURLTemplate] + config.alternateSearchURLTemplates
     }
 
-    private func parseResults(from blocks: [String], referer: URL) async throws -> [TorrentSearchResult] {
+    private func parseResults(
+        from blocks: [String],
+        referer: URL,
+        onProgress: (@Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)?
+    ) async throws -> [TorrentSearchResult] {
         var results: [TorrentSearchResult] = []
         for block in blocks {
             guard let title = RegexTools.firstCapture(pattern: config.titlePattern, in: block)?.htmlDecoded.cleanedText,
                   !title.isEmpty else { continue }
 
-            let seeders = RegexTools.firstCapture(pattern: config.seedersPattern, in: block).flatMap(Int.init) ?? 0
-            let leechers = RegexTools.firstCapture(pattern: config.leechersPattern, in: block).flatMap(Int.init) ?? 0
-            guard !(seeders == 0 && leechers < 2) else { continue }
+            let seedersCapture = RegexTools.firstCapture(pattern: config.seedersPattern, in: block)
+            let leechersCapture = RegexTools.firstCapture(pattern: config.leechersPattern, in: block)
+            let parsedSeeders = seedersCapture.flatMap(Int.init)
+            let parsedLeechers = leechersCapture.flatMap(Int.init)
+
+            let seeders = parsedSeeders ?? 0
+            let leechers = parsedLeechers ?? 0
+
+            // Only apply this low-activity drop heuristic when we successfully parsed both values.
+            if parsedSeeders != nil && parsedLeechers != nil {
+                guard !(seeders == 0 && leechers < 2) else { continue }
+            }
             let size = config.sizePattern.flatMap { RegexTools.firstCapture(pattern: $0, in: block) }?.htmlDecoded.cleanedText
 
             let inlineMagnet = config.magnetPattern.flatMap { RegexTools.firstCapture(pattern: $0, in: block) }?.htmlDecoded
@@ -86,7 +102,7 @@ public final class OneThreeThreeSevenXProvider: TorrentProvider, @unchecked Send
                 magnet = nil
             }
 
-            results.append(TorrentSearchResult(
+            let result = TorrentSearchResult(
                 title: title,
                 magnet: magnet,
                 detailURL: detailURL,
@@ -94,7 +110,11 @@ public final class OneThreeThreeSevenXProvider: TorrentProvider, @unchecked Send
                 leechers: leechers,
                 provider: config.name,
                 size: size
-            ))
+            )
+            results.append(result)
+            if let onProgress {
+                await onProgress([result])
+            }
         }
         return results
     }
