@@ -21,7 +21,7 @@ public enum BuiltInProviderConfigs {
         leechersPattern: #"<td[^>]*class=[\"'][^\"']*leeches[^\"']*[\"'][^>]*>\s*(\d+)\s*</td>"#,
         sizePattern: #"<td[^>]*class=[\"'][^\"']*size[^\"']*[\"'][^>]*>\s*([^<]+?)\s*(?:<span|</td>)"#,
         detailBaseURL: "https://13377x.click",
-        timeoutSeconds: 35,
+        timeoutSeconds: 30,
         searchPageCount: 3
     )
 
@@ -43,7 +43,7 @@ public enum BuiltInProviderConfigs {
         leechersPattern: "",
         sizePattern: nil,
         detailBaseURL: "https://thepiratebay.org",
-        timeoutSeconds: 12
+        timeoutSeconds: 30
     )
 
     public static let torrentGalaxy = ProviderConfig(
@@ -61,7 +61,7 @@ public enum BuiltInProviderConfigs {
         leechersPattern: "</font>/<font color=\\\"#ff0000\\\"><b>(\\d+)</b></font>",
         sizePattern: "Size\\\">\\s*([^<\\[]+)",
         detailBaseURL: "https://torrentgalaxy.one",
-        timeoutSeconds: 12,
+        timeoutSeconds: 30,
         searchPageCount: 3
     )
 

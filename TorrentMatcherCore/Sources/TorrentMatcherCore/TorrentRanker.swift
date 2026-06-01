@@ -22,7 +22,7 @@ public struct RankerWeights: Codable, Hashable, Sendable {
         ddpAtmosBonus: 9,
         trueHDAtmosBonus: 0,
         topTierUHDRemuxBonus: 100,
-        imaxBonus: 8
+        imaxBonus: 13
     )
 }
 

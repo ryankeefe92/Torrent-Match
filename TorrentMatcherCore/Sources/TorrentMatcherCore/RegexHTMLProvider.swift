@@ -16,21 +16,36 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
         }
 
         let encodedQuery = encodedSearchQuery(query)
-        var lastError: Error?
-
-        for template in allSearchURLTemplates {
-            do {
-                let results = try await fetchSearchResults(template: template, encodedQuery: encodedQuery)
-                if !results.isEmpty { return results }
-            } catch {
-                lastError = error
+        let searchResult = await withTaskGroup(of: SearchTemplateResult.self) { group in
+            for template in allSearchURLTemplates {
+                group.addTask {
+                    do {
+                        let results = try await self.fetchSearchResults(template: template, encodedQuery: encodedQuery)
+                        return SearchTemplateResult(results: results, error: nil)
+                    } catch {
+                        return SearchTemplateResult(results: [], error: error)
+                    }
+                }
             }
+
+            var lastError: Error?
+            for await result in group {
+                if !result.results.isEmpty {
+                    group.cancelAll()
+                    return result
+                }
+                if let error = result.error {
+                    lastError = error
+                }
+            }
+
+            return SearchTemplateResult(results: [], error: lastError)
         }
 
-        if let lastError {
-            throw lastError
+        if let error = searchResult.error {
+            throw error
         }
-        return []
+        return searchResult.results
     }
 
     public func resolveMagnet(for result: TorrentSearchResult) async throws -> String? {
@@ -41,7 +56,11 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
               let magnetPattern = config.magnetPattern else {
             return nil
         }
-        let html = try await fetchText(detailURL)
+        let html = try await fetchText(
+            detailURL,
+            referer: sameSiteHomeURL(for: detailURL),
+            timeoutSeconds: 35
+        )
         return RegexTools.firstCapture(pattern: magnetPattern, in: html)?.htmlDecoded
     }
 
@@ -127,7 +146,7 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
             if let inlineMagnet {
                 magnet = inlineMagnet
             } else if config.fetchMagnetFromDetailDuringSearch, let detailURL, let magnetPattern = config.magnetPattern {
-                let detailHTML = try? await fetchText(detailURL)
+                let detailHTML = try? await fetchText(detailURL, referer: sameSiteHomeURL(for: detailURL))
                 magnet = detailHTML.flatMap { RegexTools.firstCapture(pattern: magnetPattern, in: $0) }?.htmlDecoded
             } else {
                 magnet = nil
@@ -146,9 +165,9 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
         return results
     }
 
-    private func fetchText(_ url: URL) async throws -> String {
+    private func fetchText(_ url: URL, referer: URL? = nil, timeoutSeconds: Int? = nil) async throws -> String {
         do {
-            let (data, response) = try await session.data(for: makeRequest(url: url))
+            let (data, response) = try await session.data(for: makeRequest(url: url, referer: referer, timeoutSeconds: timeoutSeconds))
             return try validateResponse(data: data, response: response)
         } catch let error as ProviderError {
             if case .badStatus(_, 403) = error, let retried = try await retryAfterBootstrap(url: url) {
@@ -173,9 +192,9 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
         return try validateResponse(data: data, response: response)
     }
 
-    private func makeRequest(url: URL, referer: URL? = nil) -> URLRequest {
+    private func makeRequest(url: URL, referer: URL? = nil, timeoutSeconds: Int? = nil) -> URLRequest {
         var request = URLRequest(url: url)
-        request.timeoutInterval = TimeInterval(config.timeoutSeconds ?? 20)
+        request.timeoutInterval = TimeInterval(timeoutSeconds ?? config.timeoutSeconds ?? 20)
         request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
         request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
         request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
@@ -214,6 +233,11 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
         return URL(string: raw, relativeTo: baseURL)?.absoluteURL
     }
 
+    private func sameSiteHomeURL(for url: URL) -> URL? {
+        guard let scheme = url.scheme, let host = url.host else { return nil }
+        return URL(string: "\(scheme)://\(host)/")
+    }
+
     private func encodedSearchQuery(_ query: String) -> String {
         let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
         guard config.id == "1337x" else { return encoded }
@@ -226,4 +250,9 @@ private struct SearchPageResult: Sendable {
     let page: Int
     let results: [TorrentSearchResult]
     let errorMessage: String?
+}
+
+private struct SearchTemplateResult: Sendable {
+    let results: [TorrentSearchResult]
+    let error: Error?
 }

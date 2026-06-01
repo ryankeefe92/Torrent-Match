@@ -24,11 +24,28 @@ struct ContentView: View {
     @State private var selected: SearchResult? = nil
     @State private var alertTitle: String = ""
     @State private var alertMessage: String? = nil
-    @State private var isResolvingMagnet: Bool = false
+    @State private var transmissionSendPhase: TransmissionSendPhase = .idle
     @State private var isPresentingTransmissionSettings: Bool = false
+    @State private var magnetPrefetchTask: Task<Void, Never>? = nil
+    @State private var selectedMagnetPrefetchTask: Task<Void, Never>? = nil
 
     var sortedResults: [SearchResult] {
         results.sorted { $0.score > $1.score }
+    }
+
+    private var transmissionButtonTitle: String {
+        switch transmissionSendPhase {
+        case .idle:
+            return "Send to Transmission"
+        case .fetchingMagnet:
+            return "Fetching Magnet…"
+        case .connecting:
+            return "Connecting to Transmission…"
+        }
+    }
+
+    private var isSendingToTransmission: Bool {
+        transmissionSendPhase != .idle
     }
 
     var body: some View {
@@ -47,7 +64,7 @@ struct ContentView: View {
                         ErrorStateView(message: message, retry: performSearch)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else if isSearching {
-                        ProgressView("Searching providers… \(releaseCountText(foundSoFar)) found")
+                        SearchProgressView(foundCount: foundSoFar)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else if sortedResults.isEmpty {
                         EmptyResultsView()
@@ -72,6 +89,9 @@ struct ContentView: View {
                     password: $transmissionPassword
                 )
             }
+            .onChange(of: selected) { newValue in
+                prefetchSelectedMagnet(for: newValue)
+            }
             .toolbar {
                 #if os(iOS)
                 if #available(iOS 17.0, *) {
@@ -88,10 +108,10 @@ struct ContentView: View {
                         Button {
                             sendSelectedToTransmission()
                         } label: {
-                            Text(isResolvingMagnet ? "Fetching Magnet…" : "Send to Transmission")
+                            Text(transmissionButtonTitle)
                         }
                         .labelStyle(.titleOnly)
-                        .disabled(selected == nil || isResolvingMagnet)
+                        .disabled(selected == nil || isSendingToTransmission)
                     }
                 }
                 #elseif os(macOS)
@@ -102,10 +122,10 @@ struct ContentView: View {
                     Button {
                         sendSelectedToTransmission()
                     } label: {
-                        Text(isResolvingMagnet ? "Fetching Magnet…" : "Send to Transmission")
+                        Text(transmissionButtonTitle)
                     }
                     .labelStyle(.titleOnly)
-                    .disabled(selected == nil || isResolvingMagnet)
+                    .disabled(selected == nil || isSendingToTransmission)
                 }
                 #else
                 ToolbarItem(placement: .automatic) {
@@ -115,10 +135,10 @@ struct ContentView: View {
                     Button {
                         sendSelectedToTransmission()
                     } label: {
-                        Text(isResolvingMagnet ? "Fetching Magnet…" : "Send to Transmission")
+                        Text(transmissionButtonTitle)
                     }
                     .labelStyle(.titleOnly)
-                    .disabled(selected == nil || isResolvingMagnet)
+                    .disabled(selected == nil || isSendingToTransmission)
                 }
                 #endif
             }
@@ -162,6 +182,9 @@ struct ContentView: View {
         isSearching = true
         foundSoFar = 0
         results = []
+        selected = nil
+        magnetPrefetchTask?.cancel()
+        selectedMagnetPrefetchTask?.cancel()
 
         Task { @MainActor in
             let report = await searchService.searchAndRankReport(trimmed) { found in
@@ -178,6 +201,7 @@ struct ContentView: View {
                 errorMessage = "No results. Providers reported errors:\n\(details)\n\nThis often means the site is blocked on your current network/DNS."
             }
             isSearching = false
+            prefetchTopMagnets(from: results)
         }
     }
 
@@ -195,19 +219,18 @@ struct ContentView: View {
             return
         }
 
-        isResolvingMagnet = true
         Task { @MainActor in
-            defer { isResolvingMagnet = false }
+            defer { transmissionSendPhase = .idle }
 
             do {
+                transmissionSendPhase = .fetchingMagnet
                 let magnet = try await resolvedMagnet(for: selected)
+                transmissionSendPhase = .connecting
                 try await TransmissionClient(config: config).add(magnet: magnet)
                 showAlert(title: "Sent to Transmission", message: selected.title)
             } catch {
-                showAlert(
-                    title: "Transmission Error",
-                    message: (error as? LocalizedError)?.errorDescription ?? "Failed to send torrent to Transmission."
-                )
+                let presentation = transmissionErrorPresentation(for: error, phase: transmissionSendPhase)
+                showAlert(title: presentation.title, message: presentation.message)
             }
         }
     }
@@ -234,6 +257,70 @@ struct ContentView: View {
         }
 
         return magnet
+    }
+
+    private func prefetchTopMagnets(from searchResults: [SearchResult]) {
+        magnetPrefetchTask?.cancel()
+        let candidates = magnetPrefetchCandidates(from: searchResults)
+        guard !candidates.isEmpty else { return }
+
+        magnetPrefetchTask = Task { @MainActor in
+            for candidate in candidates {
+                guard !Task.isCancelled else { return }
+                await warmMagnet(for: candidate)
+            }
+        }
+    }
+
+    private func prefetchSelectedMagnet(for searchResult: SearchResult?) {
+        selectedMagnetPrefetchTask?.cancel()
+        guard let searchResult, shouldPrefetchMagnet(for: searchResult) else { return }
+
+        selectedMagnetPrefetchTask = Task { @MainActor in
+            await warmMagnet(for: searchResult)
+        }
+    }
+
+    private func magnetPrefetchCandidates(from searchResults: [SearchResult]) -> [SearchResult] {
+        var seenResolutionKeys = Set<String>()
+        return searchResults
+            .sorted { $0.score > $1.score }
+            .filter(shouldPrefetchMagnet)
+            .filter { result in
+                let key: String
+                if let detailURL = result.detailURL?.absoluteString {
+                    key = "\(result.provider)|\(detailURL)"
+                } else {
+                    key = "\(result.provider)|\(result.id.uuidString)"
+                }
+                return seenResolutionKeys.insert(key).inserted
+            }
+    }
+
+    private func shouldPrefetchMagnet(for searchResult: SearchResult) -> Bool {
+        searchResult.magnet?.isEmpty != false
+    }
+
+    private func warmMagnet(for searchResult: SearchResult) async {
+        do {
+            guard let magnet = try await searchService.resolveMagnet(for: searchResult.raw),
+                  !magnet.isEmpty,
+                  !Task.isCancelled else { return }
+            applyResolvedMagnet(magnet, to: searchResult.id)
+        } catch {
+            return
+        }
+    }
+
+    private func applyResolvedMagnet(_ magnet: String, to resultID: UUID) {
+        guard let index = results.firstIndex(where: { $0.id == resultID }),
+              results[index].magnet?.isEmpty != false else { return }
+        let updated = results[index].withMagnet(magnet)
+        results[index] = updated
+        results = dedupedResults(results)
+        if selected?.id == resultID {
+            selected = results.first(where: { $0.id == updated.id })
+        }
     }
 
     private func makeTransmissionConfig() throws -> TransmissionConfig {
@@ -285,6 +372,92 @@ struct ContentView: View {
     private func showAlert(title: String, message: String) {
         alertTitle = title
         alertMessage = message
+    }
+
+    private func transmissionErrorPresentation(
+        for error: Error,
+        phase: TransmissionSendPhase
+    ) -> (title: String, message: String) {
+        switch phase {
+        case .fetchingMagnet:
+            return ("Magnet Error", magnetFetchErrorMessage(for: error))
+        case .connecting:
+            return ("Transmission Error", transmissionConnectionErrorMessage(for: error))
+        case .idle:
+            if error is TransmissionError || error is URLError {
+                return ("Transmission Error", transmissionConnectionErrorMessage(for: error))
+            }
+            return ("Magnet Error", magnetFetchErrorMessage(for: error))
+        }
+    }
+
+    private func magnetFetchErrorMessage(for error: Error) -> String {
+        if let providerError = error as? ProviderError {
+            switch providerError {
+            case .timedOut(let provider, let seconds):
+                return "Can't fetch magnet from \(provider): the request timed out after \(seconds)s."
+            case .badStatus(let provider, let status):
+                return "Can't fetch magnet from \(provider): the detail page returned HTTP \(status)."
+            case .accessBlocked(let provider, let reason):
+                return "Can't fetch magnet from \(provider): \(reason)."
+            case .missingURLTemplate(let provider):
+                return "Can't fetch magnet from \(provider): the provider is missing a search URL."
+            case .invalidURL(let url):
+                return "Can't fetch magnet: invalid URL \(url)."
+            }
+        }
+
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .timedOut:
+                return "Can't fetch magnet: the request timed out."
+            case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed, .notConnectedToInternet, .networkConnectionLost:
+                return "Can't fetch magnet: network connection failed."
+            default:
+                return "Can't fetch magnet: \(urlError.localizedDescription)"
+            }
+        }
+
+        if let localizedError = error as? LocalizedError, let message = localizedError.errorDescription {
+            return "Can't fetch magnet: \(message)"
+        }
+
+        return "Can't fetch magnet for the selected result."
+    }
+
+    private func transmissionConnectionErrorMessage(for error: Error) -> String {
+        if let transmissionError = error as? TransmissionError {
+            switch transmissionError {
+            case .missingSessionID:
+                return "Can't connect to Transmission: no session ID was returned."
+            case .badStatus(let status):
+                if status == 401 || status == 403 {
+                    return "Can't connect to Transmission: authentication failed."
+                }
+                return "Can't connect to Transmission: the RPC endpoint returned HTTP \(status)."
+            case .rpcFailure(let message):
+                return "Transmission rejected the torrent: \(message)."
+            }
+        }
+
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .userAuthenticationRequired:
+                return "Can't connect to Transmission: authentication is required."
+            case .timedOut:
+                return "Can't connect to Transmission: the connection timed out."
+            case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed, .notConnectedToInternet, .networkConnectionLost:
+                return "Can't connect to Transmission: the server could not be reached."
+            default:
+                return "Can't connect to Transmission: \(urlError.localizedDescription)"
+            }
+        }
+
+        if let localizedError = error as? LocalizedError, let message = localizedError.errorDescription {
+            return "Can't connect to Transmission: \(message)"
+        }
+
+        return "Can't connect to Transmission."
     }
 
     private func dedupedResults(_ results: [SearchResult]) -> [SearchResult] {
@@ -380,6 +553,37 @@ private enum TransmissionConfigurationError: LocalizedError {
         case .missingMagnet:
             return "No magnet is available for the selected result."
         }
+    }
+}
+
+private enum TransmissionSendPhase {
+    case idle
+    case fetchingMagnet
+    case connecting
+}
+
+private struct SearchProgressView: View {
+    let foundCount: Int
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.5)) { context in
+            let dots = animatedDots(for: context.date)
+            VStack(spacing: 8) {
+                ProgressView("Searching providers\(dots)")
+                Text(releaseCountText(foundCount))
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func animatedDots(for date: Date) -> String {
+        let phase = Int(date.timeIntervalSinceReferenceDate * 2).quotientAndRemainder(dividingBy: 3).remainder + 1
+        return String(repeating: ".", count: phase)
+    }
+
+    private func releaseCountText(_ count: Int) -> String {
+        count == 1 ? "1 result found" : "\(count) results found"
     }
 }
 

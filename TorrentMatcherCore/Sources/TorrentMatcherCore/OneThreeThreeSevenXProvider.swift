@@ -15,31 +15,48 @@ public final class OneThreeThreeSevenXProvider: TorrentProvider, @unchecked Send
         }
 
         let encodedQuery = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
-        var lastError: Error?
+        let searchResult = await withTaskGroup(of: SearchTemplateResult.self) { group in
+            for template in allSearchURLTemplates {
+                group.addTask {
+                    let urlString = template.replacingOccurrences(of: "{{query}}", with: encodedQuery)
+                    guard let url = URL(string: urlString) else {
+                        return SearchTemplateResult(results: [], error: ProviderError.invalidURL(urlString))
+                    }
 
-        for template in allSearchURLTemplates {
-            let urlString = template.replacingOccurrences(of: "{{query}}", with: encodedQuery)
-            guard let url = URL(string: urlString) else {
-                lastError = ProviderError.invalidURL(urlString)
-                continue
-            }
-
-            do {
-                let html = try await WebViewHTMLLoader().loadHTML(from: url)
-                let blocks = RegexTools.captureMatches(pattern: config.resultBlockPattern, in: html)
-                if blocks.isEmpty {
-                    continue
+                    do {
+                        let html = try await WebViewHTMLLoader().loadHTML(from: url)
+                        let blocks = RegexTools.captureMatches(pattern: self.config.resultBlockPattern, in: html)
+                        guard !blocks.isEmpty else {
+                            return SearchTemplateResult(results: [], error: nil)
+                        }
+                        return SearchTemplateResult(
+                            results: try await self.parseResults(from: blocks, referer: url),
+                            error: nil
+                        )
+                    } catch {
+                        return SearchTemplateResult(results: [], error: error)
+                    }
                 }
-                return try await parseResults(from: blocks, referer: url)
-            } catch {
-                lastError = error
             }
+
+            var lastError: Error?
+            for await result in group {
+                if !result.results.isEmpty {
+                    group.cancelAll()
+                    return result
+                }
+                if let error = result.error {
+                    lastError = error
+                }
+            }
+
+            return SearchTemplateResult(results: [], error: lastError)
         }
 
-        if let lastError {
-            throw lastError
+        if let error = searchResult.error {
+            throw error
         }
-        return []
+        return searchResult.results
     }
 
     private var allSearchURLTemplates: [String] {
@@ -96,5 +113,10 @@ public final class OneThreeThreeSevenXProvider: TorrentProvider, @unchecked Send
         guard let base = config.detailBaseURL, let baseURL = URL(string: base) else { return nil }
         return URL(string: raw, relativeTo: baseURL)?.absoluteURL
     }
+}
+
+private struct SearchTemplateResult: Sendable {
+    let results: [TorrentSearchResult]
+    let error: Error?
 }
 #endif

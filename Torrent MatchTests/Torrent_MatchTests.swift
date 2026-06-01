@@ -195,7 +195,7 @@ struct Torrent_MatchTests {
             provider: "A"
         )
 
-        #expect(TorrentRanker.score(imax).score == TorrentRanker.score(standard).score + 8)
+        #expect(TorrentRanker.score(imax).score == TorrentRanker.score(standard).score + 13)
     }
 
 }

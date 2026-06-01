@@ -24,17 +24,31 @@ public final class TorrentSearchService: @unchecked Sendable {
     private let providers: [TorrentProvider]
     private let weights: RankerWeights
     private let providerTimeoutSeconds: Int
+    private let magnetResolveTimeoutSeconds: Int
+    private let magnetCache = MagnetResolutionCache()
 
-    public init(configs: [ProviderConfig], weights: RankerWeights = .appleTVDefault, providerTimeoutSeconds: Int = 20) {
+    public init(
+        configs: [ProviderConfig],
+        weights: RankerWeights = .appleTVDefault,
+        providerTimeoutSeconds: Int = 30,
+        magnetResolveTimeoutSeconds: Int = 35
+    ) {
         self.providers = configs.map(Self.provider(for:))
         self.weights = weights
         self.providerTimeoutSeconds = providerTimeoutSeconds
+        self.magnetResolveTimeoutSeconds = magnetResolveTimeoutSeconds
     }
 
-    public init(providers: [TorrentProvider], weights: RankerWeights = .appleTVDefault, providerTimeoutSeconds: Int = 20) {
+    public init(
+        providers: [TorrentProvider],
+        weights: RankerWeights = .appleTVDefault,
+        providerTimeoutSeconds: Int = 30,
+        magnetResolveTimeoutSeconds: Int = 35
+    ) {
         self.providers = providers
         self.weights = weights
         self.providerTimeoutSeconds = providerTimeoutSeconds
+        self.magnetResolveTimeoutSeconds = magnetResolveTimeoutSeconds
     }
 
     public func searchAndRank(_ query: String) async -> [RankedTorrentResult] {
@@ -67,10 +81,33 @@ public final class TorrentSearchService: @unchecked Sendable {
     }
 
     public func resolveMagnet(for result: TorrentSearchResult) async throws -> String? {
+        if let magnet = result.magnet, !magnet.isEmpty {
+            return magnet
+        }
         guard let provider = providers.first(where: { $0.config.name == result.provider }) else {
             return result.magnet
         }
-        return try await provider.resolveMagnet(for: result)
+
+        let operation = { @Sendable in
+            try await self.withProviderTimeout(
+                provider: provider,
+                seconds: max(1, self.magnetResolveTimeoutSeconds)
+            ) {
+                try await provider.resolveMagnet(for: result)
+            }
+        }
+
+        guard let cacheKey = magnetCacheKey(for: result) else {
+            return try await operation()
+        }
+        return try await magnetCache.value(for: cacheKey, operation: operation)
+    }
+
+    private func magnetCacheKey(for result: TorrentSearchResult) -> String? {
+        if let detailURL = result.detailURL {
+            return "\(result.provider)|\(detailURL.absoluteString)"
+        }
+        return nil
     }
 
     private func searchReport(
@@ -115,7 +152,45 @@ public final class TorrentSearchService: @unchecked Sendable {
         query: String,
         timeoutOverride: Int?
     ) async throws -> [TorrentSearchResult] {
-        try await provider.search(query)
+        let seconds = timeoutOverride ?? effectiveTimeout(for: provider, cap: providerTimeoutSeconds)
+        return try await withProviderTimeout(provider: provider, seconds: seconds) {
+            try await provider.search(query)
+        }
+    }
+
+    private func effectiveTimeout(for provider: TorrentProvider, cap: Int) -> Int {
+        guard let providerTimeout = provider.config.timeoutSeconds else {
+            return cap
+        }
+        return max(1, min(providerTimeout, cap))
+    }
+
+    private func withProviderTimeout<T: Sendable>(
+        provider: TorrentProvider,
+        seconds: Int,
+        operation: @escaping @Sendable () async throws -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask {
+                try await operation()
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(seconds) * 1_000_000_000)
+                throw ProviderError.timedOut(provider: provider.config.name, seconds: seconds)
+            }
+
+            do {
+                guard let result = try await group.next() else {
+                    group.cancelAll()
+                    throw ProviderError.timedOut(provider: provider.config.name, seconds: seconds)
+                }
+                group.cancelAll()
+                return result
+            } catch {
+                group.cancelAll()
+                throw error
+            }
+        }
     }
 
     private func dedupe(_ results: [TorrentSearchResult]) -> [TorrentSearchResult] {
@@ -145,6 +220,40 @@ public final class TorrentSearchService: @unchecked Sendable {
             return PirateBayAPIProvider(config: config)
         default:
             return RegexHTMLProvider(config: config)
+        }
+    }
+}
+
+private actor MagnetResolutionCache {
+    private var resolved: [String: String] = [:]
+    private var inFlight: [String: Task<String?, Error>] = [:]
+
+    func value(
+        for key: String,
+        operation: @escaping @Sendable () async throws -> String?
+    ) async throws -> String? {
+        if let magnet = resolved[key] {
+            return magnet
+        }
+        if let task = inFlight[key] {
+            return try await task.value
+        }
+
+        let task = Task {
+            try await operation()
+        }
+        inFlight[key] = task
+
+        do {
+            let magnet = try await task.value
+            if let magnet, !magnet.isEmpty {
+                resolved[key] = magnet
+            }
+            inFlight[key] = nil
+            return magnet
+        } catch {
+            inFlight[key] = nil
+            throw error
         }
     }
 }
