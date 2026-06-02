@@ -15,8 +15,11 @@ struct ContentView: View {
 
     // MARK: - Search / Results State
     @AppStorage("transmission.rpcURL") private var transmissionRPCURL: String = ""
+    @AppStorage("transmission.tailscaleRPCURL") private var transmissionTailscaleRPCURL: String = ""
+    @AppStorage("transmission.preferTailscale") private var transmissionPreferTailscale: Bool = false
     @AppStorage("transmission.username") private var transmissionUsername: String = ""
     @AppStorage("transmission.password") private var transmissionPassword: String = ""
+    @StateObject private var movieAutocomplete = MovieAutocompleteViewModel()
     @State private var query: String = ""
     @State private var isSearching: Bool = false
     @State private var foundSoFar: Int = 0
@@ -55,7 +58,12 @@ struct ContentView: View {
         NavigationViewWrapper {
             VStack(spacing: 0) {
                 // Search Bar + Action
-                SearchBar(query: $query, onSubmit: performSearch)
+                SearchBar(
+                    query: $query,
+                    suggestions: movieAutocomplete.suggestions,
+                    onSuggestionSelected: applyMovieSuggestion,
+                    onSubmit: performSearch
+                )
                     .padding([.horizontal, .top])
                     .padding(.bottom, 6)
 
@@ -98,12 +106,17 @@ struct ContentView: View {
             .sheet(isPresented: $isPresentingTransmissionSettings) {
                 TransmissionSettingsView(
                     rpcURL: $transmissionRPCURL,
+                    tailscaleRPCURL: $transmissionTailscaleRPCURL,
+                    preferTailscale: $transmissionPreferTailscale,
                     username: $transmissionUsername,
                     password: $transmissionPassword
                 )
             }
-            .onChange(of: selected) { newValue in
+            .onChange(of: selected) { _, newValue in
                 prefetchSelectedMagnet(for: newValue)
+            }
+            .onChange(of: query) { _, newValue in
+                movieAutocomplete.updateQuery(newValue)
             }
             .toolbar {
                 #if os(iOS)
@@ -188,9 +201,11 @@ struct ContentView: View {
     private func performSearch() {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !isSearching else { return }
+        let searchQuery = movieAutocomplete.resolvedSuggestion(for: trimmed)?.providerQuery ?? trimmed
 #if os(iOS)
         UIApplication.shared.endEditing()
 #endif
+        movieAutocomplete.clearSuggestions()
         errorMessage = nil
         isSearching = true
         foundSoFar = 0
@@ -200,7 +215,7 @@ struct ContentView: View {
         selectedMagnetPrefetchTask?.cancel()
 
         Task { @MainActor in
-            let report = await searchService.searchAndRankReport(trimmed) { update in
+            let report = await searchService.searchAndRankReport(searchQuery) { update in
                 Task { @MainActor in
                     foundSoFar = update.foundSoFar
                     results = dedupedResults(update.results.map(SearchResult.init))
@@ -222,11 +237,17 @@ struct ContentView: View {
         }
     }
 
+    private func applyMovieSuggestion(_ suggestion: MovieCatalogSuggestion) {
+        query = suggestion.displayTitle
+        movieAutocomplete.selectSuggestion(suggestion)
+        performSearch()
+    }
+
     private func sendSelectedToTransmission() {
         guard let selected else { return }
-        let config: TransmissionConfig
+        let endpoints: [TransmissionEndpoint]
         do {
-            config = try makeTransmissionConfig()
+            endpoints = try makeTransmissionEndpoints()
         } catch {
             showAlert(
                 title: "Transmission Not Configured",
@@ -243,7 +264,7 @@ struct ContentView: View {
                 transmissionSendPhase = .fetchingMagnet
                 let magnet = try await resolvedMagnet(for: selected)
                 transmissionSendPhase = .connecting
-                try await TransmissionClient(config: config).add(magnet: magnet)
+                try await addMagnetToTransmission(magnet, using: endpoints)
                 showAlert(title: "Sent to Transmission", message: selected.title)
             } catch {
                 let presentation = transmissionErrorPresentation(for: error, phase: transmissionSendPhase)
@@ -414,27 +435,78 @@ struct ContentView: View {
         }
     }
 
-    private func makeTransmissionConfig() throws -> TransmissionConfig {
-        let rpcURLText = transmissionRPCURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !rpcURLText.isEmpty else {
-            throw TransmissionConfigurationError.missingRPCURL
-        }
-
+    private func makeTransmissionEndpoints() throws -> [TransmissionEndpoint] {
         let username = transmissionUsername.trimmingCharacters(in: .whitespacesAndNewlines)
         let password = transmissionPassword.trimmingCharacters(in: .whitespacesAndNewlines)
         if (username.isEmpty && !password.isEmpty) || (!username.isEmpty && password.isEmpty) {
             throw TransmissionConfigurationError.incompleteCredentials
         }
 
-        guard let rpcURL = normalizedTransmissionRPCURL(from: rpcURLText) else {
-            throw TransmissionConfigurationError.invalidRPCURL
+        var endpoints: [TransmissionEndpoint] = []
+
+        let homeRPCURLText = transmissionRPCURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !homeRPCURLText.isEmpty {
+            guard let rpcURL = normalizedTransmissionRPCURL(from: homeRPCURLText) else {
+                throw TransmissionConfigurationError.invalidHomeRPCURL
+            }
+
+            endpoints.append(
+                TransmissionEndpoint(
+                    name: "Home RPC",
+                    config: transmissionConfig(for: rpcURL, username: username, password: password)
+                )
+            )
         }
 
-        return TransmissionConfig(
+        let tailscaleRPCURLText = transmissionTailscaleRPCURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tailscaleRPCURLText.isEmpty {
+            guard let rpcURL = normalizedTransmissionRPCURL(from: tailscaleRPCURLText) else {
+                throw TransmissionConfigurationError.invalidTailscaleRPCURL
+            }
+
+            endpoints.append(
+                TransmissionEndpoint(
+                    name: "Tailscale RPC",
+                    config: transmissionConfig(for: rpcURL, username: username, password: password)
+                )
+            )
+        }
+
+        guard !endpoints.isEmpty else {
+            throw TransmissionConfigurationError.missingRPCURL
+        }
+
+        let orderedEndpoints = endpoints.sorted { lhs, rhs in
+            lhs.priority(preferTailscale: transmissionPreferTailscale) < rhs.priority(preferTailscale: transmissionPreferTailscale)
+        }
+
+        var seenURLs: Set<URL> = []
+        return orderedEndpoints.filter { endpoint in
+            seenURLs.insert(endpoint.config.rpcURL).inserted
+        }
+    }
+
+    private func transmissionConfig(for rpcURL: URL, username: String, password: String) -> TransmissionConfig {
+        TransmissionConfig(
             rpcURL: rpcURL,
             username: username.isEmpty ? nil : username,
             password: password.isEmpty ? nil : password
         )
+    }
+
+    private func addMagnetToTransmission(_ magnet: String, using endpoints: [TransmissionEndpoint]) async throws {
+        var failures: [TransmissionEndpointFailure] = []
+
+        for endpoint in endpoints {
+            do {
+                try await TransmissionClient(config: endpoint.config).add(magnet: magnet)
+                return
+            } catch {
+                failures.append(TransmissionEndpointFailure(endpointName: endpoint.name, error: error))
+            }
+        }
+
+        throw TransmissionSendError.allEndpointsFailed(failures)
     }
 
     private func normalizedTransmissionRPCURL(from rawValue: String) -> URL? {
@@ -517,6 +589,19 @@ struct ContentView: View {
     }
 
     private func transmissionConnectionErrorMessage(for error: Error) -> String {
+        if let sendError = error as? TransmissionSendError {
+            switch sendError {
+            case .allEndpointsFailed(let failures):
+                let details = failures
+                    .map { "\($0.endpointName): \(transmissionConnectionFailureSummary(for: $0.error))." }
+                    .joined(separator: "\n")
+                let suggestion = failures.contains { $0.endpointName == "Tailscale RPC" }
+                    ? "\n\nCheck that Tailscale is connected on both devices, your Mac is awake, and Transmission remote access is enabled."
+                    : ""
+                return "Tried all configured Transmission endpoints:\n\(details)\(suggestion)"
+            }
+        }
+
         if let transmissionError = error as? TransmissionError {
             switch transmissionError {
             case .missingSessionID:
@@ -549,6 +634,41 @@ struct ContentView: View {
         }
 
         return "Can't connect to Transmission."
+    }
+
+    private func transmissionConnectionFailureSummary(for error: Error) -> String {
+        if let transmissionError = error as? TransmissionError {
+            switch transmissionError {
+            case .missingSessionID:
+                return "no session ID was returned"
+            case .badStatus(let status):
+                if status == 401 || status == 403 {
+                    return "authentication failed"
+                }
+                return "the RPC endpoint returned HTTP \(status)"
+            case .rpcFailure(let message):
+                return "Transmission rejected the torrent: \(message)"
+            }
+        }
+
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .userAuthenticationRequired:
+                return "authentication is required"
+            case .timedOut:
+                return "the connection timed out"
+            case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed, .notConnectedToInternet, .networkConnectionLost:
+                return "the server could not be reached"
+            default:
+                return urlError.localizedDescription
+            }
+        }
+
+        if let localizedError = error as? LocalizedError, let message = localizedError.errorDescription {
+            return message
+        }
+
+        return "unknown connection error"
     }
 
     private func dedupedResults(_ results: [SearchResult]) -> [SearchResult] {
@@ -634,16 +754,19 @@ private struct MagnetPrefetchCandidate {
 
 private enum TransmissionConfigurationError: LocalizedError {
     case missingRPCURL
-    case invalidRPCURL
+    case invalidHomeRPCURL
+    case invalidTailscaleRPCURL
     case incompleteCredentials
     case missingMagnet
 
     var errorDescription: String? {
         switch self {
         case .missingRPCURL:
-            return "Enter your Transmission RPC URL, for example http://YOUR-IP:9091/transmission/rpc."
-        case .invalidRPCURL:
-            return "The Transmission RPC URL is invalid."
+            return "Enter a home RPC URL, a Tailscale RPC URL, or both."
+        case .invalidHomeRPCURL:
+            return "The home Transmission RPC URL is invalid."
+        case .invalidTailscaleRPCURL:
+            return "The Tailscale Transmission RPC URL is invalid."
         case .incompleteCredentials:
             return "Enter both a username and password, or leave both blank."
         case .missingMagnet:
@@ -656,6 +779,27 @@ private enum TransmissionSendPhase {
     case idle
     case fetchingMagnet
     case connecting
+}
+
+private struct TransmissionEndpoint {
+    let name: String
+    let config: TransmissionConfig
+
+    func priority(preferTailscale: Bool) -> Int {
+        if preferTailscale {
+            return name == "Tailscale RPC" ? 0 : 1
+        }
+        return name == "Home RPC" ? 0 : 1
+    }
+}
+
+private struct TransmissionEndpointFailure {
+    let endpointName: String
+    let error: Error
+}
+
+private enum TransmissionSendError: LocalizedError {
+    case allEndpointsFailed([TransmissionEndpointFailure])
 }
 
 private struct SearchProgressView: View {
@@ -938,33 +1082,66 @@ enum ParserRankerAdapter {
 // MARK: - Views
 private struct SearchBar: View {
     @Binding var query: String
+    let suggestions: [MovieCatalogSuggestion]
+    var onSuggestionSelected: (MovieCatalogSuggestion) -> Void
     var onSubmit: () -> Void
 
     var body: some View {
-        HStack(spacing: 8) {
-            ZStack(alignment: .trailing) {
-                TextField("Search movies or shows", text: $query)
-                    .textFieldStyle(.roundedBorder)
-                    .padding(.trailing, query.isEmpty ? 0 : 28)
-                    .submitLabel(.search)
-                    .onSubmit(onSubmit)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                ZStack(alignment: .trailing) {
+                    TextField("Search movies", text: $query)
+                        .textFieldStyle(.roundedBorder)
+                        .padding(.trailing, query.isEmpty ? 0 : 28)
+                        .submitLabel(.search)
+                        .onSubmit(onSubmit)
 
-                if !query.isEmpty {
-                    Button {
-                        query = ""
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.secondary)
+                    if !query.isEmpty {
+                        Button {
+                            query = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.trailing, 10)
                     }
-                    .buttonStyle(.plain)
-                    .padding(.trailing, 10)
                 }
+                Button(action: onSubmit) {
+                    Label("Search", systemImage: "magnifyingglass")
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
-            Button(action: onSubmit) {
-                Label("Search", systemImage: "magnifyingglass")
+
+            if !suggestions.isEmpty {
+                VStack(spacing: 0) {
+                    ForEach(suggestions) { suggestion in
+                        Button {
+                            onSuggestionSelected(suggestion)
+                        } label: {
+                            HStack {
+                                Text(suggestion.displayTitle)
+                                    .lineLimit(1)
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+
+                        if suggestion.id != suggestions.last?.id {
+                            Divider()
+                        }
+                    }
+                }
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(.quaternary, lineWidth: 1)
+                )
             }
-            .keyboardShortcut(.defaultAction)
-            .disabled(query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         }
     }
 }
@@ -1208,6 +1385,8 @@ fileprivate struct NavigationViewWrapper<Content: View>: View {
 
 private struct TransmissionSettingsView: View {
     @Binding var rpcURL: String
+    @Binding var tailscaleRPCURL: String
+    @Binding var preferTailscale: Bool
     @Binding var username: String
     @Binding var password: String
     @Environment(\.dismiss) private var dismiss
@@ -1215,12 +1394,21 @@ private struct TransmissionSettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Connection") {
-                    TextField("RPC URL", text: $rpcURL)
+                Section("Endpoints") {
+                    TextField("Home RPC URL (Optional)", text: $rpcURL)
 #if os(iOS)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
 #endif
+                    TextField("Tailscale RPC URL (Optional)", text: $tailscaleRPCURL)
+#if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+#endif
+                    Toggle("Prefer Tailscale First", isOn: $preferTailscale)
+                }
+
+                Section("Authentication") {
                     TextField("Username (Optional)", text: $username)
 #if os(iOS)
                         .textInputAutocapitalization(.never)
@@ -1230,7 +1418,7 @@ private struct TransmissionSettingsView: View {
                 }
 
                 Section("Tip") {
-                    Text("If you enter only a host like 100.64.0.10:9091, the app will use http and append /transmission/rpc automatically.")
+                    Text("Use your LAN address in Home RPC URL and your Tailscale IP or MagicDNS name in Tailscale RPC URL. If you enter only a host like 100.64.0.10:9091, the app will use http and append /transmission/rpc automatically.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

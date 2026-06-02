@@ -14,18 +14,6 @@ Swift files for the torrent matcher app core logic.
 - Transmission RPC client
 - Sample provider config templates with empty URLs
 
-## How to add to Xcode
-
-### Easiest method
-
-1. Unzip this folder.
-2. In Xcode, open your app project.
-3. Drag `Sources/TorrentMatcherCore` into your project navigator.
-4. Choose **Copy items if needed**.
-5. Add files to your iOS/macOS targets.
-
-You do not need external packages for this MVP.
-
 ## Main files
 
 - `ReleaseParser.swift` parses release names.
@@ -33,8 +21,21 @@ You do not need external packages for this MVP.
 - `ProviderConfig.swift` defines configurable providers.
 - `RegexHTMLProvider.swift` fetches/parses HTML providers.
 - `TorrentSearchService.swift` searches all providers and ranks results.
+- `MovieCatalog.swift` loads the bundled movie title catalog used for local autocomplete.
 - `ProviderConfigTester.swift` tests regex configs against pasted sample HTML.
 - `TransmissionClient.swift` sends a magnet to Transmission RPC.
+
+## Refreshing the bundled movie catalog
+
+The app can autocomplete against a bundled IMDb-derived movie database with release years.
+
+Regenerate it with:
+
+```bash
+/usr/bin/python3 scripts/update_movie_catalog.py
+```
+
+That script downloads IMDb `title.basics.tsv.gz` and `title.ratings.tsv.gz`, filters out low-signal titles, and writes `Sources/TorrentMatcherCore/Resources/MovieCatalog.sqlite`.
 
 ## Current final calibrated weights
 
@@ -141,3 +142,10 @@ try await client.add(magnet: magnet)
 ```
 
 Your Mac must be awake, Transmission remote access must be enabled, and the iPhone/Mac must be network-reachable, e.g. with Tailscale.
+
+In the app UI you can now save both:
+
+- a `Home RPC URL` for your LAN address
+- a `Tailscale RPC URL` for your tailnet IP or MagicDNS hostname
+
+When both are configured, Torrent Match will try them in order and can prefer the Tailscale endpoint first.
