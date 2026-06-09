@@ -12,6 +12,7 @@ import TorrentMatcherCore
 struct ContentView: View {
     private let searchService = TorrentSearchService(configs: BuiltInProviderConfigs.default)
     private let maxConcurrentMagnetPrefetches = 8
+    private let maxConcurrentDetailPrefetches = 4
 
     // MARK: - Search / Results State
     @AppStorage("transmission.rpcURL") private var transmissionRPCURL: String = ""
@@ -26,6 +27,7 @@ struct ContentView: View {
     @State private var results: [SearchResult] = []
     @State private var errorMessage: String? = nil
     @State private var selected: SearchResult? = nil
+    @State private var presentedResult: SearchResult? = nil
     @State private var alertTitle: String = ""
     @State private var alertMessage: String? = nil
     @State private var transmissionSendPhase: TransmissionSendPhase = .idle
@@ -34,6 +36,10 @@ struct ContentView: View {
     @State private var activeMagnetPrefetchTasks: [String: Task<Void, Never>] = [:]
     @State private var attemptedMagnetPrefetchKeys: Set<String> = []
     @State private var selectedMagnetPrefetchTask: Task<Void, Never>? = nil
+    @State private var detailPrefetchQueue: [DetailPrefetchCandidate] = []
+    @State private var activeDetailPrefetchTasks: [String: Task<Void, Never>] = [:]
+    @State private var attemptedDetailPrefetchKeys: Set<String> = []
+    @State private var detailMetadataStatuses: [UUID: DetailMetadataFetchStatus] = [:]
 
     var sortedResults: [SearchResult] {
         results.sorted { $0.score > $1.score }
@@ -84,14 +90,14 @@ struct ContentView: View {
                                     .padding(.horizontal)
                                     .padding(.vertical, 8)
                                 Divider()
-                                ResultsListView(results: sortedResults, selected: $selected)
+                                ResultsListView(results: sortedResults, selected: $selected, presentedResult: $presentedResult)
                             }
                         }
                     } else if sortedResults.isEmpty {
                         EmptyResultsView()
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else {
-                        ResultsListView(results: sortedResults, selected: $selected)
+                        ResultsListView(results: sortedResults, selected: $selected, presentedResult: $presentedResult)
                     }
                 }
             }
@@ -112,8 +118,17 @@ struct ContentView: View {
                     password: $transmissionPassword
                 )
             }
+            .sheet(item: $presentedResult) { result in
+                ResultDetailView(
+                    result: result,
+                    metadataStatus: detailMetadataStatuses[result.id] ?? .notStarted
+                )
+            }
             .onChange(of: selected) { _, newValue in
                 prefetchSelectedMagnet(for: newValue)
+            }
+            .onChange(of: presentedResult) { _, newValue in
+                fetchPresentedDetailMetadataIfNeeded(for: newValue)
             }
             .onChange(of: query) { _, newValue in
                 movieAutocomplete.updateQuery(newValue)
@@ -211,7 +226,10 @@ struct ContentView: View {
         foundSoFar = 0
         results = []
         selected = nil
+        presentedResult = nil
         cancelMagnetPrefetchPipeline()
+        cancelDetailPrefetchPipeline()
+        detailMetadataStatuses.removeAll()
         selectedMagnetPrefetchTask?.cancel()
 
         Task { @MainActor in
@@ -220,6 +238,7 @@ struct ContentView: View {
                     foundSoFar = update.foundSoFar
                     results = dedupedResults(update.results.map(SearchResult.init))
                     reconcileSelectedResult()
+                    prefetchDetailMetadataIfNeeded(from: results)
                     prefetchMagnetsIfNeeded(from: results)
                 }
             }
@@ -233,6 +252,7 @@ struct ContentView: View {
             }
             isSearching = false
             reconcileSelectedResult()
+            prefetchDetailMetadataIfNeeded(from: results)
             prefetchMagnetsIfNeeded(from: results)
         }
     }
@@ -323,12 +343,55 @@ struct ContentView: View {
         startQueuedMagnetPrefetchesIfNeeded()
     }
 
+    private func prefetchDetailMetadataIfNeeded(from searchResults: [SearchResult]) {
+        let candidates = detailPrefetchCandidates(from: searchResults)
+        guard !candidates.isEmpty else { return }
+
+        for candidate in candidates {
+            let key = detailPrefetchDedupKey(for: candidate)
+            guard activeDetailPrefetchTasks[key] == nil else { continue }
+            guard !attemptedDetailPrefetchKeys.contains(key) else { continue }
+
+            if let existingIndex = detailPrefetchQueue.firstIndex(where: { $0.key == key }) {
+                detailPrefetchQueue[existingIndex] = DetailPrefetchCandidate(key: key, result: candidate)
+            } else {
+                detailPrefetchQueue.append(DetailPrefetchCandidate(key: key, result: candidate))
+            }
+        }
+
+        detailPrefetchQueue.sort { lhs, rhs in
+            if lhs.result.score != rhs.result.score {
+                return lhs.result.score > rhs.result.score
+            }
+            return lhs.result.title < rhs.result.title
+        }
+
+        startQueuedDetailPrefetchesIfNeeded()
+    }
+
     private func prefetchSelectedMagnet(for searchResult: SearchResult?) {
         selectedMagnetPrefetchTask?.cancel()
         guard let searchResult, shouldPrefetchMagnet(for: searchResult) else { return }
 
         selectedMagnetPrefetchTask = Task { @MainActor in
             await warmMagnet(for: searchResult)
+        }
+    }
+
+    private func fetchPresentedDetailMetadataIfNeeded(for searchResult: SearchResult?) {
+        guard let searchResult, shouldPrefetchDetailMetadata(for: searchResult) else { return }
+        let key = detailPrefetchDedupKey(for: searchResult)
+        guard activeDetailPrefetchTasks[key] == nil else { return }
+        attemptedDetailPrefetchKeys.insert(key)
+
+        activeDetailPrefetchTasks[key] = Task {
+            defer {
+                Task { @MainActor in
+                    activeDetailPrefetchTasks[key] = nil
+                    startQueuedDetailPrefetchesIfNeeded()
+                }
+            }
+            await warmDetailMetadata(for: searchResult)
         }
     }
 
@@ -358,6 +421,36 @@ struct ContentView: View {
         searchResult.magnet?.isEmpty != false
     }
 
+    private func detailPrefetchCandidates(from searchResults: [SearchResult]) -> [SearchResult] {
+        var seenResolutionKeys = Set<String>()
+        return searchResults
+            .sorted { $0.score > $1.score }
+            .filter(shouldPrefetchDetailMetadata)
+            .filter { result in
+                let key = detailPrefetchDedupKey(for: result)
+                return seenResolutionKeys.insert(key).inserted
+            }
+    }
+
+    private func detailPrefetchDedupKey(for result: SearchResult) -> String {
+        if let detailURL = result.detailURL?.absoluteString, !detailURL.isEmpty {
+            return "\(result.provider)|\(detailURL)"
+        }
+        return result.id.uuidString
+    }
+
+    private func shouldPrefetchDetailMetadata(for searchResult: SearchResult) -> Bool {
+        guard searchResult.detailURL != nil,
+              searchResult.raw.detailSpecs?.hasDisplayableFields != true else { return false }
+
+        switch detailMetadataStatuses[searchResult.id] {
+        case .fetching, .checkedNoMetadata, .failed(_):
+            return false
+        case .notStarted, .fetched, .none:
+            return true
+        }
+    }
+
     private func warmMagnet(for searchResult: SearchResult) async {
         do {
             guard let magnet = try await searchService.resolveMagnet(for: searchResult.raw),
@@ -371,6 +464,31 @@ struct ContentView: View {
         }
     }
 
+    private func warmDetailMetadata(for searchResult: SearchResult) async {
+        await MainActor.run {
+            detailMetadataStatuses[searchResult.id] = .fetching
+        }
+        do {
+            guard let metadata = try await searchService.fetchDetailMetadata(for: searchResult.raw),
+                  !Task.isCancelled else {
+                await MainActor.run {
+                    detailMetadataStatuses[searchResult.id] = .checkedNoMetadata
+                }
+                return
+            }
+            await MainActor.run {
+                detailMetadataStatuses[searchResult.id] = metadata.specs?.hasDisplayableFields == true ? .fetched : .checkedNoMetadata
+                applyResolvedDetailMetadata(metadata, to: searchResult.id)
+            }
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+            await MainActor.run {
+                detailMetadataStatuses[searchResult.id] = .failed(message)
+            }
+            return
+        }
+    }
+
     private func applyResolvedMagnet(_ magnet: String, to resultID: UUID) {
         guard let index = results.firstIndex(where: { $0.id == resultID }),
               results[index].magnet?.isEmpty != false else { return }
@@ -380,6 +498,24 @@ struct ContentView: View {
         if selected?.id == resultID {
             selected = results.first(where: { $0.id == updated.id })
         }
+        if presentedResult?.id == resultID {
+            presentedResult = results.first(where: { $0.id == updated.id })
+        }
+    }
+
+    private func applyResolvedDetailMetadata(_ metadata: TorrentDetailMetadata, to resultID: UUID) {
+        guard let index = results.firstIndex(where: { $0.id == resultID }) else { return }
+        let updated = results[index].withDetailMetadata(metadata)
+        results[index] = updated
+        results = dedupedResults(results)
+        if selected?.id == resultID {
+            selected = results.first(where: { $0.id == updated.id })
+        }
+        if presentedResult?.id == resultID {
+            presentedResult = results.first(where: { $0.id == updated.id })
+        }
+        prefetchMagnetsIfNeeded(from: results)
+        prefetchDetailMetadataIfNeeded(from: results)
     }
 
     private func cancelMagnetPrefetchPipeline() {
@@ -387,6 +523,13 @@ struct ContentView: View {
         activeMagnetPrefetchTasks.removeAll()
         magnetPrefetchQueue.removeAll()
         attemptedMagnetPrefetchKeys.removeAll()
+    }
+
+    private func cancelDetailPrefetchPipeline() {
+        activeDetailPrefetchTasks.values.forEach { $0.cancel() }
+        activeDetailPrefetchTasks.removeAll()
+        detailPrefetchQueue.removeAll()
+        attemptedDetailPrefetchKeys.removeAll()
     }
 
     private func startQueuedMagnetPrefetchesIfNeeded() {
@@ -423,15 +566,52 @@ struct ContentView: View {
         magnetPrefetchCandidates(from: results).first { magnetPrefetchDedupKey(for: $0) == key }
     }
 
+    private func startQueuedDetailPrefetchesIfNeeded() {
+        while activeDetailPrefetchTasks.count < maxConcurrentDetailPrefetches {
+            guard let nextCandidate = nextDetailPrefetchCandidate() else { return }
+
+            let key = nextCandidate.key
+            attemptedDetailPrefetchKeys.insert(key)
+            activeDetailPrefetchTasks[key] = Task {
+                defer {
+                    Task { @MainActor in
+                        activeDetailPrefetchTasks[key] = nil
+                        startQueuedDetailPrefetchesIfNeeded()
+                    }
+                }
+                guard !Task.isCancelled else { return }
+                await warmDetailMetadata(for: nextCandidate.result)
+            }
+        }
+    }
+
+    private func nextDetailPrefetchCandidate() -> DetailPrefetchCandidate? {
+        while !detailPrefetchQueue.isEmpty {
+            let candidate = detailPrefetchQueue.removeFirst()
+            let latestCandidate = latestDetailPrefetchCandidate(forKey: candidate.key)
+            if let latestCandidate {
+                return DetailPrefetchCandidate(key: candidate.key, result: latestCandidate)
+            }
+        }
+        return nil
+    }
+
+    private func latestDetailPrefetchCandidate(forKey key: String) -> SearchResult? {
+        detailPrefetchCandidates(from: results).first { detailPrefetchDedupKey(for: $0) == key }
+    }
+
     private func reconcileSelectedResult() {
         guard let selected else { return }
         if let refreshed = results.first(where: { $0.id == selected.id }) {
             self.selected = refreshed
-            return
-        }
-        if let magnetHash = selected.magnet?.infoHashFromMagnet,
-           let refreshed = results.first(where: { $0.magnet?.infoHashFromMagnet == magnetHash }) {
+        } else if let magnetHash = selected.magnet?.infoHashFromMagnet,
+                  let refreshed = results.first(where: { $0.magnet?.infoHashFromMagnet == magnetHash }) {
             self.selected = refreshed
+        }
+
+        if let presentedResult,
+           let refreshed = results.first(where: { $0.id == presentedResult.id }) {
+            self.presentedResult = refreshed
         }
     }
 
@@ -752,6 +932,19 @@ private struct MagnetPrefetchCandidate {
     let result: SearchResult
 }
 
+private struct DetailPrefetchCandidate {
+    let key: String
+    let result: SearchResult
+}
+
+private enum DetailMetadataFetchStatus: Hashable {
+    case notStarted
+    case fetching
+    case fetched
+    case checkedNoMetadata
+    case failed(String)
+}
+
 private enum TransmissionConfigurationError: LocalizedError {
     case missingRPCURL
     case invalidHomeRPCURL
@@ -875,6 +1068,9 @@ struct SearchResult: Identifiable, Hashable {
     let magnet: String?
     let detailURL: URL?
     let score: Int
+    let scoreNotes: [String]
+    let detailMetadata: String?
+    let detailSpecs: TorrentDetailSpecs?
 
     init(ranked: RankedTorrentResult) {
         id = ranked.id
@@ -893,6 +1089,9 @@ struct SearchResult: Identifiable, Hashable {
         magnet = ranked.raw.magnet
         detailURL = ranked.raw.detailURL
         score = ranked.score
+        scoreNotes = ranked.notes
+        detailMetadata = ranked.raw.detailMetadata
+        detailSpecs = ranked.raw.detailSpecs
     }
 
     func withMagnet(_ magnet: String) -> SearchResult {
@@ -901,6 +1100,8 @@ struct SearchResult: Identifiable, Hashable {
             raw: TorrentSearchResult(
                 id: raw.id,
                 title: raw.title,
+                detailMetadata: raw.detailMetadata,
+                detailSpecs: raw.detailSpecs,
                 magnet: magnet,
                 detailURL: raw.detailURL,
                 seeders: raw.seeders,
@@ -921,8 +1122,27 @@ struct SearchResult: Identifiable, Hashable {
             leechers: leechers,
             magnet: magnet,
             detailURL: detailURL,
-            score: score
+            score: score,
+            scoreNotes: scoreNotes,
+            detailMetadata: detailMetadata,
+            detailSpecs: detailSpecs
         )
+    }
+
+    func withDetailMetadata(_ metadata: TorrentDetailMetadata) -> SearchResult {
+        let updatedRaw = TorrentSearchResult(
+            id: raw.id,
+            title: raw.title,
+            detailMetadata: metadata.text ?? raw.detailMetadata,
+            detailSpecs: metadata.specs ?? raw.detailSpecs,
+            magnet: metadata.magnet ?? raw.magnet,
+            detailURL: raw.detailURL,
+            seeders: raw.seeders,
+            leechers: raw.leechers,
+            provider: raw.provider,
+            size: raw.size
+        )
+        return SearchResult(ranked: TorrentRanker.score(updatedRaw))
     }
 
     private init(
@@ -941,7 +1161,10 @@ struct SearchResult: Identifiable, Hashable {
         leechers: Int?,
         magnet: String?,
         detailURL: URL?,
-        score: Int
+        score: Int,
+        scoreNotes: [String],
+        detailMetadata: String?,
+        detailSpecs: TorrentDetailSpecs?
     ) {
         self.id = id
         self.raw = raw
@@ -959,6 +1182,9 @@ struct SearchResult: Identifiable, Hashable {
         self.magnet = magnet
         self.detailURL = detailURL
         self.score = score
+        self.scoreNotes = scoreNotes
+        self.detailMetadata = detailMetadata
+        self.detailSpecs = detailSpecs
     }
 }
 
@@ -1234,7 +1460,196 @@ private struct ScoreBadge: View {
 
 // Removed ChipsFlow and HeightPreferenceKey structs as requested
 
-// Removed ResultDetailView struct as requested
+private struct ResultDetailView: View {
+    let result: SearchResult
+    let metadataStatus: DetailMetadataFetchStatus
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(prettifiedTitle(result.title))
+                        .font(.title2.weight(.semibold))
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 10) {
+                        ScoreBadge(score: result.score)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(result.provider)
+                                .font(.headline)
+                            if let detailURL = result.detailURL {
+                                Link(detailURL.host ?? detailURL.absoluteString, destination: detailURL)
+                                    .font(.callout)
+                            }
+                        }
+                    }
+                }
+
+                FlowLayout(spacing: 8, lineSpacing: 6) {
+                    Tag("Source", value: result.source)
+                    Tag("Resolution", value: result.resolution)
+                    Tag("Range", value: result.dynamicRange)
+                    Tag("Video", value: result.codec)
+                    Tag("Audio", value: result.audio)
+                    if result.imax {
+                        Tag("Format", value: "IMAX")
+                    }
+                    if let size = result.size, !size.isEmpty {
+                        Tag("Size", value: size)
+                    }
+                    if let seeders = result.seeders {
+                        Tag("Seeders", value: "\(seeders)")
+                    }
+                    if let leechers = result.leechers {
+                        Tag("Leechers", value: "\(leechers)")
+                    }
+                }
+
+                if !result.scoreNotes.isEmpty {
+                    DetailSection(title: "Score") {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(result.scoreNotes, id: \.self) { note in
+                                Text(note)
+                                    .font(.callout)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                }
+
+                DetailSection(title: "Detail Page Specs") {
+                    if let specs = result.detailSpecs, specs.hasDisplayableFields {
+                        DetailSpecList(specs: specs)
+                    } else if result.detailURL != nil {
+                        metadataStatusView
+                    } else {
+                        Text("This result does not include a detail page URL.")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding(20)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(minWidth: 420, minHeight: 420)
+    }
+
+    private func prettifiedTitle(_ title: String) -> String {
+        title
+            .replacingOccurrences(of: ".", with: " ")
+            .replacingOccurrences(of: "_", with: " ")
+            .components(separatedBy: .whitespacesAndNewlines)
+            .filter { !$0.isEmpty }
+            .joined(separator: " ")
+    }
+
+    @ViewBuilder
+    private var metadataStatusView: some View {
+        switch metadataStatus {
+        case .notStarted:
+            Text("Metadata fetch is queued for this result.")
+                .foregroundStyle(.secondary)
+        case .fetching:
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Fetching and parsing the detail page...")
+                    .foregroundStyle(.secondary)
+            }
+        case .fetched:
+            Text("Checked the detail page, but no requested specs were found.")
+                .foregroundStyle(.secondary)
+        case .checkedNoMetadata:
+            Text("Checked the detail page, but no requested specs were found.")
+                .foregroundStyle(.secondary)
+        case .failed(let message):
+            Text("Detail page fetch failed: \(message)")
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct DetailSpecList: View {
+    let specs: TorrentDetailSpecs
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(rows, id: \.label) { row in
+                DetailSpecRow(label: row.label, value: row.value, isCalculated: row.isCalculated)
+            }
+        }
+        .textSelection(.enabled)
+    }
+
+    private var rows: [(label: String, value: String, isCalculated: Bool)] {
+        var rows: [(String, String, Bool)] = []
+        append("Full torrent name", specs.fullTorrentName, field: "fullTorrentName", to: &rows)
+        append("Video bitrate", specs.videoBitrate, field: "videoBitrate", to: &rows)
+        append("Resolution width", specs.resolutionWidth, field: "resolutionWidth", to: &rows)
+        append("Resolution height", specs.resolutionHeight, field: "resolutionHeight", to: &rows)
+        append("Frame rate", specs.frameRate, field: "frameRate", to: &rows)
+        append("Bit depth", specs.bitDepth, field: "bitDepth", to: &rows)
+        append("CRF", specs.crf, field: "crf", to: &rows)
+        append("Preset", specs.preset, field: "preset", to: &rows)
+        append("Encoding passes", specs.encodingPasses, field: "encodingPasses", to: &rows)
+        append("Color gamut", specs.colorGamut, field: "colorGamut", to: &rows)
+        append("Dolby Vision profile", specs.dolbyVisionProfile, field: "dolbyVisionProfile", to: &rows)
+        append("Aspect ratio", specs.aspectRatio, field: "aspectRatio", to: &rows)
+        append("Best English audio bitrate", specs.bestEnglishAudioBitrate, field: "bestEnglishAudioBitrate", to: &rows)
+        append("Best English audio sample rate", specs.bestEnglishAudioSampleRate, field: "bestEnglishAudioSampleRate", to: &rows)
+        if !specs.allAudioTrackBitrates.isEmpty {
+            rows.append(("All audio track bitrates", specs.allAudioTrackBitrates.joined(separator: "\n"), specs.isCalculated("allAudioTrackBitrates")))
+        }
+        append("Total audio bitrate", specs.totalAudioTrackBitrate, field: "totalAudioTrackBitrate", to: &rows)
+        append("Overall bitrate", specs.overallBitrate, field: "overallBitrate", to: &rows)
+        append("Calculated video bitrate", specs.calculatedVideoBitrate, field: "calculatedVideoBitrate", to: &rows)
+        append("Runtime", specs.runtime, field: "runtime", to: &rows)
+        return rows
+    }
+
+    private func append(_ label: String, _ value: String?, field: String, to rows: inout [(String, String, Bool)]) {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else { return }
+        rows.append((label, value, specs.isCalculated(field)))
+    }
+}
+
+private struct DetailSpecRow: View {
+    let label: String
+    let value: String
+    let isCalculated: Bool
+
+    var body: some View {
+        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
+            GridRow(alignment: .firstTextBaseline) {
+                Text(label)
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(isCalculated ? .orange : .secondary)
+                    .frame(width: 190, alignment: .leading)
+                Text(value)
+                    .font(.callout)
+                    .foregroundStyle(isCalculated ? .orange : .primary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
+private struct DetailSection<Content: View>: View {
+    let title: String
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.headline)
+            content
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+    }
+}
 
 private struct Tag: View {
     let label: String
@@ -1292,11 +1707,13 @@ private struct EmptyResultsView: View {
 private struct ResultsListView: View {
     let results: [SearchResult]
     @Binding var selected: SearchResult?
+    @Binding var presentedResult: SearchResult?
 
     var body: some View {
         List(results) { result in
             ResultRow(result: result) {
                 selected = result
+                presentedResult = result
             }
             .listRowBackground(selected?.id == result.id ? Color.accentColor.opacity(0.1) : Color.clear)
         }

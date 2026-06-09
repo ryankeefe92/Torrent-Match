@@ -36,6 +36,7 @@ public final class TorrentSearchService: @unchecked Sendable {
     private let providerTimeoutSeconds: Int
     private let magnetResolveTimeoutSeconds: Int
     private let magnetCache = MagnetResolutionCache()
+    private let detailCache = DetailMetadataCache()
 
     public init(
         configs: [ProviderConfig],
@@ -122,6 +123,26 @@ public final class TorrentSearchService: @unchecked Sendable {
             return try await operation()
         }
         return try await magnetCache.value(for: cacheKey, operation: operation)
+    }
+
+    public func fetchDetailMetadata(for result: TorrentSearchResult) async throws -> TorrentDetailMetadata? {
+        guard let provider = providers.first(where: { $0.config.name == result.provider }) else {
+            return nil
+        }
+
+        let operation = { @Sendable in
+            try await self.withProviderTimeout(
+                provider: provider,
+                seconds: max(1, self.magnetResolveTimeoutSeconds)
+            ) {
+                try await provider.fetchDetailMetadata(for: result)
+            }
+        }
+
+        guard let cacheKey = magnetCacheKey(for: result) else {
+            return try await operation()
+        }
+        return try await detailCache.value(for: cacheKey, operation: operation)
     }
 
     private func magnetCacheKey(for result: TorrentSearchResult) -> String? {
@@ -336,6 +357,40 @@ private actor MagnetResolutionCache {
             }
             inFlight[key] = nil
             return magnet
+        } catch {
+            inFlight[key] = nil
+            throw error
+        }
+    }
+}
+
+private actor DetailMetadataCache {
+    private var resolved: [String: TorrentDetailMetadata] = [:]
+    private var inFlight: [String: Task<TorrentDetailMetadata?, Error>] = [:]
+
+    func value(
+        for key: String,
+        operation: @escaping @Sendable () async throws -> TorrentDetailMetadata?
+    ) async throws -> TorrentDetailMetadata? {
+        if let metadata = resolved[key] {
+            return metadata
+        }
+        if let task = inFlight[key] {
+            return try await task.value
+        }
+
+        let task = Task {
+            try await operation()
+        }
+        inFlight[key] = task
+
+        do {
+            let metadata = try await task.value
+            if let metadata {
+                resolved[key] = metadata
+            }
+            inFlight[key] = nil
+            return metadata
         } catch {
             inFlight[key] = nil
             throw error

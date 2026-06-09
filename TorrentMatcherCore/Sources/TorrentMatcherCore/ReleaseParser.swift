@@ -181,7 +181,7 @@ public enum ReleaseParser {
     }
 
     private static func detectChannels(in upper: String) -> ChannelLayout {
-        let audioPrefix = #"(TRUEHD|TRUE-HD|LPCM|PCM|DDP|EAC3|E-AC-3|EAC-3|DD|AC3|AC-3|DTSHD|DTS-HD(?:\.MA)?|DTS HD MA|DTS|ATMOS)"#
+        let audioPrefix = #"(TRUEHD|TRUE-HD|LPCM|PCM|DDP|EAC3|E-AC-3|EAC-3|DD|AC3|AC-3|DTSHD|DTS-HDMA|DTS-HD(?:\.MA)?|DTS-MA|DTS HDMA|DTS HD MA|DTS MA|DTS|ATMOS)"#
 
         if matches(#"(^|[^A-Z0-9])(7\.1|8CH|8 CH)([^A-Z0-9]|$)"#, in: upper) ||
             matches(audioPrefix + #"[\.\s_-]?(7[\.\s]?1)([^A-Z0-9]|$)"#, in: upper) {

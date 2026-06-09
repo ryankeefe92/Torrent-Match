@@ -9,6 +9,47 @@ public final class PirateBayAPIProvider: TorrentProvider, @unchecked Sendable {
         self.session = session
     }
 
+    public func fetchDetailMetadata(for result: TorrentSearchResult) async throws -> TorrentDetailMetadata? {
+        guard let detailURL = result.detailURL else { return nil }
+
+        if let apiURL = apiDetailURL(for: detailURL) {
+            let (data, response) = try await session.data(for: makeRequest(url: apiURL))
+            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                throw ProviderError.badStatus(provider: config.name, status: http.statusCode)
+            }
+
+            let payload = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+            if payload.contains("cf-mitigated") || payload.contains("Just a moment...") || payload.contains("<html") {
+                throw ProviderError.accessBlocked(provider: config.name, reason: "API returned HTML instead of JSON")
+            }
+
+            let details = try JSONDecoder().decode(PirateBayAPITorrentDetails.self, from: data)
+            let description = details.descr?.htmlDecoded.readableMetadataText
+            if let description, Self.looksLikeUsefulDetailMetadata(description) {
+                let specs = TorrentDetailSpecParser.parse(description, fallbackTitle: result.title)
+                return TorrentDetailMetadata(text: description, specs: specs, magnet: result.magnet)
+            }
+        }
+
+        let (data, response) = try await session.data(for: makeRequest(url: detailURL))
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw ProviderError.badStatus(provider: config.name, status: http.statusCode)
+        }
+
+        let html = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+        if html.contains("cf-mitigated") || html.contains("Just a moment...") {
+            throw ProviderError.accessBlocked(provider: config.name, reason: "Cloudflare challenge")
+        }
+
+        guard let metadata = fallbackDetailMetadata(from: html) else { return nil }
+        let specs = TorrentDetailSpecParser.parse(
+            metadata,
+            detailTitle: extractDetailPageTitle(from: html),
+            fallbackTitle: result.title
+        )
+        return TorrentDetailMetadata(text: metadata, specs: specs, magnet: result.magnet)
+    }
+
     public func search(
         _ query: String,
         onProgress: (@Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)?
@@ -115,6 +156,21 @@ public final class PirateBayAPIProvider: TorrentProvider, @unchecked Sendable {
         return request
     }
 
+    private func apiDetailURL(for detailURL: URL) -> URL? {
+        guard let components = URLComponents(url: detailURL, resolvingAgainstBaseURL: false),
+              let id = components.queryItems?.first(where: { $0.name == "id" })?.value,
+              !id.isEmpty else { return nil }
+
+        let apiBaseURL = config.searchURLTemplate
+            .split(separator: "?")
+            .first
+            .flatMap { URL(string: String($0)) }
+            .flatMap { URL(string: "/", relativeTo: $0)?.absoluteURL }
+            ?? URL(string: "https://apibay.org/")
+        guard let apiBaseURL else { return nil }
+        return URL(string: "t.php?id=\(id)", relativeTo: apiBaseURL)?.absoluteURL
+    }
+
     private func makeMagnet(infoHash: String) -> String {
         let trackers = [
             "udp://tracker.opentrackr.org:1337/announce",
@@ -140,6 +196,78 @@ public final class PirateBayAPIProvider: TorrentProvider, @unchecked Sendable {
         formatter.includesCount = true
         return formatter.string(fromByteCount: Int64(bytes))
     }
+
+    private func fallbackDetailMetadata(from html: String) -> String? {
+        let candidates = [
+            #"<pre[^>]*>([\s\S]*?)</pre>"#,
+            #"<textarea[^>]*>([\s\S]*?)</textarea>"#,
+            #"<div[^>]+(?:id|class)=[\"'][^\"']*(?:media[\s_-]?info|nfo|description|technical|file[\s_-]?info|torrent[\s_-]?info|details?)[^\"']*[\"'][^>]*>([\s\S]*?)</div>"#,
+            #"<section[^>]+(?:id|class)=[\"'][^\"']*(?:media[\s_-]?info|nfo|description|technical|file[\s_-]?info|torrent[\s_-]?info|details?)[^\"']*[\"'][^>]*>([\s\S]*?)</section>"#
+        ]
+
+        let bestBlock = candidates
+            .flatMap { RegexTools.captureMatches(pattern: $0, in: html) }
+            .map { $0.htmlDecoded.readableMetadataText }
+            .filter(Self.looksLikeUsefulDetailMetadata)
+            .max { Self.metadataSignalScore($0) < Self.metadataSignalScore($1) }
+
+        if let bestBlock {
+            return bestBlock
+        }
+
+        let pageText = RegexTools.firstCapture(pattern: #"<body[^>]*>([\s\S]*?)</body>"#, in: html)?
+            .htmlDecoded
+            .readableMetadataText
+        guard let pageText,
+              Self.looksLikeUsefulDetailMetadata(pageText) else { return nil }
+        return pageText
+    }
+
+    private func extractDetailPageTitle(from html: String) -> String? {
+        let candidates = [
+            #"<h1[^>]*>([\s\S]*?)</h1>"#,
+            #"<h2[^>]*>([\s\S]*?)</h2>"#,
+            #"<title[^>]*>([\s\S]*?)</title>"#
+        ]
+
+        return candidates
+            .compactMap { RegexTools.firstCapture(pattern: $0, in: html)?.htmlDecoded.readableMetadataText.cleanedDetailPageTitle }
+            .first { !$0.isEmpty }
+    }
+
+    private static func looksLikeUsefulDetailMetadata(_ text: String) -> Bool {
+        let normalized = text.lowercased()
+        guard text.count >= 40 else { return false }
+        guard !isBoilerplateDetailText(normalized) else { return false }
+        return [
+            "mediainfo", "media info", "general", "video", "audio", "duration",
+            "bit rate", "bitrate", "codec", "format", "resolution", "width",
+            "height", "frame rate", "channel", "hdr", "dolby", "dts", "truehd"
+        ].contains { normalized.contains($0) }
+    }
+
+    private static func isBoilerplateDetailText(_ normalized: String) -> Bool {
+        [
+            "your report will be reviewed",
+            "moderation team",
+            "report this torrent",
+            "report torrent",
+            "dmca",
+            "captcha"
+        ].contains { normalized.contains($0) }
+    }
+
+    private static func metadataSignalScore(_ text: String) -> Int {
+        let normalized = text.lowercased()
+        let signals = [
+            "mediainfo", "media info", "general", "video", "audio", "duration",
+            "bit rate", "bitrate", "codec", "format", "resolution", "width",
+            "height", "frame rate", "channel", "hdr", "dolby", "dts", "truehd"
+        ]
+        return signals.reduce(0) { score, signal in
+            score + (normalized.contains(signal) ? 1 : 0)
+        } + min(text.count / 500, 10)
+    }
 }
 
 private struct PirateBayAPITorrent: Decodable {
@@ -158,4 +286,8 @@ private struct PirateBayAPITorrent: Decodable {
         case seeders
         case size
     }
+}
+
+private struct PirateBayAPITorrentDetails: Decodable {
+    let descr: String?
 }

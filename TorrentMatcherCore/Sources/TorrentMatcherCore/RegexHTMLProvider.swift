@@ -74,6 +74,29 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
         return RegexTools.firstCapture(pattern: magnetPattern, in: html)?.htmlDecoded
     }
 
+    public func fetchDetailMetadata(for result: TorrentSearchResult) async throws -> TorrentDetailMetadata? {
+        guard let detailURL = result.detailURL else { return nil }
+        guard config.detailMetadataPattern != nil || config.magnetPattern != nil else { return nil }
+
+        let html = try await fetchText(
+            detailURL,
+            referer: sameSiteHomeURL(for: detailURL),
+            timeoutSeconds: 35
+        )
+        let metadataText = extractDetailMetadata(from: html) ?? fallbackDetailMetadata(from: html)
+        let magnet = result.magnet?.isEmpty == false
+            ? result.magnet
+            : config.magnetPattern.flatMap { RegexTools.firstCapture(pattern: $0, in: html) }?.htmlDecoded
+
+        let specs = TorrentDetailSpecParser.parse(
+            metadataText,
+            detailTitle: extractDetailPageTitle(from: html),
+            fallbackTitle: result.title
+        )
+        guard metadataText?.isEmpty == false || magnet?.isEmpty == false else { return nil }
+        return TorrentDetailMetadata(text: metadataText, specs: specs, magnet: magnet)
+    }
+
     private var allSearchURLTemplates: [String] {
         [config.searchURLTemplate] + config.alternateSearchURLTemplates
     }
@@ -158,7 +181,7 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
             let url = try searchURL(template: template, encodedQuery: encodedQuery, page: 1)
             let html = try await fetchText(url, timeoutSeconds: requestTimeoutSeconds)
             let blocks = RegexTools.captureMatches(pattern: config.resultBlockPattern, in: html)
-            return try await parseResults(from: blocks, onProgress: onProgress)
+            return try await parseResults(from: blocks, sourceURL: url, onProgress: onProgress)
         }
 
         let pageFetch = await withTaskGroup(of: SearchPageEvent.self) { group in
@@ -168,7 +191,7 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
                         let url = try self.searchURL(template: template, encodedQuery: encodedQuery, page: page)
                         let html = try await self.fetchText(url, timeoutSeconds: requestTimeoutSeconds)
                         let blocks = RegexTools.captureMatches(pattern: self.config.resultBlockPattern, in: html)
-                        return .page(SearchPageResult(page: page, results: try await self.parseResults(from: blocks, onProgress: onProgress), errorMessage: nil))
+                        return .page(SearchPageResult(page: page, results: try await self.parseResults(from: blocks, sourceURL: url, onProgress: onProgress), errorMessage: nil))
                     } catch {
                         return .page(SearchPageResult(page: page, results: [], errorMessage: self.errorMessage(from: error)))
                     }
@@ -237,6 +260,7 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
 
     private func parseResults(
         from blocks: [String],
+        sourceURL: URL,
         onProgress: (@Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)?
     ) async throws -> [TorrentSearchResult] {
         var results: [TorrentSearchResult] = []
@@ -260,7 +284,7 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
             let size = config.sizePattern.flatMap { RegexTools.firstCapture(pattern: $0, in: block) }?.htmlDecoded.cleanedText
 
             let inlineMagnet = config.magnetPattern.flatMap { RegexTools.firstCapture(pattern: $0, in: block) }?.htmlDecoded
-            let detailURL = extractDetailURL(from: block)
+            let detailURL = extractDetailURL(from: block, sourceURL: sourceURL)
 
             let magnet: String?
             if let inlineMagnet {
@@ -348,13 +372,94 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
         (error as? LocalizedError)?.errorDescription ?? String(describing: error)
     }
 
-    private func extractDetailURL(from block: String) -> URL? {
+    private func extractDetailURL(from block: String, sourceURL: URL) -> URL? {
         guard let pattern = config.detailURLPattern,
               let raw = RegexTools.firstCapture(pattern: pattern, in: block)?.htmlDecoded,
               !raw.isEmpty else { return nil }
         if let absolute = URL(string: raw), absolute.scheme != nil { return absolute }
-        guard let base = config.detailBaseURL, let baseURL = URL(string: base) else { return nil }
+        let baseURL = sameSiteHomeURL(for: sourceURL) ?? config.detailBaseURL.flatMap(URL.init(string:))
+        guard let baseURL else { return nil }
         return URL(string: raw, relativeTo: baseURL)?.absoluteURL
+    }
+
+    private func extractDetailMetadata(from html: String) -> String? {
+        guard let pattern = config.detailMetadataPattern,
+              let raw = RegexTools.firstCapture(pattern: pattern, in: html)?.htmlDecoded.readableMetadataText,
+              Self.looksLikeUsefulDetailMetadata(raw) else { return nil }
+        return raw
+    }
+
+    private func fallbackDetailMetadata(from html: String) -> String? {
+        let candidates = [
+            #"<a\s+name=[\"']description[\"'][^>]*>[\s\S]*?(?:<legend[^>]*>[\s\S]*?</legend>)?([\s\S]*?)(?=<a\s+name=[\"']usercomments[\"']|<div[^>]+id=[\"']usercomments[\"']|$)"#,
+            #"<pre[^>]*>([\s\S]*?)</pre>"#,
+            #"<textarea[^>]*>([\s\S]*?)</textarea>"#,
+            #"<div[^>]+(?:id|class)=[\"'][^\"']*(?:media[\s_-]?info|nfo|description|technical|file[\s_-]?info|torrent[\s_-]?info)[^\"']*[\"'][^>]*>([\s\S]*?)</div>"#,
+            #"<section[^>]+(?:id|class)=[\"'][^\"']*(?:media[\s_-]?info|nfo|description|technical|file[\s_-]?info|torrent[\s_-]?info)[^\"']*[\"'][^>]*>([\s\S]*?)</section>"#
+        ]
+
+        let bestBlock = candidates
+            .flatMap { RegexTools.captureMatches(pattern: $0, in: html) }
+            .map { $0.htmlDecoded.readableMetadataText }
+            .filter(Self.looksLikeUsefulDetailMetadata)
+            .max { Self.metadataSignalScore($0) < Self.metadataSignalScore($1) }
+
+        if let bestBlock {
+            return bestBlock
+        }
+
+        let pageText = RegexTools.firstCapture(pattern: #"<body[^>]*>([\s\S]*?)</body>"#, in: html)?
+            .htmlDecoded
+            .readableMetadataText
+        guard let pageText,
+              Self.looksLikeUsefulDetailMetadata(pageText) else { return nil }
+        return pageText
+    }
+
+    private func extractDetailPageTitle(from html: String) -> String? {
+        let candidates = [
+            #"<h1[^>]*>([\s\S]*?)</h1>"#,
+            #"<h2[^>]*>([\s\S]*?)</h2>"#,
+            #"<title[^>]*>([\s\S]*?)</title>"#
+        ]
+
+        return candidates
+            .compactMap { RegexTools.firstCapture(pattern: $0, in: html)?.htmlDecoded.readableMetadataText.cleanedDetailPageTitle }
+            .first { !$0.isEmpty }
+    }
+
+    private static func looksLikeUsefulDetailMetadata(_ text: String) -> Bool {
+        let normalized = text.lowercased()
+        guard text.count >= 40 else { return false }
+        guard !isBoilerplateDetailText(normalized) else { return false }
+        return [
+            "mediainfo", "media info", "general", "video", "audio", "duration",
+            "bit rate", "bitrate", "codec", "format", "resolution", "width",
+            "height", "frame rate", "channel", "hdr", "dolby", "dts", "truehd"
+        ].contains { normalized.contains($0) }
+    }
+
+    private static func isBoilerplateDetailText(_ normalized: String) -> Bool {
+        [
+            "your report will be reviewed",
+            "moderation team",
+            "report this torrent",
+            "report torrent",
+            "dmca",
+            "captcha"
+        ].contains { normalized.contains($0) }
+    }
+
+    private static func metadataSignalScore(_ text: String) -> Int {
+        let normalized = text.lowercased()
+        let signals = [
+            "mediainfo", "media info", "general", "video", "audio", "duration",
+            "bit rate", "bitrate", "codec", "format", "resolution", "width",
+            "height", "frame rate", "channel", "hdr", "dolby", "dts", "truehd"
+        ]
+        return signals.reduce(0) { score, signal in
+            score + (normalized.contains(signal) ? 1 : 0)
+        } + min(text.count / 500, 10)
     }
 
     private func sameSiteHomeURL(for url: URL) -> URL? {

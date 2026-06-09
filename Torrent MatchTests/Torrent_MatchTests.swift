@@ -9,6 +9,7 @@ import Foundation
 import Testing
 import TorrentMatcherCore
 
+@Suite(.serialized)
 struct Torrent_MatchTests {
 
     @Test func htmlProvidersKeepRowsWhenSeedLeechParsingFails() async throws {
@@ -148,6 +149,52 @@ struct Torrent_MatchTests {
 
         #expect(results.count == 1)
         #expect(elapsed < 1.0)
+    }
+
+    @Test func x1337RelativeDetailURLsUseRespondingMirrorHost() async throws {
+        let sampleHTML = """
+        <table>
+          <tr>
+            <td class="name">
+              <a href="/torrent/12345/test/">The Matrix 1999 2160p WEB-DL DDP5 1 Atmos H265-GROUP</a>
+            </td>
+            <td class="coll-2 seeds">20</td>
+            <td class="coll-3 leeches">12</td>
+          </tr>
+        </table>
+        """
+
+        let config = ProviderConfig(
+            id: "1337x",
+            name: "1337x",
+            enabled: true,
+            searchURLTemplate: "https://dead.example/category-search/{{query}}/Movies/{{page}}/",
+            alternateSearchURLTemplates: [
+                "https://live.example/category-search/{{query}}/Movies/{{page}}/"
+            ],
+            resultBlockPattern: #"<tr[^>]*>([\s\S]*?)</tr>"#,
+            titlePattern: #"<a[^>]+href=[\"'](?:https?://[^\"']+)?/torrent/[^\"']+[\"'][^>]*>([^<]+)</a>"#,
+            detailURLPattern: #"<a[^>]+href=[\"']((?:https?://[^\"']+)?/torrent/[^\"']+)[\"'][^>]*>[^<]+</a>"#,
+            magnetPattern: nil,
+            fetchMagnetFromDetailDuringSearch: false,
+            seedersPattern: #"<td[^>]*class=[\"'][^\"']*seeds[^\"']*[\"'][^>]*>\s*(\d+)\s*</td>"#,
+            leechersPattern: #"<td[^>]*class=[\"'][^\"']*leeches[^\"']*[\"'][^>]*>\s*(\d+)\s*</td>"#,
+            sizePattern: nil,
+            detailBaseURL: "https://dead.example",
+            timeoutSeconds: 5,
+            searchPageCount: 1
+        )
+
+        let session = URLSession(configuration: MockURLProtocol.ephemeralConfiguration { request in
+            request.url?.host == "live.example"
+                ? .immediate(status: 200, body: sampleHTML)
+                : .immediate(status: 200, body: "<table></table>")
+        })
+        let provider = RegexHTMLProvider(config: config, session: session)
+        let results = try await provider.search("The Matrix", onProgress: nil)
+
+        #expect(results.count == 1)
+        #expect(results.first?.detailURL?.absoluteString == "https://live.example/torrent/12345/test/")
     }
 
     @Test func partialResultsSurviveProviderTimeout() async {
@@ -415,6 +462,400 @@ struct Torrent_MatchTests {
         #expect(testResult.sampleResults.first?.size == "6.4 GB")
     }
 
+    @Test func detailMetadataRejectsTorrentGalaxyReportBoilerplate() async throws {
+        let detailHTML = """
+        <html><body>
+          <div class="description">
+            Your report will be reviewed by our moderation team.
+          </div>
+        </body></html>
+        """
+        let config = ProviderConfig(
+            id: "torrentgalaxy",
+            name: "TorrentGalaxy",
+            enabled: true,
+            searchURLTemplate: "https://torrentgalaxy.example/search/{{query}}",
+            resultBlockPattern: "",
+            titlePattern: "",
+            detailURLPattern: nil,
+            detailMetadataPattern: "<div[^>]+class=\\\"[^\\\"]*(?:mediainfo|media-info|nfo|description)[^\\\"]*\\\"[^>]*>([\\s\\S]*?)</div>",
+            magnetPattern: nil,
+            fetchMagnetFromDetailDuringSearch: false,
+            seedersPattern: "",
+            leechersPattern: "",
+            detailBaseURL: "https://torrentgalaxy.example"
+        )
+        let session = URLSession(configuration: MockURLProtocol.ephemeralConfiguration { _ in
+            .immediate(status: 200, body: detailHTML)
+        })
+        let provider = RegexHTMLProvider(config: config, session: session)
+        let result = TorrentSearchResult(
+            title: "Movie 2025 2160p WEB-DL DDP5 1 H265-GROUP",
+            magnet: nil,
+            detailURL: URL(string: "https://torrentgalaxy.example/post-detail/abc/movie/"),
+            seeders: 10,
+            leechers: 2,
+            provider: config.name
+        )
+
+        let metadata = try await provider.fetchDetailMetadata(for: result)
+        #expect(metadata?.text == nil)
+    }
+
+    @Test func detailMetadataExtractsTorrentGalaxyDescriptionAnchorMediaInfo() async throws {
+        let detailHTML = """
+        <html><body>
+          <a name="description"></a><br>
+          <legend class="txlight"><b>Description</b></legend>
+          <div class="container-fluid">
+            <center>
+              <strong>MEDIAINFO</strong><br>
+              <div style="white-space: pre-wrap; text-align: left; display: inline-block;">
+        General
+        Complete name : /downloads/Movie.2025.2160p.WEB-DL.mkv
+        Format : Matroska
+        Duration : 2 h 16 min
+        Overall bit rate : 24.5 Mb/s
+        Frame rate : 23.976 FPS
+
+        Video
+        Format : HEVC
+        HDR format : Dolby Vision, Version 1.0, dvhe.05.06
+        Bit rate : 22.0 Mb/s
+        Width : 3 840 pixels
+        Height : 2 160 pixels
+        Display aspect ratio : 16:9
+        Frame rate : 23.976 (24000/1001) FPS
+        Bit depth : 10 bits
+        Color primaries : BT.2020
+        Encoding settings : crf=17.5 / preset=slow / pass=2
+
+        Audio #1
+        Format : E-AC-3
+        Bit rate : 192 kb/s
+        Channel(s) : 2 channels
+        Language : Spanish
+
+        Audio #2
+        Format : E-AC-3 JOC
+        Bit rate : 768 kb/s
+        Channel(s) : 6 channels
+        Language : English (US)
+        Sampling rate : 48.0 kHz
+        Frame rate : 31.250 FPS (1536 SPF)
+              </div>
+            </center>
+          </div>
+          <a name="usercomments"></a>
+        </body></html>
+        """
+        let session = URLSession(configuration: MockURLProtocol.ephemeralConfiguration { _ in
+            .immediate(status: 200, body: detailHTML)
+        })
+        let provider = RegexHTMLProvider(config: BuiltInProviderConfigs.torrentGalaxy, session: session)
+        let result = TorrentSearchResult(
+            title: "Movie 2025 1080p WEB-DL DDP5 1 H264-GROUP",
+            magnet: nil,
+            detailURL: URL(string: "https://torrentgalaxy.example/post-detail/abc/movie/"),
+            seeders: 10,
+            leechers: 2,
+            provider: BuiltInProviderConfigs.torrentGalaxy.name
+        )
+
+        let metadata = try await provider.fetchDetailMetadata(for: result)
+        #expect(metadata?.text?.contains("MEDIAINFO") == true)
+        #expect(metadata?.text?.contains("Complete name : /downloads/Movie.2025.2160p.WEB-DL.mkv") == true)
+        #expect(metadata?.text?.contains("E-AC-3 JOC") == true)
+        #expect(metadata?.specs?.fullTorrentName == "Movie.2025.2160p.WEB-DL.mkv")
+        #expect(metadata?.specs?.videoBitrate == "22.0 Mb/s")
+        #expect(metadata?.specs?.resolutionWidth == "3840 px")
+        #expect(metadata?.specs?.resolutionHeight == "2160 px")
+        #expect(metadata?.specs?.frameRate == "23.976 (24000/1001) FPS")
+        #expect(metadata?.specs?.bitDepth == "10 bits")
+        #expect(metadata?.specs?.crf == "17.5")
+        #expect(metadata?.specs?.preset == "slow")
+        #expect(metadata?.specs?.encodingPasses == "2 passes")
+        #expect(metadata?.specs?.colorGamut == "BT.2020")
+        #expect(metadata?.specs?.dolbyVisionProfile == "Profile 5 (05)")
+        #expect(metadata?.specs?.aspectRatio == "16:9")
+        #expect(metadata?.specs?.bestEnglishAudioBitrate == "768 kb/s")
+        #expect(metadata?.specs?.bestEnglishAudioSampleRate == "48.0 kHz")
+        #expect(metadata?.specs?.allAudioTrackBitrates == ["Spanish E-AC-3: 192 kb/s", "English (US) E-AC-3 JOC: 768 kb/s"])
+        #expect(metadata?.specs?.totalAudioTrackBitrate == "960 kb/s")
+        #expect(metadata?.specs?.overallBitrate == "24.5 Mb/s")
+        #expect(metadata?.specs?.calculatedVideoBitrate == "23.54 Mb/s (23540 kb/s)")
+        #expect(metadata?.specs?.runtime == "2 h 16 min")
+    }
+
+    @Test func pirateBayDetailMetadataUsesAPIDescription() async throws {
+        let detailJSON = """
+        {
+          "descr": "MediaInfo\\nGeneral\\nDuration : 2 h 16 min\\nVideo\\nFormat : HEVC\\nHDR format : Dolby Vision\\nAudio\\nFormat : E-AC-3 JOC\\nChannel(s) : 6 channels"
+        }
+        """
+        let session = URLSession(configuration: MockURLProtocol.ephemeralConfiguration { request in
+            let url = request.url?.absoluteString ?? ""
+            if url.contains("t.php?id=12345") {
+                return .immediate(status: 200, body: detailJSON)
+            }
+            return .immediate(status: 200, body: "<html></html>")
+        })
+        let provider = PirateBayAPIProvider(config: BuiltInProviderConfigs.pirateBay, session: session)
+        let result = TorrentSearchResult(
+            title: "Movie 2025 2160p WEB-DL DDP5 1 H265-GROUP",
+            magnet: "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567",
+            detailURL: URL(string: "https://thepiratebay.org/description.php?id=12345"),
+            seeders: 10,
+            leechers: 2,
+            provider: BuiltInProviderConfigs.pirateBay.name
+        )
+
+        let metadata = try await provider.fetchDetailMetadata(for: result)
+        #expect(metadata?.text?.contains("MediaInfo") == true)
+        #expect(metadata?.text?.contains("E-AC-3") == true)
+        #expect(metadata?.specs?.runtime == "2 h 16 min")
+    }
+
+    @Test func detailSpecParserFallsBackToAllAudioBitratesWhenVideoBitrateIsMissing() {
+        let text = """
+        MediaInfo
+        General
+        Duration : 1 h 44 min
+
+        Video
+        Format : AVC
+        Width : 1 920 pixels
+        Height : 1 040 pixels
+
+        Audio #1
+        Format : AAC
+        Bit rate : 128 kb/s
+        Language : English
+
+        Audio #2
+        Format : AC-3
+        Bit rate : 640 kb/s
+        Language : English
+        """
+
+        let specs = TorrentDetailSpecParser.parse(text)
+
+        #expect(specs?.videoBitrate == nil)
+        #expect(specs?.allAudioTrackBitrates == ["English AAC: 128 kb/s", "English AC-3: 640 kb/s"])
+        #expect(specs?.totalAudioTrackBitrate == "768 kb/s")
+        #expect(specs?.bestEnglishAudioBitrate == "640 kb/s")
+    }
+
+    @Test func detailSpecParserUsesDetailPageTitleWhenCompleteNameIsMissing() {
+        let text = """
+        MediaInfo
+        General
+        Duration : 1 h 44 min
+
+        Video
+        Format : AVC
+        Width : 1 920 pixels
+        Height : 1 040 pixels
+        """
+
+        let specs = TorrentDetailSpecParser.parse(
+            text,
+            detailTitle: "Movie.2025.1080p.WEB-DL.x264-GROUP",
+            fallbackTitle: "Movie 2025..."
+        )
+
+        #expect(specs?.fullTorrentName == "Movie.2025.1080p.WEB-DL.x264-GROUP")
+    }
+
+    @Test func detailSpecParserHandles1337xDescriptionSpecs() {
+        let text = """
+        Title : Mortal Kombat II 2026 2160p iT WEB-DL DDP5 1 Atmos DV HDR H 265-BYNDR
+        File Size : 20.01 GB
+        Duration : 1 h 55 min
+        Format : Matroska
+
+        Video:
+        Codec : HEVC
+        Resolution : 3 840 pixels x 1 606 pixels
+        Frame Rate : 23.976 FPS
+        Bitrate : 24.0 Mb/s
+        Overall Bitrate : 24.8 Mb/s
+
+        Audio:
+        Codec : E-AC-3 JOC
+        Bitrate : 768 kb/s
+        Language(s) : English
+        """
+
+        let specs = TorrentDetailSpecParser.parse(text)
+
+        #expect(specs?.fullTorrentName == "Mortal Kombat II 2026 2160p iT WEB-DL DDP5 1 Atmos DV HDR H 265-BYNDR")
+        #expect(specs?.videoBitrate == "24.0 Mb/s")
+        #expect(specs?.resolutionWidth == "3840 px")
+        #expect(specs?.resolutionHeight == "1606 px")
+        #expect(specs?.frameRate == "23.976 FPS")
+        #expect(specs?.overallBitrate == "24.8 Mb/s")
+        #expect(specs?.totalAudioTrackBitrate == "768 kb/s")
+        #expect(specs?.calculatedVideoBitrate == "24.03 Mb/s (24032 kb/s)")
+        #expect(specs?.runtime == "1 h 55 min")
+        #expect(specs?.bestEnglishAudioBitrate == "768 kb/s")
+        #expect(specs?.releaseHintText?.contains("HEVC") == true)
+        #expect(specs?.releaseHintText?.contains("DDP 5.1 Atmos") == true)
+    }
+
+    @Test func detailSpecParserHandlesUploaderNoteStyleSpecs() {
+        let text = """
+        The.Matrix.1999.1080p.BluRay.DDP5.1.x265.10bit-GalaxyRG265[TGx]
+
+        NOTE
+        SOURCE: The.Matrix.1999.RERIP.2160p.BluRay.x265.10bit.SDR.DTS-HD.MA.TrueHD.7.1.Atmos-SWTYBLZ
+
+        MEDIAINFO
+        Container = Matroska (mkv)
+        Duration = 02:16:18.671
+        Filesize = 3 GiB
+        --Video
+        Codec info = HEVC Main 10@L4@Main | V_MPEGH/ISO/HEVC
+        Resolution = 1920x800
+        Display AR = 2.400 | 2.40:1
+        Bitrate = 52.2 Mb/s
+        Framerate = CFR 23.976
+        Encoder = x265 - 3.5:[Linux][GCC 10.2.1][64 bit] 10bit
+        --Audio
+        Codec info = E-AC-3 | A_EAC3
+        Channels = 6
+        Bitrate = CBR 384 kb/s
+        Samplerate = 48.0 kHz
+        Language = English
+        """
+
+        let specs = TorrentDetailSpecParser.parse(text)
+
+        #expect(specs?.fullTorrentName == "The.Matrix.1999.1080p.BluRay.DDP5.1.x265.10bit-GalaxyRG265[TGx]")
+        #expect(specs?.runtime == "02:16:18.671")
+        #expect(specs?.resolutionWidth == "1920 px")
+        #expect(specs?.resolutionHeight == "800 px")
+        #expect(specs?.aspectRatio == "2.400 | 2.40:1")
+        #expect(specs?.videoBitrate == "52.2 Mb/s")
+        #expect(specs?.frameRate == "CFR 23.976")
+        #expect(specs?.bitDepth == "10 bits")
+        #expect(specs?.bestEnglishAudioBitrate == "CBR 384 kb/s")
+        #expect(specs?.bestEnglishAudioSampleRate == "48.0 kHz")
+        #expect(specs?.allAudioTrackBitrates == ["English E-AC-3 | A_EAC3: CBR 384 kb/s"])
+        #expect(specs?.totalAudioTrackBitrate == "384 kb/s")
+        #expect(specs?.releaseHintText?.contains("HEVC") == true)
+        #expect(specs?.releaseHintText?.contains("DDP 5.1") == true)
+    }
+
+    @Test func detailSpecParserSumsAudioBitratesAcrossUploaderFormats() {
+        let text = """
+        MEDIAINFO
+        General
+        Duration : 01:50:00
+        Overall BitRate = 12.0 Mb/s
+
+        Video #1
+        Codec: HEVC
+        Resolution: 1920 x 804
+        FrameRate: 23.976 fps
+
+        Audio #1 English
+        Codec: DTS-HD MA
+        BitRate = 1 536 kb/s
+        Language: English
+
+        Audio #2 English Commentary
+        Codec: AC-3
+        BitRate=640 kb/s
+        Language: English
+
+        Audio: Spanish AAC 160 kb/s
+        """
+
+        let specs = TorrentDetailSpecParser.parse(text)
+
+        #expect(specs?.videoBitrate == "9.66 Mb/s (9664 kb/s)")
+        #expect(specs?.overallBitrate == "12.0 Mb/s")
+        #expect(specs?.allAudioTrackBitrates == [
+            "English DTS-HD MA: 1 536 kb/s",
+            "English AC-3: 640 kb/s",
+            "Audio: Spanish AAC: 160 kb/s"
+        ])
+        #expect(specs?.bestEnglishAudioBitrate == "1 536 kb/s")
+        #expect(specs?.totalAudioTrackBitrate == "2.34 Mb/s (2336 kb/s)")
+        #expect(specs?.calculatedVideoBitrate == "9.66 Mb/s (9664 kb/s)")
+        #expect(specs?.calculatedFields.contains("videoBitrate") == true)
+        #expect(specs?.calculatedFields.contains("calculatedVideoBitrate") == true)
+    }
+
+    @Test func detailSpecParserCalculatesMissingSpecsFromExistingData() {
+        let text = """
+        MEDIAINFO
+        General
+        Duration : 01:40:00
+
+        Files
+        Movie.2026.1080p.WEB-DL.mkv 9.00 GB
+        Movie.2026.Sample.mkv 100 MB
+        Movie.2026.nfo 10 KB
+
+        Video
+        Format : HEVC
+        Width : 1920 pixels
+
+        Audio #1
+        Format : E-AC-3
+        Bit rate : 640 kb/s
+        Language : English
+
+        Audio #2
+        Format : AAC
+        Bit rate : 128 kb/s
+        Language : Spanish
+        """
+
+        let specs = TorrentDetailSpecParser.parse(text)
+
+        #expect(specs?.resolutionWidth == "1920 px")
+        #expect(specs?.resolutionHeight == nil)
+        #expect(specs?.overallBitrate == "12 Mb/s (12000 kb/s)")
+        #expect(specs?.totalAudioTrackBitrate == "768 kb/s")
+        #expect(specs?.videoBitrate == "11.23 Mb/s (11232 kb/s)")
+        #expect(specs?.calculatedVideoBitrate == "11.23 Mb/s (11232 kb/s)")
+        #expect(specs?.calculatedFields.contains("overallBitrate") == true)
+        #expect(specs?.calculatedFields.contains("videoBitrate") == true)
+        #expect(specs?.calculatedFields.contains("totalAudioTrackBitrate") == true)
+    }
+
+    @Test func detailSpecParserCalculatesAspectRatioAndMissingDimension() {
+        let dimensionsOnly = """
+        Video
+        Width : 1 920 pixels
+        Height : 800 pixels
+        """
+        let widthAndAspectRatio = """
+        Video
+        Width : 1 920 pixels
+        Display aspect ratio : 16:9
+        """
+
+        let dimensionsOnlySpecs = TorrentDetailSpecParser.parse(dimensionsOnly)
+        let widthAndAspectRatioSpecs = TorrentDetailSpecParser.parse(widthAndAspectRatio)
+
+        #expect(dimensionsOnlySpecs?.aspectRatio == "12:5 (2.40:1)")
+        #expect(dimensionsOnlySpecs?.calculatedFields.contains("aspectRatio") == true)
+        #expect(widthAndAspectRatioSpecs?.resolutionHeight == "1080 px")
+        #expect(widthAndAspectRatioSpecs?.calculatedFields.contains("resolutionHeight") == true)
+        #expect(widthAndAspectRatioSpecs?.aspectRatio == "16:9")
+        #expect(widthAndAspectRatioSpecs?.calculatedFields.contains("aspectRatio") == false)
+    }
+
+    @Test func detailPageTitleCleanupRejectsGenericProviderTitles() {
+        #expect("Download Latest Top Torrents by Subcategories torrentGalaxy".cleanedDetailPageTitle.isEmpty)
+        #expect("Search for Category: Movies, Free Fast, Download. Torrent torrentGalaxy".cleanedDetailPageTitle.isEmpty)
+        #expect("Download Mortal Kombat II 2026 2160p iT WEB-DL DDP5 1 Atmos DV HDR H 265-BYNDR Torrent | 1337x".cleanedDetailPageTitle == "Mortal Kombat II 2026 2160p iT WEB-DL DDP5 1 Atmos DV HDR H 265-BYNDR")
+    }
+
     @Test func searchMatchesMovieTitlesWithBridgeWordsInsideName() async {
         let result = TorrentSearchResult(
             title: "Mission Impossible The Final Reckoning 2025 2160p WEB-DL DDP5 1 Atmos H265-GROUP",
@@ -529,6 +970,51 @@ struct Torrent_MatchTests {
         )
 
         #expect(TorrentRanker.score(imax).score == TorrentRanker.score(standard).score + 13)
+    }
+
+    @Test func rankerUsesDetailMetadataWhenPresent() {
+        let titleOnly = TorrentSearchResult(
+            title: "Movie 2025 1080p WEB-DL TrueHD 7.1 H264-GROUP",
+            magnet: nil,
+            detailURL: nil,
+            seeders: 10,
+            leechers: 2,
+            provider: "A"
+        )
+        let enriched = TorrentSearchResult(
+            title: "Movie 2025 1080p WEB-DL TrueHD 7.1 H264-GROUP",
+            detailSpecs: TorrentDetailSpecParser.parse("""
+            MediaInfo
+            General
+            Complete name : Movie.2025.2160p.WEB-DL.mkv
+
+            Video
+            Format : HEVC
+            HDR format : Dolby Vision, Version 1.0, dvhe.05.06
+            Width : 3 840 pixels
+            Height : 2 160 pixels
+
+            Audio
+            Format : E-AC-3 JOC
+            Channel(s) : 6 channels
+            Language : English
+            """),
+            magnet: nil,
+            detailURL: nil,
+            seeders: 10,
+            leechers: 2,
+            provider: "A"
+        )
+
+        let titleScore = TorrentRanker.score(titleOnly)
+        let enrichedScore = TorrentRanker.score(enriched)
+        #expect(enrichedScore.score > titleScore.score)
+        #expect(enrichedScore.parsed.resolution == .p2160)
+        #expect(enrichedScore.parsed.videoCodec == .hevc)
+        #expect(enrichedScore.parsed.dynamicRange == .dolbyVision)
+        #expect(enrichedScore.parsed.audioCodec == .ddp)
+        #expect(enrichedScore.parsed.channels == .fiveOne)
+        #expect(enrichedScore.parsed.atmos == true)
     }
 
 }

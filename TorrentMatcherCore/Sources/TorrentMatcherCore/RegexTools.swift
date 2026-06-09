@@ -34,6 +34,37 @@ public extension String {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
+    var readableMetadataText: String {
+        self
+            .replacingOccurrences(of: #"<\s*br\s*/?\s*>"#, with: "\n", options: [.regularExpression, .caseInsensitive])
+            .replacingOccurrences(of: #"</\s*(?:div|p|li|tr|pre|section|article)\s*>"#, with: "\n", options: [.regularExpression, .caseInsensitive])
+            .replacingOccurrences(of: #"<[^>]+>"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"[ \t\f\r]+"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\n\s+"#, with: "\n", options: .regularExpression)
+            .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    var cleanedDetailPageTitle: String {
+        let cleaned = self.cleanedText
+            .replacingOccurrences(of: #"(?i)^\s*download\s+"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"(?i)\s+[-|]\s+(?:TorrentGalaxy|1337x|The Pirate Bay|TPB).*$"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"(?i)\s+torrent\s+download\s*$"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"(?i)\s+torrent\s*$"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"(?i)\s+download\s*$"#, with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = cleaned.lowercased()
+        if normalized.contains("latest top torrents") ||
+            normalized.contains("search for category") ||
+            normalized.contains("free fast download") ||
+            normalized == "torrentgalaxy" ||
+            normalized == "1337x" ||
+            normalized == "the pirate bay" {
+            return ""
+        }
+        return cleaned
+    }
+
     var normalizedDedupeKey: String {
         self.lowercased()
             .replacingOccurrences(of: #"[^a-z0-9]+"#, with: ".", options: .regularExpression)

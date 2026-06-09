@@ -28,9 +28,12 @@ public struct RankerWeights: Codable, Hashable, Sendable {
 
 public enum TorrentRanker {
     public static func score(_ result: TorrentSearchResult, weights: RankerWeights = .appleTVDefault) -> RankedTorrentResult {
-        let parsed = ReleaseParser.parse(result.title)
+        let titleParsed = ReleaseParser.parse(result.title)
+        let detailParsed = result.detailSpecs?.releaseHintText.map { ReleaseParser.parse($0) }
+        let parsed = titleParsed.mergedWithDetail(parsed: detailParsed, specs: result.detailSpecs)
+        let exclusionText = result.exclusionText
 
-        let upperTitle = result.title.uppercased()
+        let upperTitle = exclusionText.uppercased()
         if upperTitle.range(of: #"(^|[^A-Z0-9])(VC(?:\s|-)?1|DIV-?X|X(?:\s|-)?VID|WMV(?:3)?)([^A-Z0-9]|$)"#, options: .regularExpression) != nil ||
             upperTitle.contains("WINDOWS MEDIA VIDEO") {
             return RankedTorrentResult(
@@ -111,5 +114,32 @@ public enum TorrentRanker {
             if $0.score != $1.score { return $0.score > $1.score }
             return $0.raw.seeders > $1.raw.seeders
         }
+    }
+}
+
+private extension TorrentSearchResult {
+    var exclusionText: String {
+        var parts = [title]
+        if let detailText = detailSpecs?.releaseHintText?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !detailText.isEmpty {
+            parts.append(detailText)
+        }
+        return parts.joined(separator: " ")
+    }
+}
+
+private extension ParsedRelease {
+    func mergedWithDetail(parsed detail: ParsedRelease?, specs: TorrentDetailSpecs?) -> ParsedRelease {
+        guard let detail else { return self }
+        return ParsedRelease(
+            sourceType: detail.sourceType != .unknown ? detail.sourceType : sourceType,
+            resolution: detail.resolution != .unknown ? detail.resolution : resolution,
+            dynamicRange: detail.dynamicRange != .unknown && specs?.hasDynamicRangeDetails == true ? detail.dynamicRange : dynamicRange,
+            videoCodec: detail.videoCodec != .unknown ? detail.videoCodec : videoCodec,
+            audioCodec: detail.audioCodec != .unknown && specs?.hasBestEnglishAudioDetails == true ? detail.audioCodec : audioCodec,
+            channels: detail.channels != .unknown && specs?.hasBestEnglishAudioDetails == true ? detail.channels : channels,
+            atmos: specs?.hasBestEnglishAudioDetails == true ? detail.atmos : atmos,
+            imax: detail.imax || imax
+        )
     }
 }

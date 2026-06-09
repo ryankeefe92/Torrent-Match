@@ -9,11 +9,16 @@ public enum BuiltInProviderConfigs {
         alternateSearchURLTemplates: [
             "https://www.1337xx.to/sort-category-search/{{query}}/Movies/seeders/desc/{{page}}/",
             "https://13377x.click/category-search/{{query}}/Movies/{{page}}/",
-            "https://13377x.click/sort-category-search/{{query}}/Movies/seeders/desc/{{page}}/"
+            "https://13377x.click/sort-category-search/{{query}}/Movies/seeders/desc/{{page}}/",
+            "https://1337x.torrentbay.to/category-search/{{query}}/Movies/{{page}}/",
+            "https://1337x.torrentbay.to/sort-category-search/{{query}}/Movies/seeders/desc/{{page}}/",
+            "https://1337x.ninjaproxy.live/category-search/{{query}}/Movies/{{page}}/",
+            "https://1337x.ninjaproxy.live/sort-category-search/{{query}}/Movies/seeders/desc/{{page}}/"
         ],
         resultBlockPattern: #"<tr[^>]*>([\s\S]*?)</tr>"#,
         titlePattern: #"<a[^>]+href=[\"'](?:https?://[^\"']+)?/torrent/[^\"']+[\"'][^>]*>([^<]+)</a>"#,
         detailURLPattern: #"<a[^>]+href=[\"']((?:https?://[^\"']+)?/torrent/[^\"']+)[\"'][^>]*>[^<]+</a>"#,
+        detailMetadataPattern: #"<div[^>]+class=[\"'][^\"']*(?:torrent-detail-page|torrent-detail-info|description)[^\"']*[\"'][^>]*>([\s\S]*?)</div>"#,
         magnetPattern: #"href=[\"'](magnet:\?[^\"'#]+)[\"']"#,
         fetchMagnetFromDetailDuringSearch: false,
         seedersPattern: #"<td[^>]*class=[\"'][^\"']*seeds[^\"']*[\"'][^>]*>\s*(\d+)\s*</td>"#,
@@ -36,6 +41,7 @@ public enum BuiltInProviderConfigs {
         resultBlockPattern: "",
         titlePattern: "",
         detailURLPattern: nil,
+        detailMetadataPattern: nil,
         magnetPattern: nil,
         fetchMagnetFromDetailDuringSearch: false,
         seedersPattern: "",
@@ -54,6 +60,7 @@ public enum BuiltInProviderConfigs {
         resultBlockPattern: "(<div class=\\\"tgxtablerow txlight\\\"[\\s\\S]*?)(?=<div class=\\\"tgxtablerow txlight\\\"|<script src=\\\"/static/tgx/js/added-date.js\\\"|$)",
         titlePattern: "<a[^>]+class=\\\"txlight\\\"[^>]+title=\\\"([^\\\"]+)\\\"[^>]+href=\\\"/post-detail/[^\\\"]+/\\\"",
         detailURLPattern: "<a[^>]+href=\\\"(/post-detail/[^\\\"]+/)\\\"",
+        detailMetadataPattern: "<div[^>]+class=\\\"[^\\\"]*(?:mediainfo|media-info|nfo)[^\\\"]*\\\"[^>]*>([\\s\\S]*?)</div>",
         magnetPattern: "href=\\\"(magnet:\\?[^\\\"]+)\\\"",
         fetchMagnetFromDetailDuringSearch: false,
         seedersPattern: "Seeders/Leechers\\\">\\[<font color=\\\"green\\\">\\s*<b>(\\d+)</b>",
