@@ -441,7 +441,7 @@ struct ContentView: View {
 
     private func shouldPrefetchDetailMetadata(for searchResult: SearchResult) -> Bool {
         guard searchResult.detailURL != nil,
-              searchResult.raw.detailSpecs?.hasDisplayableFields != true else { return false }
+              searchResult.raw.detailSpecs?.hasDetailPageMetadataFields != true else { return false }
 
         switch detailMetadataStatuses[searchResult.id] {
         case .fetching, .checkedNoMetadata, .failed(_):
@@ -1130,11 +1130,12 @@ struct SearchResult: Identifiable, Hashable {
     }
 
     func withDetailMetadata(_ metadata: TorrentDetailMetadata) -> SearchResult {
+        let mergedSpecs = metadata.specs?.mergedMissingFields(from: raw.detailSpecs) ?? raw.detailSpecs
         let updatedRaw = TorrentSearchResult(
             id: raw.id,
             title: raw.title,
             detailMetadata: metadata.text ?? raw.detailMetadata,
-            detailSpecs: metadata.specs ?? raw.detailSpecs,
+            detailSpecs: mergedSpecs,
             magnet: metadata.magnet ?? raw.magnet,
             detailURL: raw.detailURL,
             seeders: raw.seeders,
@@ -1273,6 +1274,8 @@ enum ParserRankerAdapter {
         switch videoCodec {
         case .hevc: return "HEVC"
         case .avc: return "h264"
+        case .vc1: return "VC-1"
+        case .mpeg2: return "MPEG-2"
         case .av1: return "AV1"
         case .unknown: return "Unknown"
         }
@@ -1283,6 +1286,7 @@ enum ParserRankerAdapter {
         switch ac {
         case .truehd: base = "TrueHD"
         case .dtsHDMA: base = "DTS MA"
+        case .dtsHDHRA: base = "DTS HRA"
         case .pcm: base = "PCM"
         case .ddp: base = "DDP"
         case .dts: base = "DTS"
@@ -1468,7 +1472,7 @@ private struct ResultDetailView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 18) {
                 VStack(alignment: .leading, spacing: 8) {
-                    Text(prettifiedTitle(result.title))
+                    Text(result.title)
                         .font(.title2.weight(.semibold))
                         .fixedSize(horizontal: false, vertical: true)
                     HStack(spacing: 10) {
@@ -1517,9 +1521,13 @@ private struct ResultDetailView: View {
                     }
                 }
 
+                DetailSection(title: "Codec-Adjusted Quality Math") {
+                    QualityEquationView(result: result)
+                }
+
                 DetailSection(title: "Detail Page Specs") {
                     if let specs = result.detailSpecs, specs.hasDisplayableFields {
-                        DetailSpecList(specs: specs)
+                        DetailSpecList(specs: specs, result: result.raw)
                     } else if result.detailURL != nil {
                         metadataStatusView
                     } else {
@@ -1532,15 +1540,6 @@ private struct ResultDetailView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(minWidth: 420, minHeight: 420)
-    }
-
-    private func prettifiedTitle(_ title: String) -> String {
-        title
-            .replacingOccurrences(of: ".", with: " ")
-            .replacingOccurrences(of: "_", with: " ")
-            .components(separatedBy: .whitespacesAndNewlines)
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
     }
 
     @ViewBuilder
@@ -1569,8 +1568,114 @@ private struct ResultDetailView: View {
     }
 }
 
+private struct QualityEquationView: View {
+    let result: SearchResult
+
+    private var breakdown: QualityScoreBreakdown {
+        TorrentRanker.qualityBreakdown(for: result.raw)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Video codec-adjusted BPPPF")
+                    .font(.callout.weight(.semibold))
+                FractionEquation(
+                    value: formatDecimal(breakdown.video.adjustedBPPPF, places: 6),
+                    numerator: "\(formatInteger(breakdown.video.bitrateKbps)) kb/s (bitrate) x 1000 x \(formatDecimal(breakdown.video.codecFactor, places: 2)) (codec)",
+                    denominator: "\(breakdown.video.width) x \(breakdown.video.height) (pixels) x \(formatDecimal(breakdown.video.frameRate, places: 3)) (fps)"
+                )
+                Text("Bitrate source: \(breakdown.video.bitrateSourceLabel)")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Curved compression health: \(formatDecimal(breakdown.video.adjustedBPPPF, places: 6)) BPPPF -> \(formatDecimal(breakdown.video.compressionHealth, places: 4))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Curve points: 0.025=0.35, 0.050=0.50, 0.080=0.65, 0.120=0.80, 0.180=0.90, 0.300=0.97, 0.450=1.00")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Audio codec-adjusted density")
+                    .font(.callout.weight(.semibold))
+                if let audioBitrate = breakdown.audio.bitrateKbps,
+                   let density = breakdown.audio.density {
+                    FractionEquation(
+                        value: formatDecimal(density, places: 3),
+                        numerator: "\(formatInteger(audioBitrate)) kb/s (bitrate) x \(formatDecimal(breakdown.audio.codecFactor, places: 2)) (codec)",
+                        denominator: "\(formatDecimal(breakdown.audio.effectiveChannelCount, places: 0)) (channels)"
+                    )
+                } else {
+                    Text("No explicit or inferred bitrate was available for the selected English audio track.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text("Selected track: \(ParserRankerAdapter.audioSummary(codec: breakdown.parsed.audioCodec, channels: breakdown.parsed.channels, atmos: breakdown.parsed.atmos))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let source = breakdown.audio.bitrateSourceLabel {
+                    Text("Bitrate source: \(source)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if let density = breakdown.audio.density {
+                    Text("Curved compression health: \(formatDecimal(density, places: 3)) density -> \(formatDecimal(breakdown.audio.compressionHealth, places: 4))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("Curve points: 48=0.35, 64=0.50, 96=0.65, 128=0.80, 180=0.90, 250=0.97, 320=1.00")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Compression health: \(formatDecimal(breakdown.audio.compressionHealth, places: 4))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .textSelection(.enabled)
+    }
+
+    private func formatInteger(_ value: Int) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
+    }
+
+    private func formatDecimal(_ value: Double, places: Int) -> String {
+        String(format: "%.\(places)f", value)
+    }
+}
+
+private struct FractionEquation: View {
+    let value: String
+    let numerator: String
+    let denominator: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(value)
+                .font(.system(.body, design: .monospaced).weight(.semibold))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(numerator)
+                Rectangle()
+                    .fill(.secondary.opacity(0.55))
+                    .frame(maxWidth: .infinity, minHeight: 1, maxHeight: 1)
+                Text(denominator)
+            }
+            .font(.system(.callout, design: .monospaced))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
 private struct DetailSpecList: View {
     let specs: TorrentDetailSpecs
+    let result: TorrentSearchResult
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1584,10 +1689,10 @@ private struct DetailSpecList: View {
     private var rows: [(label: String, value: String, isCalculated: Bool)] {
         var rows: [(String, String, Bool)] = []
         append("Full torrent name", specs.fullTorrentName, field: "fullTorrentName", to: &rows)
-        append("Video bitrate", specs.videoBitrate, field: "videoBitrate", to: &rows)
+        append("Video bitrate", specs.videoBitrate ?? derivedVideoBitrate, field: "videoBitrate", to: &rows, forceCalculated: specs.videoBitrate == nil && derivedVideoBitrate != nil)
         append("Resolution width", specs.resolutionWidth, field: "resolutionWidth", to: &rows)
         append("Resolution height", specs.resolutionHeight, field: "resolutionHeight", to: &rows)
-        append("Frame rate", specs.frameRate, field: "frameRate", to: &rows)
+        append("Frame rate", specs.frameRate ?? "23.976 FPS", field: "frameRate", to: &rows)
         append("Bit depth", specs.bitDepth, field: "bitDepth", to: &rows)
         append("CRF", specs.crf, field: "crf", to: &rows)
         append("Preset", specs.preset, field: "preset", to: &rows)
@@ -1602,15 +1707,24 @@ private struct DetailSpecList: View {
         }
         append("Total audio bitrate", specs.totalAudioTrackBitrate, field: "totalAudioTrackBitrate", to: &rows)
         append("Overall bitrate", specs.overallBitrate, field: "overallBitrate", to: &rows)
-        append("Calculated video bitrate", specs.calculatedVideoBitrate, field: "calculatedVideoBitrate", to: &rows)
+        if specs.videoBitrate == nil && derivedVideoBitrate == nil {
+            append("Calculated video bitrate", specs.calculatedVideoBitrate, field: "calculatedVideoBitrate", to: &rows)
+        }
         append("Runtime", specs.runtime, field: "runtime", to: &rows)
         return rows
     }
 
-    private func append(_ label: String, _ value: String?, field: String, to rows: inout [(String, String, Bool)]) {
+    private var derivedVideoBitrate: String? {
+        let breakdown = TorrentRanker.qualityBreakdown(for: result)
+        guard !breakdown.video.bitrateIsEstimated else { return nil }
+        guard breakdown.video.bitrateSourceLabel != "explicit" else { return nil }
+        return "\(breakdown.video.bitrateKbps) kb/s"
+    }
+
+    private func append(_ label: String, _ value: String?, field: String, to rows: inout [(String, String, Bool)], forceCalculated: Bool = false) {
         guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
               !value.isEmpty else { return }
-        rows.append((label, value, specs.isCalculated(field)))
+        rows.append((label, value, forceCalculated || specs.isCalculated(field)))
     }
 }
 
@@ -1743,7 +1857,7 @@ private struct ResultRow: View {
                 ScoreBadge(score: result.score)
                     .padding(.top, 2)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(prettifiedTitle(result.title))
+                    Text(result.title)
                         .font(.headline)
                         .lineLimit(3)
                         .truncationMode(.tail)
@@ -1780,14 +1894,6 @@ private struct ResultRow: View {
         .padding(.vertical, 4)
     }
     
-    private func prettifiedTitle(_ title: String) -> String {
-        var s = title.replacingOccurrences(of: ".", with: " ")
-        s = s.replacingOccurrences(of: "_", with: " ")
-        s = s.replacingOccurrences(of: "-", with: "-") // keep hyphen as a token but avoid mid-word joiners
-        // Collapse multiple spaces
-        let parts = s.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
-        return parts.joined(separator: " ")
-    }
 }
 
 fileprivate struct NavigationViewWrapper<Content: View>: View {

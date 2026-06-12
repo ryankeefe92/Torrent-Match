@@ -21,6 +21,19 @@ public struct MovieCatalogSuggestion: Identifiable, Hashable, Sendable {
     }
 }
 
+public struct MovieCatalogRuntime: Hashable, Sendable {
+    public let minutes: Int
+
+    public var displayText: String {
+        let hours = minutes / 60
+        let remainder = minutes % 60
+        if hours > 0 {
+            return "\(hours) h \(remainder) min"
+        }
+        return "\(minutes) min"
+    }
+}
+
 public actor MovieCatalog {
     public static let shared = MovieCatalog()
 
@@ -74,6 +87,24 @@ public actor MovieCatalog {
         } catch {
             print("Movie catalog query failed: \(error)")
             return []
+        }
+    }
+
+    public func runtime(for query: String) async -> MovieCatalogRuntime? {
+        let (title, year) = Self.titleAndYear(from: query)
+        let normalizedQuery = Self.normalize(title)
+        guard !normalizedQuery.isEmpty else { return nil }
+
+        do {
+            let database = try openDatabase()
+            if let year,
+               let runtime = try queryRuntime(in: database, normalizedQuery: normalizedQuery, year: year) {
+                return runtime
+            }
+            return try queryRuntime(in: database, normalizedQuery: normalizedQuery, year: nil)
+        } catch {
+            print("Movie catalog runtime query failed: \(error)")
+            return nil
         }
     }
 
@@ -198,6 +229,41 @@ public actor MovieCatalog {
         return merged
     }
 
+    private func queryRuntime(
+        in database: OpaquePointer,
+        normalizedQuery: String,
+        year: Int?
+    ) throws -> MovieCatalogRuntime? {
+        let sql = """
+        SELECT runtime_minutes
+        FROM movies
+        WHERE runtime_minutes IS NOT NULL
+          AND (normalized_title = ?1 OR canonical_title = ?1)
+          AND (?2 IS NULL OR year = ?2)
+        ORDER BY
+            CASE WHEN year = ?2 THEN 0 ELSE 1 END,
+            num_votes DESC,
+            english_bias DESC
+        LIMIT 1
+        """
+
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(database, sql, -1, &statement, nil) == SQLITE_OK, let statement else {
+            throw MovieCatalogError.prepareFailed(sqlite3ErrorMessage(from: database))
+        }
+        defer { sqlite3_finalize(statement) }
+
+        bind(normalizedQuery, at: 1, in: statement)
+        if let year {
+            sqlite3_bind_int(statement, 2, Int32(year))
+        } else {
+            sqlite3_bind_null(statement, 2)
+        }
+
+        guard sqlite3_step(statement) == SQLITE_ROW else { return nil }
+        return MovieCatalogRuntime(minutes: Int(sqlite3_column_int(statement, 0)))
+    }
+
     static func normalize(_ text: String) -> String {
         let folded = text
             .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
@@ -214,6 +280,18 @@ public actor MovieCatalog {
             .joined(separator: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
+    }
+
+    static func titleAndYear(from query: String) -> (title: String, year: Int?) {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let yearText = RegexTools.firstCapture(pattern: #"(?i)(?:^|[^0-9])((?:19|20)[0-9]{2})(?:[^0-9]|$)"#, in: trimmed),
+           let year = Int(yearText) {
+            let title = trimmed
+                .replacingOccurrences(of: #"(?i)\s*\(?\b(?:19|20)[0-9]{2}\b\)?\s*$"#, with: "", options: .regularExpression)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return (title.isEmpty ? trimmed : title, year)
+        }
+        return (trimmed, nil)
     }
 }
 

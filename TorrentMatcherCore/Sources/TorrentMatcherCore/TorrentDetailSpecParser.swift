@@ -67,10 +67,17 @@ public enum TorrentDetailSpecParser {
         let fileDerivedOverallBitrate = calculatedOverallBitrate(fileSizeBytes: fileSizeBytes, runtimeSeconds: runtimeSeconds)
         let overallBitrate = parsedOverallBitrate ?? fileDerivedOverallBitrate
         if parsedOverallBitrate == nil, overallBitrate != nil { calculatedFields.insert("overallBitrate") }
-        let calculatedVideoBitrate = calculatedVideoBitrate(overallBitrate: overallBitrate, totalAudioBitrateKbps: totalAudioBitrateKbps)
+        let calculatedVideoBitrate = parsedVideoBitrate == nil ? calculatedVideoBitrate(overallBitrate: overallBitrate, totalAudioBitrateKbps: totalAudioBitrateKbps) : nil
         let videoBitrate = parsedVideoBitrate ?? calculatedVideoBitrate
-        if parsedVideoBitrate == nil, videoBitrate != nil { calculatedFields.insert("videoBitrate") }
-        if calculatedVideoBitrate != nil { calculatedFields.insert("calculatedVideoBitrate") }
+        if calculatedVideoBitrate != nil {
+            calculatedFields.insert("videoBitrate")
+            calculatedFields.insert("calculatedVideoBitrate")
+        }
+        let parsedBestEnglishAudioBitrate = firstValue(for: ["Bit rate", "Bitrate", "BitRate"], in: bestEnglishAudio) ??
+            bestEnglishAudio.flatMap { bitrateLabel(in: $0.name) } ??
+            freeText.bestEnglishAudioBitrate
+        let calculatedBestEnglishAudioBitrate = parsedBestEnglishAudioBitrate == nil ? calculatedAudioBitrate(overallBitrate: overallBitrate, videoBitrate: parsedVideoBitrate) : nil
+        if calculatedBestEnglishAudioBitrate != nil { calculatedFields.insert("bestEnglishAudioBitrate") }
         let runtime = firstValue(for: ["Duration", "Runtime"], in: general) ??
             firstValue(for: ["Duration", "Runtime"], in: video) ??
             freeText.runtime
@@ -101,7 +108,7 @@ public enum TorrentDetailSpecParser {
             colorGamut: colorGamut,
             dolbyVisionProfile: dolbyVisionProfile,
             aspectRatio: aspectRatio,
-            bestEnglishAudioBitrate: firstValue(for: ["Bit rate", "Bitrate", "BitRate"], in: bestEnglishAudio) ?? freeText.bestEnglishAudioBitrate,
+            bestEnglishAudioBitrate: parsedBestEnglishAudioBitrate ?? calculatedBestEnglishAudioBitrate,
             bestEnglishAudioSampleRate: firstValue(for: ["Sampling rate", "Sample rate", "Samplerate"], in: bestEnglishAudio) ?? freeText.bestEnglishAudioSampleRate,
             allAudioTrackBitrates: allAudioBitrates,
             totalAudioTrackBitrate: totalAudioBitrate,
@@ -266,9 +273,7 @@ private extension TorrentDetailSpecParser {
 
         return FreeTextSpecs(
             resolution: resolutionValues(firstRegexCapture(#"(?i)(\d[\d ]{2,7}\s*(?:pixels?|px)?\s*[x×]\s*\d[\d ]{2,7})"#, in: compact)),
-            videoBitrate: videoBitrateLine.flatMap {
-                firstRegexCapture(#"(?i)(?:bit\s*rate|bitrate)\s*[:=]\s*((?:VBR|CBR|ABR)?\s*\d[\d ]*(?:\.\d+)?\s*(?:[kmgt]i?b/s|[kmgt]bps|b/s))"#, in: $0)
-            },
+            videoBitrate: videoBitrateLine.flatMap(bitrateLabel),
             frameRate: firstRegexCapture(#"(?i)(?:frame\s*rate|framerate)\s*[:=]\s*([A-Z]*\s*\d+(?:\.\d+)?(?:\s*\([^\)]*\))?\s*FPS?)"#, in: compact) ??
                 firstRegexCapture(#"(?i)\b(\d{2,3}(?:\.\d{2,3})\s*FPS)\b"#, in: compact),
             bitDepth: bitDepthValue(from: compact),
@@ -279,12 +284,10 @@ private extension TorrentDetailSpecParser {
             colorGamut: firstRegexCapture(#"(?i)\b(BT\.?2020|BT\.?709|DCI-?P3|Display\s*P3)\b"#, in: compact),
             dolbyVisionProfile: extractDolbyVisionProfile(from: compact),
             aspectRatio: firstRegexCapture(#"(?i)(?:display\s*ar|display\s*aspect\s*ratio|aspect\s*ratio|dar)\s*[:=]\s*([0-9.]+\s*(?:\|\s*)?[0-9.]*:?[0-9.]*)"#, in: compact),
-            bestEnglishAudioBitrate: audioLine.flatMap {
-                firstRegexCapture(#"(?i)((?:VBR|CBR|ABR)?\s*\d[\d ]*(?:\.\d+)?\s*(?:[kmgt]i?b/s|[kmgt]bps|b/s))"#, in: $0)
-            },
+            bestEnglishAudioBitrate: audioLine.flatMap(bitrateLabel),
             bestEnglishAudioSampleRate: firstRegexCapture(#"(?i)(?:sampling\s*rate|sample\s*rate|samplerate)\s*[:=]\s*(\d+(?:\.\d+)?\s*kHz)"#, in: compact),
             allAudioBitrates: looseAudioBitrates,
-            overallBitrate: firstRegexCapture(#"(?i)overall\s*(?:bit\s*rate|bitrate)\s*[:=]\s*((?:VBR|CBR|ABR)?\s*\d[\d ]*(?:\.\d+)?\s*(?:[kmgt]i?b/s|[kmgt]bps|b/s))"#, in: compact),
+            overallBitrate: firstRegexCapture(#"(?i)overall\s*(?:bit\s*rate|bitrate)\s*[:=]\s*([^:;\n\r]{0,50}?(?:[kmgt]i?b/s|[kmgt]bps|b/s))"#, in: compact).flatMap(bitrateLabel),
             runtime: firstRegexCapture(#"(?i)(?:duration|runtime|run\s*time)\s*[:=]\s*([0-9]{1,2}\s*h(?:ours?)?\s*[0-9]{1,2}\s*m(?:in(?:utes?)?)?(?:\s*[0-9]{1,2}\s*s(?:ec(?:onds?)?)?)?)"#, in: compact) ??
                 firstRegexCapture(#"(?i)(?:duration|runtime|run\s*time)\s*[:=]\s*([0-9]{1,2}:[0-9]{2}(?::[0-9]{2}(?:\.\d+)?)?)"#, in: compact)
         )
@@ -390,7 +393,8 @@ private extension TorrentDetailSpecParser {
 
     static func bestEnglishTrack(from audioTracks: [DetailMediaSection]) -> DetailMediaSection? {
         let englishTracks = audioTracks.filter(isEnglishAudioTrack)
-        return englishTracks.max { audioTrackScore($0) < audioTrackScore($1) }
+        return englishTracks.max { audioTrackScore($0) < audioTrackScore($1) } ??
+            audioTracks.max { audioTrackScore($0) < audioTrackScore($1) }
     }
 
     static func isEnglishAudioTrack(_ track: DetailMediaSection) -> Bool {
@@ -404,25 +408,38 @@ private extension TorrentDetailSpecParser {
     }
 
     static func audioTrackScore(_ track: DetailMediaSection) -> Int {
-        let format = firstValue(for: ["Format", "Codec", "Codec info", "Commercial name"], in: track)?.uppercased() ?? ""
+        let format = audioDescriptor(for: track)
         let bitrate = bitrateKbps(firstValue(for: ["Bit rate", "Bitrate"], in: track)) ?? 0
-        let channels = channelCount(firstValue(for: ["Channel(s)", "Channels"], in: track)) ?? 0
-        return audioCodecPriority(format) * 1_000_000 + bitrate * 100 + channels
+        let channels = channelCount(firstValue(for: ["Channel(s)", "Channels"], in: track)) ?? channelCount(fromDescriptor: format) ?? 0
+        let atmos = format.contains("JOC") || format.contains("ATMOS")
+        let isDDP = isDolbyDigitalPlus(format)
+        let scoredChannels = channels == 0 && isDDP && atmos ? 6 : channels
+        return audioTrackPriority(format: format, channels: scoredChannels, atmos: atmos) * 1_000_000 + scoredChannels * 10_000 + bitrate
     }
 
-    static func audioCodecPriority(_ format: String) -> Int {
-        if format.contains("TRUEHD") { return 9 }
-        if format.contains("DTS-HD") || format.contains("DTS HD") { return 8 }
-        if format.contains("PCM") { return 7 }
-        if format.contains("E-AC-3") || format.contains("EAC3") || format.contains("DD+") { return 6 }
-        if format.contains("DTS") { return 5 }
-        if format.contains("AC-3") || format.contains("AC3") { return 4 }
-        if format.contains("AAC") { return 3 }
-        return 1
+    static func audioTrackPriority(format: String, channels: Int, atmos: Bool) -> Int {
+        let isDDP = isDolbyDigitalPlus(format)
+        let isLossless = format.contains("TRUEHD") ||
+            format.contains("DTS-HD MA") ||
+            format.contains("DTS HD MA") ||
+            format.contains("DTS-HD MASTER") ||
+            format.contains("PCM")
+        if isDDP && atmos && channels >= 8 { return 110 }
+        if isDDP && atmos && channels >= 6 { return 109 }
+        if isLossless && channels >= 8 { return 100 }
+        if isLossless && channels >= 6 { return 95 }
+        if isDDP && channels >= 8 { return 90 }
+        if isDDP && channels >= 6 { return 85 }
+        if format.contains("DTS") && channels >= 6 { return 80 }
+        if (format.contains("AC-3") || format.contains("AC3") || format.contains("DOLBY DIGITAL")) && channels >= 6 { return 75 }
+        if format.contains("AAC") && channels >= 6 { return 70 }
+        if channels == 2 { return 60 }
+        if channels == 1 { return 50 }
+        return 10
     }
 
     static func audioTrackBitrateLabel(_ track: DetailMediaSection) -> String? {
-        guard let bitrate = firstValue(for: ["Bit rate", "Bitrate", "BitRate"], in: track) else { return nil }
+        guard let bitrate = firstValue(for: ["Bit rate", "Bitrate", "BitRate"], in: track) ?? bitrateLabel(in: track.name) else { return nil }
         let language = firstValue(for: ["Language"], in: track)
         let format = firstValue(for: ["Format", "Codec", "Codec info"], in: track)
         let label = [language, format]
@@ -432,7 +449,7 @@ private extension TorrentDetailSpecParser {
     }
 
     static func totalBitrateKbps(from tracks: [DetailMediaSection]) -> Int? {
-        let values = tracks.compactMap { bitrateKbps(firstValue(for: ["Bit rate", "Bitrate", "BitRate"], in: $0)) }
+        let values = tracks.compactMap { bitrateKbps(firstValue(for: ["Bit rate", "Bitrate", "BitRate"], in: $0) ?? bitrateLabel(in: $0.name)) }
         guard !values.isEmpty else { return nil }
         return values.reduce(0, +)
     }
@@ -448,6 +465,13 @@ private extension TorrentDetailSpecParser {
               let overallKbps = bitrateKbps(overallBitrate),
               overallKbps > totalAudioBitrateKbps else { return nil }
         return displayBitrate(overallKbps - totalAudioBitrateKbps)
+    }
+
+    static func calculatedAudioBitrate(overallBitrate: String?, videoBitrate: String?) -> String? {
+        guard let overallKbps = bitrateKbps(overallBitrate),
+              let videoKbps = bitrateKbps(videoBitrate),
+              overallKbps > videoKbps else { return nil }
+        return displayBitrate(overallKbps - videoKbps)
     }
 
     static func calculatedOverallBitrate(fileSizeBytes: Double?, runtimeSeconds: Double?) -> String? {
@@ -587,7 +611,8 @@ private extension TorrentDetailSpecParser {
             .compactMap { line in
                 let lower = line.lowercased()
                 guard lower.contains("audio") || lower.contains("english") || lower.contains("commentary") else { return nil }
-                guard let rawBitrate = firstRegexCapture(#"(?i)((?:VBR|CBR|ABR)?\s*\d[\d ]*(?:\.\d+)?\s*(?:[kmgt]i?b/s|[kmgt]bps|b/s))"#, in: line) else { return nil }
+                if !line.contains(":") && !line.contains("="), sectionHeader(from: line)?.kind == .audio { return nil }
+                guard let rawBitrate = bitrateLabel(in: line) else { return nil }
                 let bitrate = rawBitrate.trimmingCharacters(in: .whitespacesAndNewlines)
                 let label = line.replacingOccurrences(of: rawBitrate, with: "")
                     .replacingOccurrences(of: #"(?i)\b(?:bit\s*rate|bitrate)\b\s*[:=]?"#, with: "", options: .regularExpression)
@@ -643,6 +668,8 @@ private extension TorrentDetailSpecParser {
         if upper.contains("AV1") { return "AV1" }
         if upper.contains("HEVC") || upper.contains("H.265") || upper.contains("H265") { return "HEVC" }
         if upper.contains("AVC") || upper.contains("H.264") || upper.contains("H264") { return "AVC" }
+        if upper.contains("VC-1") || upper.contains("VC 1") { return "VC-1" }
+        if upper.contains("MPEG VIDEO") || upper.contains("MPEG-2") || upper.contains("MPEG 2") { return "MPEG-2" }
         return nil
     }
 
@@ -662,19 +689,22 @@ private extension TorrentDetailSpecParser {
 
     static func audioToken(from track: DetailMediaSection?) -> String? {
         guard let track else { return nil }
-        let format = firstValue(for: ["Format", "Codec", "Codec info", "Commercial name"], in: track)?.uppercased() ?? ""
-        let atmos = format.contains("JOC") || format.contains("ATMOS") || (firstValue(for: ["Title"], in: track)?.uppercased().contains("ATMOS") == true)
+        let format = audioDescriptor(for: track)
+        let atmos = format.contains("JOC") || format.contains("ATMOS")
         let channels = channelLayoutToken(firstValue(for: ["Channel(s)", "Channels"], in: track)) ??
-            ((format.contains("E-AC-3") || format.contains("EAC3") || format.contains("DD+")) && atmos ? "5.1" : nil)
+            channelLayoutToken(fromDescriptor: format) ??
+            (isDolbyDigitalPlus(format) && atmos ? "5.1" : nil)
 
         let codec: String?
         if format.contains("TRUEHD") {
             codec = "TrueHD"
+        } else if format.contains("DTS-HD HRA") || format.contains("DTS HD HRA") || format.contains("DTS-HD HIGH RESOLUTION") {
+            codec = "DTS-HD HRA"
         } else if format.contains("DTS-HD") || format.contains("DTS HD") {
             codec = "DTS-HD MA"
         } else if format.contains("PCM") {
             codec = "PCM"
-        } else if format.contains("E-AC-3") || format.contains("EAC3") || format.contains("DD+") {
+        } else if isDolbyDigitalPlus(format) {
             codec = "DDP"
         } else if format.contains("DTS") {
             codec = "DTS"
@@ -692,6 +722,23 @@ private extension TorrentDetailSpecParser {
             .nilIfEmpty
     }
 
+    static func audioDescriptor(for track: DetailMediaSection) -> String {
+        ([track.name] + ["Format", "Codec", "Codec info", "Commercial name", "Title"]
+            .compactMap { firstValue(for: [$0], in: track) }
+        )
+            .joined(separator: " ")
+            .uppercased()
+    }
+
+    static func isDolbyDigitalPlus(_ format: String) -> Bool {
+        format.contains("E-AC-3") ||
+            format.contains("EAC3") ||
+            format.contains("EAC-3") ||
+            format.contains("DD+") ||
+            format.range(of: #"(^|[^A-Z0-9])DDP([^A-Z0-9]|$)"#, options: .regularExpression) != nil ||
+            format.contains("DOLBY DIGITAL PLUS")
+    }
+
     static func channelLayoutToken(_ raw: String?) -> String? {
         guard let count = channelCount(raw) else { return nil }
         if count >= 8 { return "7.1" }
@@ -701,20 +748,44 @@ private extension TorrentDetailSpecParser {
         return nil
     }
 
+    static func channelLayoutToken(fromDescriptor raw: String) -> String? {
+        if raw.range(of: #"(?i)(^|[^0-9])(?:7\.1|8\s*CH)([^0-9]|$)"#, options: .regularExpression) != nil { return "7.1" }
+        if raw.range(of: #"(?i)(^|[^0-9])(?:5\.1|6\s*CH)([^0-9]|$)"#, options: .regularExpression) != nil { return "5.1" }
+        if raw.range(of: #"(?i)(^|[^0-9])(?:2\.0|2\s*CH)([^0-9]|$)"#, options: .regularExpression) != nil { return "2.0" }
+        if raw.range(of: #"(?i)(^|[^0-9])(?:1\.0|1\s*CH|MONO)([^0-9]|$)"#, options: .regularExpression) != nil { return "1.0" }
+        return nil
+    }
+
+    static func channelCount(fromDescriptor raw: String) -> Int? {
+        switch channelLayoutToken(fromDescriptor: raw) {
+        case "7.1": return 8
+        case "5.1": return 6
+        case "2.0": return 2
+        case "1.0": return 1
+        default: return nil
+        }
+    }
+
     static func bitrateKbps(_ raw: String?) -> Int? {
         guard let raw else { return nil }
-        let normalized = raw.replacingOccurrences(of: #"[, ]+"#, with: "", options: .regularExpression).lowercased()
-        let pattern = #"([0-9]+(?:\.[0-9]+)?)([kmgt]i?b/s|[kmgt]bps|b/s)"#
+        let normalized = raw.replacingOccurrences(of: #","#, with: "", options: .regularExpression).lowercased()
+        let pattern = #"(?i)(?:VBR|CBR|ABR)?\s*(?<![0-9.])([0-9]+(?:\s[0-9]{3})*(?:\.[0-9]+)?)\s*([kmgt]i?b/s|[kmgt]bps|b/s)"#
         guard let regex = try? NSRegularExpression(pattern: pattern),
               let match = regex.matches(in: normalized, range: NSRange(normalized.startIndex..<normalized.endIndex, in: normalized)).last,
               match.numberOfRanges > 2,
               let valueRange = Range(match.range(at: 1), in: normalized),
               let unitRange = Range(match.range(at: 2), in: normalized),
-              let value = Double(normalized[valueRange]) else { return nil }
+              let value = Double(normalized[valueRange].replacingOccurrences(of: " ", with: "")) else { return nil }
         let unit = String(normalized[unitRange])
         if unit.contains("mb/s") || unit.contains("mbps") { return Int(value * 1_000) }
         if unit == "b/s" { return Int(value / 1_000) }
         return Int(value)
+    }
+
+    static func bitrateLabel(in raw: String?) -> String? {
+        guard let raw else { return nil }
+        let pattern = #"(?i)((?:VBR|CBR|ABR)?\s*(?<![0-9.])[0-9]+(?:\s[0-9]{3})*(?:\.[0-9]+)?\s*(?:[kmgt]i?b/s|[kmgt]bps|b/s))"#
+        return firstRegexCapture(pattern, in: raw)?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
     }
 
     static func channelCount(_ raw: String?) -> Int? {

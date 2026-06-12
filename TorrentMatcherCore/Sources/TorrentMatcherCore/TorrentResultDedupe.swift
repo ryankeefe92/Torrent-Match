@@ -38,7 +38,7 @@ public enum TorrentResultDedupe {
         indexByTitle.reserveCapacity(results.count)
 
         for result in results {
-            let key = result.title.normalizedDedupeKey
+            let key = result.title.normalizedProperInsensitiveDedupeKey
             guard !key.isEmpty else {
                 output.append(result)
                 continue
@@ -56,29 +56,52 @@ public enum TorrentResultDedupe {
     }
 
     private static func preferredDuplicate(between lhs: TorrentSearchResult, and rhs: TorrentSearchResult, weights: RankerWeights) -> TorrentSearchResult {
-        let lhsHasMagnet = lhs.magnet?.isEmpty == false
-        let rhsHasMagnet = rhs.magnet?.isEmpty == false
+        let lhsWithMergedMetadata = mergedWinner(lhs, withMetadataFrom: rhs)
+        let rhsWithMergedMetadata = mergedWinner(rhs, withMetadataFrom: lhs)
+        let lhsProper = lhsWithMergedMetadata.title.isProperReleaseTokenPresent
+        let rhsProper = rhsWithMergedMetadata.title.isProperReleaseTokenPresent
 
-        if lhsHasMagnet != rhsHasMagnet {
-            return lhsHasMagnet ? lhs : rhs
+        if lhsProper != rhsProper {
+            return lhsProper ? lhsWithMergedMetadata : rhsWithMergedMetadata
         }
 
-        let lhsRanked = TorrentRanker.score(lhs, weights: weights)
-        let rhsRanked = TorrentRanker.score(rhs, weights: weights)
+        let lhsHasMagnet = lhsWithMergedMetadata.magnet?.isEmpty == false
+        let rhsHasMagnet = rhsWithMergedMetadata.magnet?.isEmpty == false
+
+        if lhsHasMagnet != rhsHasMagnet {
+            return lhsHasMagnet ? lhsWithMergedMetadata : rhsWithMergedMetadata
+        }
+
+        let lhsRanked = TorrentRanker.score(lhsWithMergedMetadata, weights: weights)
+        let rhsRanked = TorrentRanker.score(rhsWithMergedMetadata, weights: weights)
 
         if lhsRanked.excluded != rhsRanked.excluded {
-            return lhsRanked.excluded ? rhs : lhs
+            return lhsRanked.excluded ? rhsWithMergedMetadata : lhsWithMergedMetadata
         }
 
         if lhsRanked.score != rhsRanked.score {
-            return lhsRanked.score >= rhsRanked.score ? lhs : rhs
+            return lhsRanked.score >= rhsRanked.score ? lhsWithMergedMetadata : rhsWithMergedMetadata
         }
 
-        if lhs.seeders != rhs.seeders {
-            return lhs.seeders >= rhs.seeders ? lhs : rhs
+        if lhsWithMergedMetadata.seeders != rhsWithMergedMetadata.seeders {
+            return lhsWithMergedMetadata.seeders >= rhsWithMergedMetadata.seeders ? lhsWithMergedMetadata : rhsWithMergedMetadata
         }
 
-        return lhs
+        return lhsWithMergedMetadata
+    }
+
+    private static func mergedWinner(_ winner: TorrentSearchResult, withMetadataFrom other: TorrentSearchResult) -> TorrentSearchResult {
+        TorrentSearchResult(
+            id: winner.id,
+            title: winner.title,
+            detailMetadata: winner.detailMetadata ?? other.detailMetadata,
+            detailSpecs: winner.detailSpecs?.mergedMissingFields(from: other.detailSpecs) ?? other.detailSpecs,
+            magnet: winner.magnet ?? other.magnet,
+            detailURL: winner.detailURL ?? other.detailURL,
+            seeders: winner.seeders,
+            leechers: winner.leechers,
+            provider: winner.provider,
+            size: winner.size ?? other.size
+        )
     }
 }
-

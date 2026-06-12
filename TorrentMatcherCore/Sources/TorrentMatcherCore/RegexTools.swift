@@ -71,6 +71,17 @@ public extension String {
             .trimmingCharacters(in: CharacterSet(charactersIn: "."))
     }
 
+    var normalizedProperInsensitiveDedupeKey: String {
+        self.lowercased()
+            .replacingOccurrences(of: #"(^|[^a-z0-9])proper([^a-z0-9]|$)"#, with: ".", options: .regularExpression)
+            .replacingOccurrences(of: #"[^a-z0-9]+"#, with: ".", options: .regularExpression)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+    }
+
+    var isProperReleaseTokenPresent: Bool {
+        range(of: #"(^|[^A-Z0-9])PROPER([^A-Z0-9]|$)"#, options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
     var infoHashFromMagnet: String? {
         guard let range = self.range(of: #"btih:([A-Fa-f0-9]{40}|[A-Za-z2-7]{32})"#, options: .regularExpression) else { return nil }
         return String(self[range]).replacingOccurrences(of: "btih:", with: "")

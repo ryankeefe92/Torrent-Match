@@ -3,12 +3,22 @@ import Foundation
 public enum ReleaseParser {
     public static func parse(_ title: String) -> ParsedRelease {
         let upper = title.uppercased()
-        let hasExplicit2160p = upper.contains("2160P") || upper.contains("4K")
+        let hasExplicit2160p = upper.contains("2160P") || containsNonDownscaled4K(in: upper)
         let hasExplicit1080p = upper.contains("1080P")
         let hasExplicit720p = upper.contains("720P")
         let hasBluRay = containsAnyToken(["BLURAY", "BLU-RAY", "BDRIP", "BDREMUX", "BRRIP", "BR-RIP", "BR RIP"], in: upper)
         let hasRemux = containsAnyToken(["REMUX", "BDREMUX", "BD REMUX"], in: upper)
-        let hasUHD = containsAnyToken(["UHD"], in: upper) || (hasExplicit2160p && (hasBluRay || hasRemux))
+        let hasHDRSourceSignal = upper.contains("DOLBY.VISION") ||
+            upper.contains("DOLBY VISION") ||
+            upper.contains("DOVI") ||
+            upper.contains("HDR10+") ||
+            upper.contains("HDR10PLUS") ||
+            containsHDR10(in: upper) ||
+            containsToken("HDR", in: upper) ||
+            upper.range(of: #"(^|[^0-9])(?:10|12)[\s-]?BIT(S)?([^0-9]|$)"#, options: .regularExpression) != nil
+        let hasUHD = containsAnyToken(["UHD"], in: upper) ||
+            (hasExplicit2160p && (hasBluRay || hasRemux)) ||
+            (hasBluRay && hasHDRSourceSignal)
         let hasHDRip = matches(#"(^|[^A-Z0-9])(HD[\s\.-]?RIP)([^A-Z0-9]|$)"#, in: upper)
         let hasHDTV = containsAnyToken(["HDTV"], in: upper) || hasHDRip
 
@@ -76,8 +86,16 @@ public enum ReleaseParser {
             videoCodec = .hevc
         } else if upper.contains("X264") || upper.contains("H264") || upper.contains("H.264") || upper.contains("AVC") {
             videoCodec = .avc
+        } else if matches(#"(^|[^A-Z0-9])VC[\s\.-]?1([^A-Z0-9]|$)"#, in: upper) {
+            videoCodec = .vc1
+        } else if matches(#"(^|[^A-Z0-9])MPEG[\s\.-]?2([^A-Z0-9]|$)"#, in: upper) {
+            videoCodec = .mpeg2
         } else if hasRemux && (hasUHD || hasExplicit2160p) {
             videoCodec = .hevc
+        } else if hasRemux && sourceType == .dvd {
+            videoCodec = .mpeg2
+        } else if hasRemux && hasBluRay {
+            videoCodec = .avc
         } else {
             videoCodec = .unknown
         }
@@ -89,6 +107,11 @@ public enum ReleaseParser {
             audioCodec = .truehd
         } else if containsAnyToken(["LPCM", "PCM"], in: upper) {
             audioCodec = .pcm
+        } else if upper.contains("DTS-HD HRA") ||
+            upper.contains("DTS HRA") ||
+            upper.contains("DTS-HD.HRA") ||
+            upper.contains("DTSHDHRA") {
+            audioCodec = .dtsHDHRA
         } else if containsAnyToken(["DTS-MA5 1", "DTS-MA7 1", "DTS-HDMA5 1", "DTS-HDMA7 1"], in: upper) ||
             containsAnyToken(["DTS MA5 1", "DTS MA7 1", "DTS HDMA5 1", "DTS HDMA7 1"], in: upper) ||
             containsAnyToken(["DTS-MA5.1", "DTS-MA7.1", "DTS-HDMA5.1", "DTS-HDMA7.1"], in: upper) ||
@@ -130,7 +153,7 @@ public enum ReleaseParser {
         if audioCodec == .dd && channels == .sevenOne {
             audioCodec = .ddp
         }
-        if audioCodec == .dtsHDMA && channels == .unknown {
+        if (audioCodec == .dtsHDMA || audioCodec == .dtsHDHRA) && channels == .unknown {
             channels = .fiveOne
         }
         if audioCodec == .ddp && channels == .unknown && (upper.contains("DDPA") || upper.contains("DDP ATMOS") || upper.contains("DDP+ATMOS")) {
@@ -175,9 +198,11 @@ public enum ReleaseParser {
     }
 
     private static func containsHDR10(in text: String) -> Bool {
-        containsToken("HDR10", in: text) ||
-            matches(#"(^|[^A-Z0-9])HDR[\.\s_-]*10[\.\s_-]*(BIT)?([^A-Z0-9]|$)"#, in: text) ||
-            matches(#"(^|[^A-Z0-9])10[\.\s_-]*BIT[\.\s_-]*HDR([^A-Z0-9]|$)"#, in: text)
+        containsToken("HDR10", in: text)
+    }
+
+    private static func containsNonDownscaled4K(in text: String) -> Bool {
+        matches(#"(^|[^A-Z0-9])(?<!DS)4K([^A-Z0-9]|$)"#, in: text)
     }
 
     private static func detectChannels(in upper: String) -> ChannelLayout {

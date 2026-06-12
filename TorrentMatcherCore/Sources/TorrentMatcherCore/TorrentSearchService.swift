@@ -69,8 +69,9 @@ public final class TorrentSearchService: @unchecked Sendable {
 
     public func searchAndRankReport(_ query: String) async -> RankedSearchReport {
         let report = await searchReport(query, onProgress: nil, onUpdate: nil)
+        let results = await applyRuntimeFallbacks(to: report.results, query: query)
         return RankedSearchReport(
-            results: rankVisibleResults(report.results, matching: query, weights: weights),
+            results: rankVisibleResults(results, matching: query, weights: weights),
             failures: report.failures
         )
     }
@@ -80,8 +81,9 @@ public final class TorrentSearchService: @unchecked Sendable {
         onProgress: (@Sendable (_ foundSoFar: Int) -> Void)?
     ) async -> RankedSearchReport {
         let report = await searchReport(query, onProgress: onProgress, onUpdate: nil)
+        let results = await applyRuntimeFallbacks(to: report.results, query: query)
         return RankedSearchReport(
-            results: rankVisibleResults(report.results, matching: query, weights: weights),
+            results: rankVisibleResults(results, matching: query, weights: weights),
             failures: report.failures
         )
     }
@@ -91,8 +93,9 @@ public final class TorrentSearchService: @unchecked Sendable {
         onUpdate: (@Sendable (_ update: RankedSearchUpdate) -> Void)?
     ) async -> RankedSearchReport {
         let report = await searchReport(query, onProgress: nil, onUpdate: onUpdate)
+        let results = await applyRuntimeFallbacks(to: report.results, query: query)
         return RankedSearchReport(
-            results: rankVisibleResults(report.results, matching: query, weights: weights),
+            results: rankVisibleResults(results, matching: query, weights: weights),
             failures: report.failures
         )
     }
@@ -264,6 +267,59 @@ public final class TorrentSearchService: @unchecked Sendable {
         filterSearchResults(results, matching: query)
     }
 
+    private func applyRuntimeFallbacks(to results: [TorrentSearchResult], query: String) async -> [TorrentSearchResult] {
+        let queryRuntime = await MovieCatalog.shared.runtime(for: query)?.displayText
+        var enriched: [TorrentSearchResult] = []
+        enriched.reserveCapacity(results.count)
+
+        for result in results {
+            let existingRuntime = result.detailSpecs?.runtime?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+            let runtime: String?
+            if let existingRuntime {
+                runtime = existingRuntime
+            } else if result.title.isKnownRuntimeCompatibleCut {
+                let titleRuntime = queryRuntime == nil ? await MovieCatalog.shared.runtime(for: result.title)?.displayText : nil
+                runtime = queryRuntime ?? titleRuntime
+            } else {
+                runtime = nil
+            }
+
+            guard let runtime else {
+                enriched.append(result)
+                continue
+            }
+
+            let overallBitrate = result.detailSpecs?.overallBitrate == nil ? calculatedOverallBitrate(size: result.size, runtime: runtime) : nil
+            guard existingRuntime == nil || overallBitrate != nil else {
+                enriched.append(result)
+                continue
+            }
+            let specs = (result.detailSpecs ?? TorrentDetailSpecs()).withFallbackRuntime(runtime, overallBitrate: overallBitrate)
+            enriched.append(TorrentSearchResult(
+                id: result.id,
+                title: result.title,
+                detailMetadata: result.detailMetadata,
+                detailSpecs: specs,
+                magnet: result.magnet,
+                detailURL: result.detailURL,
+                seeders: result.seeders,
+                leechers: result.leechers,
+                provider: result.provider,
+                size: result.size
+            ))
+        }
+        return enriched
+    }
+
+    private func calculatedOverallBitrate(size: String?, runtime: String) -> String? {
+        guard let sizeBytes = fileSizeBytes(size),
+              let runtimeSeconds = runtimeSeconds(from: runtime),
+              runtimeSeconds > 0 else { return nil }
+        let kbps = Int((sizeBytes * 8) / runtimeSeconds / 1_000)
+        guard kbps > 0 else { return nil }
+        return displayBitrate(kbps)
+    }
+
     private static func provider(for config: ProviderConfig) -> TorrentProvider {
         switch config.id {
         case "pirate-bay":
@@ -328,6 +384,90 @@ private func rankVisibleResults(
     let filtered = filterSearchResults(results, matching: query)
     let deduped = dedupeResults(filtered, weights: weights)
     return TorrentRanker.rank(deduped, hideExcluded: true, weights: weights)
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
+    }
+
+    var isKnownRuntimeCompatibleCut: Bool {
+        range(
+            of: #"(?i)(^|[^a-z0-9])(director'?s?\s*cut|extended|unrated|uncut|alternate\s*cut|assembly\s*cut|final\s*cut|special\s*edition|roadshow|redux|criterion\s*cut)([^a-z0-9]|$)"#,
+            options: .regularExpression
+        ) == nil
+    }
+}
+
+private func displayBitrate(_ kbps: Int) -> String {
+    if kbps >= 1_000 {
+        let mbps = Double(kbps) / 1_000
+        let value = mbps >= 10 ? String(format: "%.0f", mbps) : String(format: "%.2f", mbps)
+        return "\(value) Mb/s (\(kbps) kb/s)"
+    }
+    return "\(kbps) kb/s"
+}
+
+private func fileSizeBytes(_ raw: String?) -> Double? {
+    guard let raw else { return nil }
+    let normalized = raw.replacingOccurrences(of: ",", with: ".")
+    let pattern = #"(?i)([0-9]+(?:\.[0-9]+)?)\s*([kmgt]i?b|[kmgt]b)\b"#
+    guard let regex = try? NSRegularExpression(pattern: pattern),
+          let match = regex.firstMatch(in: normalized, range: NSRange(normalized.startIndex..<normalized.endIndex, in: normalized)),
+          match.numberOfRanges > 2,
+          let valueRange = Range(match.range(at: 1), in: normalized),
+          let unitRange = Range(match.range(at: 2), in: normalized),
+          let value = Double(normalized[valueRange]) else { return nil }
+    switch String(normalized[unitRange]).lowercased() {
+    case "kib": return value * 1_024
+    case "mib": return value * pow(1_024, 2)
+    case "gib": return value * pow(1_024, 3)
+    case "tib": return value * pow(1_024, 4)
+    case "kb": return value * 1_000
+    case "mb": return value * pow(1_000, 2)
+    case "gb": return value * pow(1_000, 3)
+    case "tb": return value * pow(1_000, 4)
+    default: return nil
+    }
+}
+
+private func runtimeSeconds(from raw: String?) -> Double? {
+    guard let raw else { return nil }
+    let normalized = raw.lowercased()
+        .replacingOccurrences(of: #","#, with: "", options: .regularExpression)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    let hmsPattern = #"^([0-9]{1,2}):([0-9]{2})(?::([0-9]{2}(?:\.[0-9]+)?))?$"#
+    if let captures = regexCaptures(hmsPattern, in: normalized), captures.count >= 2 {
+        let first = Double(captures[safe: 0] ?? "") ?? 0
+        let second = Double(captures[safe: 1] ?? "") ?? 0
+        let third = Double(captures[safe: 2] ?? "") ?? 0
+        return captures.count >= 3 ? first * 3600 + second * 60 + third : first * 60 + second
+    }
+    let hours = Double(firstRegexCapture(#"([0-9]+(?:\.[0-9]+)?)\s*h"#, in: normalized) ?? "") ?? 0
+    let minutes = Double(firstRegexCapture(#"([0-9]+(?:\.[0-9]+)?)\s*m"#, in: normalized) ?? "") ?? 0
+    let seconds = Double(firstRegexCapture(#"([0-9]+(?:\.[0-9]+)?)\s*s"#, in: normalized) ?? "") ?? 0
+    let total = hours * 3600 + minutes * 60 + seconds
+    return total > 0 ? total : nil
+}
+
+private func firstRegexCapture(_ pattern: String, in text: String) -> String? {
+    regexCaptures(pattern, in: text)?.first
+}
+
+private func regexCaptures(_ pattern: String, in text: String) -> [String]? {
+    guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return nil }
+    let range = NSRange(text.startIndex..<text.endIndex, in: text)
+    guard let match = regex.firstMatch(in: text, range: range), match.numberOfRanges > 1 else { return nil }
+    return (1..<match.numberOfRanges).compactMap { index in
+        guard let captureRange = Range(match.range(at: index), in: text) else { return nil }
+        return String(text[captureRange])
+    }
+}
+
+private extension Array {
+    subscript(safe index: Int) -> Element? {
+        indices.contains(index) ? self[index] : nil
+    }
 }
 
 private actor MagnetResolutionCache {
