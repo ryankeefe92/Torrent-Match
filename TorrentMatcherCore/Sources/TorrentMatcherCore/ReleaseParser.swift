@@ -76,8 +76,16 @@ public enum ReleaseParser {
             videoCodec = .hevc
         } else if upper.contains("X264") || upper.contains("H264") || upper.contains("H.264") || upper.contains("AVC") {
             videoCodec = .avc
+        } else if matches(#"(^|[^A-Z0-9])VC[\s\.-]?1([^A-Z0-9]|$)"#, in: upper) {
+            videoCodec = .vc1
+        } else if matches(#"(^|[^A-Z0-9])MPEG[\s\.-]?2([^A-Z0-9]|$)"#, in: upper) {
+            videoCodec = .mpeg2
         } else if hasRemux && (hasUHD || hasExplicit2160p) {
             videoCodec = .hevc
+        } else if hasRemux && sourceType == .dvd {
+            videoCodec = .mpeg2
+        } else if hasRemux && hasBluRay {
+            videoCodec = .avc
         } else {
             videoCodec = .unknown
         }
@@ -89,6 +97,11 @@ public enum ReleaseParser {
             audioCodec = .truehd
         } else if containsAnyToken(["LPCM", "PCM"], in: upper) {
             audioCodec = .pcm
+        } else if upper.contains("DTS-HD HRA") ||
+            upper.contains("DTS HRA") ||
+            upper.contains("DTS-HD.HRA") ||
+            upper.contains("DTSHDHRA") {
+            audioCodec = .dtsHDHRA
         } else if containsAnyToken(["DTS-MA5 1", "DTS-MA7 1", "DTS-HDMA5 1", "DTS-HDMA7 1"], in: upper) ||
             containsAnyToken(["DTS MA5 1", "DTS MA7 1", "DTS HDMA5 1", "DTS HDMA7 1"], in: upper) ||
             containsAnyToken(["DTS-MA5.1", "DTS-MA7.1", "DTS-HDMA5.1", "DTS-HDMA7.1"], in: upper) ||
@@ -130,7 +143,7 @@ public enum ReleaseParser {
         if audioCodec == .dd && channels == .sevenOne {
             audioCodec = .ddp
         }
-        if audioCodec == .dtsHDMA && channels == .unknown {
+        if (audioCodec == .dtsHDMA || audioCodec == .dtsHDHRA) && channels == .unknown {
             channels = .fiveOne
         }
         if audioCodec == .ddp && channels == .unknown && (upper.contains("DDPA") || upper.contains("DDP ATMOS") || upper.contains("DDP+ATMOS")) {

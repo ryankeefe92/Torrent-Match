@@ -193,11 +193,11 @@ public enum DynamicRange: String, Codable, Sendable {
 }
 
 public enum VideoCodec: String, Codable, Sendable {
-    case hevc, avc, av1, unknown
+    case hevc, avc, vc1, mpeg2, av1, unknown
 }
 
 public enum AudioCodec: String, Codable, Sendable {
-    case truehd, dtsHDMA = "dts_hd_ma", pcm, ddp, dts, dd, aac, unknown
+    case truehd, dtsHDMA = "dts_hd_ma", dtsHDHRA = "dts_hd_hra", pcm, ddp, dts, dd, aac, unknown
 }
 
 public enum ChannelLayout: String, Codable, Sendable {

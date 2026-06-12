@@ -405,20 +405,34 @@ private extension TorrentDetailSpecParser {
 
     static func audioTrackScore(_ track: DetailMediaSection) -> Int {
         let format = firstValue(for: ["Format", "Codec", "Codec info", "Commercial name"], in: track)?.uppercased() ?? ""
+        let title = firstValue(for: ["Title"], in: track)?.uppercased() ?? ""
         let bitrate = bitrateKbps(firstValue(for: ["Bit rate", "Bitrate"], in: track)) ?? 0
         let channels = channelCount(firstValue(for: ["Channel(s)", "Channels"], in: track)) ?? 0
-        return audioCodecPriority(format) * 1_000_000 + bitrate * 100 + channels
+        let atmos = format.contains("JOC") || format.contains("ATMOS") || title.contains("ATMOS")
+        let isDDP = format.contains("E-AC-3") || format.contains("EAC3") || format.contains("DD+") || format.contains("DOLBY DIGITAL PLUS")
+        let scoredChannels = channels == 0 && isDDP && atmos ? 6 : channels
+        return audioTrackPriority(format: format, channels: scoredChannels, atmos: atmos) * 1_000_000 + scoredChannels * 10_000 + bitrate
     }
 
-    static func audioCodecPriority(_ format: String) -> Int {
-        if format.contains("TRUEHD") { return 9 }
-        if format.contains("DTS-HD") || format.contains("DTS HD") { return 8 }
-        if format.contains("PCM") { return 7 }
-        if format.contains("E-AC-3") || format.contains("EAC3") || format.contains("DD+") { return 6 }
-        if format.contains("DTS") { return 5 }
-        if format.contains("AC-3") || format.contains("AC3") { return 4 }
-        if format.contains("AAC") { return 3 }
-        return 1
+    static func audioTrackPriority(format: String, channels: Int, atmos: Bool) -> Int {
+        let isDDP = format.contains("E-AC-3") || format.contains("EAC3") || format.contains("DD+") || format.contains("DOLBY DIGITAL PLUS")
+        let isLossless = format.contains("TRUEHD") ||
+            format.contains("DTS-HD MA") ||
+            format.contains("DTS HD MA") ||
+            format.contains("DTS-HD MASTER") ||
+            format.contains("PCM")
+        if isDDP && atmos && channels >= 8 { return 110 }
+        if isDDP && atmos && channels >= 6 { return 109 }
+        if isLossless && channels >= 8 { return 100 }
+        if isLossless && channels >= 6 { return 95 }
+        if isDDP && channels >= 8 { return 90 }
+        if isDDP && channels >= 6 { return 85 }
+        if format.contains("DTS") && channels >= 6 { return 80 }
+        if (format.contains("AC-3") || format.contains("AC3") || format.contains("DOLBY DIGITAL")) && channels >= 6 { return 75 }
+        if format.contains("AAC") && channels >= 6 { return 70 }
+        if channels == 2 { return 60 }
+        if channels == 1 { return 50 }
+        return 10
     }
 
     static func audioTrackBitrateLabel(_ track: DetailMediaSection) -> String? {
@@ -643,6 +657,8 @@ private extension TorrentDetailSpecParser {
         if upper.contains("AV1") { return "AV1" }
         if upper.contains("HEVC") || upper.contains("H.265") || upper.contains("H265") { return "HEVC" }
         if upper.contains("AVC") || upper.contains("H.264") || upper.contains("H264") { return "AVC" }
+        if upper.contains("VC-1") || upper.contains("VC 1") { return "VC-1" }
+        if upper.contains("MPEG VIDEO") || upper.contains("MPEG-2") || upper.contains("MPEG 2") { return "MPEG-2" }
         return nil
     }
 
@@ -670,6 +686,8 @@ private extension TorrentDetailSpecParser {
         let codec: String?
         if format.contains("TRUEHD") {
             codec = "TrueHD"
+        } else if format.contains("DTS-HD HRA") || format.contains("DTS HD HRA") || format.contains("DTS-HD HIGH RESOLUTION") {
+            codec = "DTS-HD HRA"
         } else if format.contains("DTS-HD") || format.contains("DTS HD") {
             codec = "DTS-HD MA"
         } else if format.contains("PCM") {

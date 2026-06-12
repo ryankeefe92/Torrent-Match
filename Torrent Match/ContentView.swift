@@ -1273,6 +1273,8 @@ enum ParserRankerAdapter {
         switch videoCodec {
         case .hevc: return "HEVC"
         case .avc: return "h264"
+        case .vc1: return "VC-1"
+        case .mpeg2: return "MPEG-2"
         case .av1: return "AV1"
         case .unknown: return "Unknown"
         }
@@ -1283,6 +1285,7 @@ enum ParserRankerAdapter {
         switch ac {
         case .truehd: base = "TrueHD"
         case .dtsHDMA: base = "DTS MA"
+        case .dtsHDHRA: base = "DTS HRA"
         case .pcm: base = "PCM"
         case .ddp: base = "DDP"
         case .dts: base = "DTS"
