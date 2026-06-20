@@ -274,14 +274,17 @@ public final class TorrentSearchService: @unchecked Sendable {
 
         for result in results {
             let existingRuntime = result.detailSpecs?.runtime?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+            let runtimeLookupTitle = result.detailSpecs?.fullTorrentName ??
+                result.detailSpecs?.releaseHintText ??
+                result.title
             let runtime: String?
             if let existingRuntime {
                 runtime = existingRuntime
-            } else if result.title.isKnownRuntimeCompatibleCut {
+            } else if runtimeLookupTitle.isKnownRuntimeCompatibleCut {
                 let titleRuntime = queryRuntime == nil ? await MovieCatalog.shared.runtime(for: result.title)?.displayText : nil
                 runtime = queryRuntime ?? titleRuntime
             } else {
-                runtime = nil
+                runtime = await OnlineRuntimeLookup.shared.runtime(for: runtimeLookupTitle, query: query)?.displayText
             }
 
             guard let runtime else {
@@ -393,7 +396,7 @@ private extension String {
 
     var isKnownRuntimeCompatibleCut: Bool {
         range(
-            of: #"(?i)(^|[^a-z0-9])(director'?s?\s*cut|extended|unrated|uncut|alternate\s*cut|assembly\s*cut|final\s*cut|special\s*edition|roadshow|redux|criterion\s*cut)([^a-z0-9]|$)"#,
+            of: #"(?i)(^|[^a-z0-9])(dc|director'?s?\s*cut|extended|unrated|uncut|alternate\s*cut|assembly\s*cut|final\s*cut|special\s*edition|roadshow|redux|criterion\s*cut)([^a-z0-9]|$)"#,
             options: .regularExpression
         ) == nil
     }

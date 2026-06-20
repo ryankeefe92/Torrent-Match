@@ -83,7 +83,7 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
             referer: sameSiteHomeURL(for: detailURL),
             timeoutSeconds: 35
         )
-        let metadataText = extractDetailMetadata(from: html) ?? fallbackDetailMetadata(from: html)
+        let metadataText = combinedDetailMetadata(from: html)
         let magnet = result.magnet?.isEmpty == false
             ? result.magnet
             : config.magnetPattern.flatMap { RegexTools.firstCapture(pattern: $0, in: html) }?.htmlDecoded
@@ -389,11 +389,39 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
         return raw
     }
 
+    private func combinedDetailMetadata(from html: String) -> String? {
+        let primary = extractDetailMetadata(from: html) ?? fallbackDetailMetadata(from: html)
+        let fileList = extractFileListMetadata(from: html)
+        return [primary, fileList]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty }
+            .uniquedPreservingOrder()
+            .joined(separator: "\n\n")
+            .nilIfEmpty
+    }
+
+    private func extractFileListMetadata(from html: String) -> String? {
+        let candidates = [
+            #"<(?:div|section|table|ul|ol)[^>]+(?:id|class)=[\"'][^\"']*(?:file[\s_-]?list|files?|torrent[\s_-]?files?)[^\"']*[\"'][^>]*>([\s\S]*?)</(?:div|section|table|ul|ol)>"#,
+            #"(?i)((?:file\s*list|files?\s*(?:in|inside)?\s*torrent)[\s\S]{0,3000})"#
+        ]
+
+        let blocks = candidates.flatMap { RegexTools.captureMatches(pattern: $0, in: html) }
+        let filenames = blocks
+            .flatMap(Self.releaseFilenames)
+            .uniquedPreservingOrder()
+
+        guard !filenames.isEmpty else { return nil }
+        return (["File list"] + filenames).joined(separator: "\n")
+    }
+
     private func fallbackDetailMetadata(from html: String) -> String? {
         let candidates = [
             #"<a\s+name=[\"']description[\"'][^>]*>[\s\S]*?(?:<legend[^>]*>[\s\S]*?</legend>)?([\s\S]*?)(?=<a\s+name=[\"']usercomments[\"']|<div[^>]+id=[\"']usercomments[\"']|$)"#,
             #"<pre[^>]*>([\s\S]*?)</pre>"#,
             #"<textarea[^>]*>([\s\S]*?)</textarea>"#,
+            #"<div[^>]+(?:id|class)=[\"'][^\"']*(?:file[\s_-]?list|files?)[^\"']*[\"'][^>]*>([\s\S]*?)</div>"#,
+            #"<section[^>]+(?:id|class)=[\"'][^\"']*(?:file[\s_-]?list|files?)[^\"']*[\"'][^>]*>([\s\S]*?)</section>"#,
+            #"<table[^>]+(?:id|class)=[\"'][^\"']*(?:file[\s_-]?list|files?)[^\"']*[\"'][^>]*>([\s\S]*?)</table>"#,
             #"<div[^>]+(?:id|class)=[\"'][^\"']*(?:media[\s_-]?info|nfo|description|technical|file[\s_-]?info|torrent[\s_-]?info)[^\"']*[\"'][^>]*>([\s\S]*?)</div>"#,
             #"<section[^>]+(?:id|class)=[\"'][^\"']*(?:media[\s_-]?info|nfo|description|technical|file[\s_-]?info|torrent[\s_-]?info)[^\"']*[\"'][^>]*>([\s\S]*?)</section>"#
         ]
@@ -435,7 +463,9 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
         return [
             "mediainfo", "media info", "general", "video", "audio", "duration",
             "bit rate", "bitrate", "codec", "format", "resolution", "width",
-            "height", "frame rate", "channel", "hdr", "dolby", "dts", "truehd"
+            "height", "frame rate", "channel", "hdr", "dolby", "dts", "truehd",
+            ".mkv", ".mp4", ".m2ts", ".avi", "1080p", "2160p", "720p", "bluray",
+            "web-dl", "webdl", "webrip", "remux"
         ].contains { normalized.contains($0) }
     }
 
@@ -455,11 +485,32 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
         let signals = [
             "mediainfo", "media info", "general", "video", "audio", "duration",
             "bit rate", "bitrate", "codec", "format", "resolution", "width",
-            "height", "frame rate", "channel", "hdr", "dolby", "dts", "truehd"
+            "height", "frame rate", "channel", "hdr", "dolby", "dts", "truehd",
+            ".mkv", ".mp4", ".m2ts", ".avi", "1080p", "2160p", "720p", "bluray",
+            "web-dl", "webdl", "webrip", "remux"
         ]
         return signals.reduce(0) { score, signal in
             score + (normalized.contains(signal) ? 1 : 0)
         } + min(text.count / 500, 10)
+    }
+
+    private static func releaseFilenames(from raw: String) -> [String] {
+        raw.htmlDecoded.readableMetadataText
+            .components(separatedBy: .newlines)
+            .flatMap { line in
+                RegexTools.captureMatches(
+                    pattern: #"(?i)([A-Za-z0-9][A-Za-z0-9 ._\-\[\]\(\)'&,:]{8,240}\.(?:mkv|mp4|m4v|avi|mov|ts|m2ts))"#,
+                    in: line
+                )
+            }
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: " \t\r\n-:|")) }
+            .filter { filename in
+                let lower = filename.lowercased()
+                return !lower.contains("sample") &&
+                    !lower.contains("trailer") &&
+                    !lower.contains("proof") &&
+                    !lower.contains("screenshot")
+            }
     }
 
     private func sameSiteHomeURL(for url: URL) -> URL? {
@@ -518,5 +569,12 @@ private extension Array where Element: Hashable {
     func uniquedPreservingOrder() -> [Element] {
         var seen = Set<Element>()
         return filter { seen.insert($0).inserted }
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 }

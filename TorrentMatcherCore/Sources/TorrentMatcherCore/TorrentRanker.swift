@@ -27,7 +27,7 @@ public struct RankerWeights: Codable, Hashable, Sendable {
 }
 
 public enum TorrentRanker {
-    private static let maxRawScore = 855.0
+    private static let maxRawScore = 955.0
     private static let seedTieThreshold = 5
 
     public static func qualityBreakdown(for result: TorrentSearchResult) -> QualityScoreBreakdown {
@@ -61,6 +61,27 @@ public enum TorrentRanker {
                 parsed: parsed,
                 score: Int.min / 2,
                 notes: ["Excluded: AV1 is disabled for Apple TV compatibility"],
+                excluded: true
+            )
+        }
+
+        if upperTitle.range(of: #"(^|[^A-Z0-9])RIFF[\s._-]*TRAX([^A-Z0-9]|$)"#, options: .regularExpression) != nil ||
+            upperTitle.range(of: #"(^|[^A-Z0-9])RIFFTRAX([^A-Z0-9]|$)"#, options: .regularExpression) != nil {
+            return RankedTorrentResult(
+                raw: result,
+                parsed: parsed,
+                score: Int.min / 2,
+                notes: ["Excluded: RiffTrax release"],
+                excluded: true
+            )
+        }
+
+        if result.detailSpecs?.hasOnlyExplicitNonEnglishAudioTracks == true {
+            return RankedTorrentResult(
+                raw: result,
+                parsed: parsed,
+                score: Int.min / 2,
+                notes: ["Excluded: audio tracks are explicitly non-English only"],
                 excluded: true
             )
         }
@@ -122,8 +143,6 @@ public enum TorrentRanker {
         }
 
         add("Encode/remux signal", Double(encodeRemuxScore(parsed: parsed, specs: result.detailSpecs)), detail: encodeRemuxDetail(parsed: parsed, specs: result.detailSpecs))
-        let headroomScore = video.bitrateIsEstimated ? 0 : videoHeadroomScore(parsed: parsed, specs: result.detailSpecs, bitrateKbps: video.bitrateKbps)
-        add("Video bitrate headroom", Double(headroomScore), detail: video.bitrateIsEstimated ? "source estimate has no headroom credit" : "\(video.bitrateKbps) kb/s")
 
         let audioExperience = channelPotential(parsed.channels) * audio.compressionHealth
         add("Audio channel experience", audioExperience, detail: "\(parsed.channels.rawValue), health \(formatMultiplier(audio.compressionHealth))")
@@ -255,7 +274,7 @@ private extension TorrentRanker {
             let label = derived.usedEstimatedAudio ? "derived from size/runtime + estimated audio" : "derived from size/runtime"
             return VideoBitrateSource(kbps: derived.kbps, estimated: false, label: label)
         }
-        let estimated = estimatedVideoBitrateKbps(parsed: parsed)
+        let estimated = estimatedVideoBitrateKbps(result: result, parsed: parsed)
         return VideoBitrateSource(kbps: estimated, estimated: true, label: "estimated")
     }
 
@@ -266,33 +285,40 @@ private extension TorrentRanker {
         return (overall - audio.kbps, audio.estimated)
     }
 
-    static func estimatedVideoBitrateKbps(parsed: ParsedRelease) -> Int {
+    static func estimatedVideoBitrateKbps(result: TorrentSearchResult, parsed: ParsedRelease) -> Int {
+        let sourceEstimate: Int
         switch (parsed.resolution, parsed.sourceType) {
-        case (.p2160, .remux): return 55_000
-        case (.p2160, .bluray): return 22_000
-        case (.p2160, .webdl): return 16_000
-        case (.p2160, .webrip): return 10_000
-        case (.p1080, .remux), (.likely1080, .remux): return 28_000
-        case (.p1080, .bluray), (.likely1080, .bluray): return 10_000
-        case (.p1080, .webdl), (.likely1080, .webdl): return 7_000
-        case (.p1080, .webrip), (.likely1080, .webrip): return 5_000
-        case (.p720, .bluray), (.p720, .webdl), (.p720, .webrip): return 4_000
-        case (_, .dvd): return 5_000
-        case (_, .hdtv): return 4_000
-        case (_, .cam): return 2_000
-        case (.p2160, _): return 12_000
-        case (.p1080, _), (.likely1080, _): return 6_000
-        case (.p720, _): return 4_000
-        case (.sd, _): return 2_000
-        case (.unknown, _): return 5_000
+        case (.p2160, .remux): sourceEstimate = 55_000
+        case (.p2160, .bluray): sourceEstimate = 22_000
+        case (.p2160, .webdl): sourceEstimate = 16_000
+        case (.p2160, .webrip): sourceEstimate = 10_000
+        case (.p1080, .remux), (.likely1080, .remux): sourceEstimate = 28_000
+        case (.p1080, .bluray), (.likely1080, .bluray): sourceEstimate = 10_000
+        case (.p1080, .webdl), (.likely1080, .webdl): sourceEstimate = 7_000
+        case (.p1080, .webrip), (.likely1080, .webrip): sourceEstimate = 5_000
+        case (.p720, .bluray), (.p720, .webdl), (.p720, .webrip): sourceEstimate = 4_000
+        case (_, .dvd): sourceEstimate = 5_000
+        case (_, .hdtv): sourceEstimate = 4_000
+        case (_, .cam): sourceEstimate = 2_000
+        case (.p2160, _): sourceEstimate = 12_000
+        case (.p1080, _), (.likely1080, _): sourceEstimate = 6_000
+        case (.p720, _): sourceEstimate = 4_000
+        case (.sd, _): sourceEstimate = 2_000
+        case (.unknown, _): sourceEstimate = 5_000
         }
+        guard let overall = overallBitrateKbps(result: result) else {
+            return sourceEstimate
+        }
+        let share = result.title.containsStandaloneMultiToken ? 0.80 : 0.90
+        return min(sourceEstimate, max(1, Int(Double(overall) * share)))
     }
 
     static func videoDimensions(parsed: ParsedRelease, specs: TorrentDetailSpecs?) -> VideoDimensions {
         if let width = integer(from: specs?.resolutionWidth),
            let height = integer(from: specs?.resolutionHeight),
            width > 0,
-           height > 0 {
+           height > 0,
+           plausibleResolution(width: width, height: height) {
             return VideoDimensions(width: width, height: height, exact: true)
         }
         switch parsed.resolution {
@@ -306,15 +332,15 @@ private extension TorrentRanker {
 
     static func resolutionPotential(parsed: ParsedRelease, specs: TorrentDetailSpecs?, width: Int, height: Int) -> Double {
         let hasExactDimensions = specs?.resolutionWidth != nil && specs?.resolutionHeight != nil
-        if width >= 3_000 || height >= 1_600 { return 500 }
-        if width >= 1_600 || height >= 900 { return 380 }
-        if width >= 1_200 || height >= 650 { return 250 }
-        if hasExactDimensions { return 130 }
-        if parsed.resolution == .p2160 { return 500 }
-        if parsed.resolution == .p1080 || parsed.resolution == .likely1080 { return 380 }
-        if parsed.resolution == .p720 { return 250 }
+        if width >= 3_000 || height >= 1_600 { return 560 }
+        if width >= 1_600 || height >= 900 { return 430 }
+        if width >= 1_200 || height >= 650 { return 280 }
+        if hasExactDimensions { return 150 }
+        if parsed.resolution == .p2160 { return 560 }
+        if parsed.resolution == .p1080 || parsed.resolution == .likely1080 { return 430 }
+        if parsed.resolution == .p720 { return 280 }
         if parsed.resolution == .unknown { return 200 }
-        return 130
+        return 150
     }
 
     static func videoCodecFactor(_ codec: VideoCodec) -> Double {
@@ -332,12 +358,12 @@ private extension TorrentRanker {
             adjustedBPPPF,
             points: [
                 (0.025, 0.35),
-                (0.050, 0.50),
-                (0.080, 0.65),
-                (0.120, 0.80),
-                (0.180, 0.90),
-                (0.300, 0.97),
-                (0.450, 1.00)
+                (0.075, 0.58),
+                (0.150, 0.80),
+                (0.280, 0.90),
+                (0.500, 0.96),
+                (0.750, 0.98),
+                (1.000, 1.00)
             ]
         )
     }
@@ -378,6 +404,7 @@ private extension TorrentRanker {
             .compactMap { $0 }
             .joined(separator: " ")
             .uppercased()
+        if text.range(of: #"(^|[^0-9])8[\s-]?BIT(S)?([^0-9]|$)"#, options: .regularExpression) != nil { return 0 }
         if text.range(of: #"(^|[^0-9])12[\s-]?BIT(S)?([^0-9]|$)"#, options: .regularExpression) != nil { return 20 }
         if text.range(of: #"(^|[^0-9])10[\s-]?BIT(S)?([^0-9]|$)"#, options: .regularExpression) != nil { return 15 }
         let parsed = ReleaseParser.parse(result.title)
@@ -418,31 +445,6 @@ private extension TorrentRanker {
             .compactMap { $0 }
             .joined(separator: ", ")
             .nonEmptyString
-    }
-
-    static func videoHeadroomScore(parsed: ParsedRelease, specs: TorrentDetailSpecs?, bitrateKbps: Int) -> Int {
-        let healthy: Int
-        let veryHigh: Int
-        switch resolutionForScoring(parsed: parsed, specs: specs) {
-        case .p2160:
-            healthy = 22_000
-            veryHigh = 50_000
-        case .p1080, .likely1080:
-            healthy = 10_000
-            veryHigh = 25_000
-        case .p720:
-            healthy = 4_000
-            veryHigh = 8_000
-        case .sd:
-            healthy = 5_000
-            veryHigh = 8_000
-        case .unknown:
-            healthy = 6_000
-            veryHigh = 14_000
-        }
-        if bitrateKbps >= veryHigh { return 15 }
-        if bitrateKbps >= healthy { return 8 }
-        return 0
     }
 
     static func audioBitrateKbps(result: TorrentSearchResult, parsed: ParsedRelease, videoBitrate: VideoBitrateSource) -> AudioBitrateSource {
@@ -486,14 +488,25 @@ private extension TorrentRanker {
         case (.pcm, .twoZero): return 1_536
         case (.pcm, _): return 2_304
         case (.dtsHDHRA, .sevenOne): return 3_000
-        case (.dtsHDHRA, _): return 2_000
+        case (.dtsHDHRA, .fiveOne): return 2_000
+        case (.dtsHDHRA, .twoZero): return 1_000
+        case (.dtsHDHRA, .mono): return 512
+        case (.dtsHDHRA, _): return 1_500
         case (.ddp, .sevenOne): return parsed.atmos ? 1_536 : 1_024
         case (.ddp, .fiveOne): return parsed.atmos ? 768 : 640
-        case (.dts, _): return 1_509
+        case (.ddp, .twoZero): return 256
+        case (.ddp, .mono): return 128
+        case (.dts, .sevenOne): return 2_012
+        case (.dts, .fiveOne): return 1_509
+        case (.dts, .twoZero): return 768
+        case (.dts, .mono): return 384
         case (.dd, .sevenOne): return 768
         case (.dd, .fiveOne): return 640
+        case (.dd, .twoZero): return 384
+        case (.dd, .mono): return 192
         case (.aac, .fiveOne), (.aac, .sevenOne): return 384
         case (.aac, .twoZero): return 192
+        case (.aac, .mono): return 96
         case (_, .twoZero): return 192
         case (_, .mono): return 96
         case (.unknown, .sevenOne): return 768
@@ -503,21 +516,18 @@ private extension TorrentRanker {
     }
 
     static func audioCompressionHealth(codec: AudioCodec, bitrateKbps: Int?, channels: ChannelLayout) -> Double {
-        if codec == .truehd || codec == .dtsHDMA || codec == .pcm {
-            return 0.98
-        }
         guard let bitrateKbps else { return 0.65 }
         let density = Double(bitrateKbps) * audioCodecDensityFactor(codec) / effectiveChannelCount(channels)
         return piecewiseMultiplier(
             density,
             points: [
-                (48, 0.35),
-                (64, 0.50),
-                (96, 0.65),
-                (128, 0.80),
-                (180, 0.90),
-                (250, 0.97),
-                (320, 1.00)
+                (32, 0.82),
+                (64, 0.87),
+                (96, 0.90),
+                (160, 0.94),
+                (240, 0.97),
+                (360, 0.99),
+                (500, 1.00)
             ]
         )
     }
@@ -525,20 +535,20 @@ private extension TorrentRanker {
     static func audioCodecDensityFactor(_ codec: AudioCodec) -> Double {
         switch codec {
         case .dd: return 1.00
-        case .aac: return 1.05
-        case .dts: return 1.10
+        case .aac: return 1.10
+        case .dts: return 1.00
         case .ddp: return 1.35
-        case .dtsHDHRA: return 1.45
+        case .dtsHDHRA: return 1.10
         case .truehd, .dtsHDMA, .pcm, .unknown: return 1.0
         }
     }
 
     static func channelPotential(_ channels: ChannelLayout) -> Double {
         switch channels {
-        case .sevenOne: return 150
-        case .fiveOne: return 115
-        case .twoZero, .unknown: return 30
-        case .mono: return 10
+        case .sevenOne: return 205
+        case .fiveOne: return 160
+        case .twoZero, .unknown: return 40
+        case .mono: return 12
         }
     }
 
@@ -597,7 +607,8 @@ private extension TorrentRanker {
         guard let width = integer(from: specs?.resolutionWidth),
               let height = integer(from: specs?.resolutionHeight),
               width > 0,
-              height > 0 else {
+              height > 0,
+              plausibleResolution(width: width, height: height) else {
             return parsed.resolution
         }
         if width >= 3_000 || height >= 1_600 { return .p2160 }
@@ -632,6 +643,11 @@ private extension TorrentRanker {
     }
 
     static func isUHDSourceSignal(parsed: ParsedRelease, text: String?) -> Bool {
+        let upper = text?.uppercased() ?? ""
+        let hasDiscSource = parsed.sourceType == .bluray ||
+            parsed.sourceType == .remux ||
+            upper.range(of: #"(^|[^A-Z0-9])(UHD[\s\.-]?BLU[\s\.-]?RAY|BLU[\s\.-]?RAY|BDREMUX|BDRIP|BRRIP)([^A-Z0-9]|$)"#, options: .regularExpression) != nil
+        guard hasDiscSource else { return false }
         if parsed.resolution == .p2160 { return true }
         switch parsed.dynamicRange {
         case .dolbyVision, .hdr10plus, .hdr10, .hdr, .likelyHDR:
@@ -639,12 +655,18 @@ private extension TorrentRanker {
         case .unknown, .sdr:
             break
         }
-        let upper = text?.uppercased() ?? ""
         return upper.range(of: #"(^|[^0-9])(?:10|12)[\s-]?BIT(S)?([^0-9]|$)"#, options: .regularExpression) != nil ||
             upper.contains("DOLBY VISION") ||
             upper.contains("DOVI") ||
             upper.contains("HDR10") ||
             upper.range(of: #"(^|[^A-Z0-9])HDR([^A-Z0-9]|$)"#, options: .regularExpression) != nil
+    }
+
+    static func plausibleResolution(width: Int, height: Int) -> Bool {
+        guard (240...8_192).contains(width),
+              (240...8_192).contains(height) else { return false }
+        let ratio = Double(max(width, height)) / Double(min(width, height))
+        return ratio <= 3.0
     }
 
     static func overallBitrateKbps(result: TorrentSearchResult) -> Int? {
@@ -789,6 +811,10 @@ private extension String {
         let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
+
+    var containsStandaloneMultiToken: Bool {
+        range(of: #"(^|[^A-Za-z0-9])multi([^A-Za-z0-9]|$)"#, options: [.regularExpression, .caseInsensitive]) != nil
+    }
 }
 
 private extension TorrentSearchResult {
@@ -805,14 +831,17 @@ private extension TorrentSearchResult {
 private extension ParsedRelease {
     func mergedWithDetail(parsed detail: ParsedRelease?, specs: TorrentDetailSpecs?) -> ParsedRelease {
         guard let detail else { return self }
+        let hasDetailReleaseName = specs?.fullTorrentName?.isEmpty == false
+        let hasDynamicRangeSignal = specs?.hasDynamicRangeDetails == true || hasDetailReleaseName
+        let hasAudioSignal = specs?.hasBestEnglishAudioDetails == true || hasDetailReleaseName
         return ParsedRelease(
             sourceType: detail.sourceType != .unknown ? detail.sourceType : sourceType,
             resolution: detail.resolution != .unknown ? detail.resolution : resolution,
-            dynamicRange: detail.dynamicRange != .unknown && specs?.hasDynamicRangeDetails == true ? detail.dynamicRange : dynamicRange,
+            dynamicRange: detail.dynamicRange != .unknown && hasDynamicRangeSignal ? detail.dynamicRange : dynamicRange,
             videoCodec: detail.videoCodec != .unknown ? detail.videoCodec : videoCodec,
-            audioCodec: detail.audioCodec != .unknown && specs?.hasBestEnglishAudioDetails == true ? detail.audioCodec : audioCodec,
-            channels: detail.channels != .unknown && specs?.hasBestEnglishAudioDetails == true ? detail.channels : channels,
-            atmos: specs?.hasBestEnglishAudioDetails == true ? detail.atmos : atmos,
+            audioCodec: detail.audioCodec != .unknown && hasAudioSignal ? detail.audioCodec : audioCodec,
+            channels: detail.channels != .unknown && hasAudioSignal ? detail.channels : channels,
+            atmos: hasAudioSignal ? detail.atmos : atmos,
             imax: detail.imax || imax
         )
     }

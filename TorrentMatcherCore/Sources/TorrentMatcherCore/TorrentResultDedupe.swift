@@ -95,13 +95,74 @@ public enum TorrentResultDedupe {
             id: winner.id,
             title: winner.title,
             detailMetadata: winner.detailMetadata ?? other.detailMetadata,
-            detailSpecs: winner.detailSpecs?.mergedMissingFields(from: other.detailSpecs) ?? other.detailSpecs,
+            detailSpecs: winner.detailSpecs?.mergedMissingFields(from: other.detailSpecs, markingExternalFields: true) ?? other.detailSpecs?.markingAllFieldsAsExternalMetadata(),
             magnet: winner.magnet ?? other.magnet,
             detailURL: winner.detailURL ?? other.detailURL,
             seeders: winner.seeders,
             leechers: winner.leechers,
             provider: winner.provider,
             size: winner.size ?? other.size
+        )
+    }
+}
+
+private extension TorrentDetailSpecs {
+    func markingAllFieldsAsExternalMetadata() -> TorrentDetailSpecs {
+        var fields = externalMetadataFields
+        func mark(_ field: String, _ value: String?) {
+            if value?.isEmpty == false {
+                fields.insert(field)
+            }
+        }
+
+        mark("fullTorrentName", fullTorrentName)
+        mark("videoBitrate", videoBitrate)
+        mark("resolutionWidth", resolutionWidth)
+        mark("resolutionHeight", resolutionHeight)
+        mark("frameRate", frameRate)
+        mark("bitDepth", bitDepth)
+        mark("crf", crf)
+        mark("preset", preset)
+        mark("encodingPasses", encodingPasses)
+        mark("colorGamut", colorGamut)
+        mark("dolbyVisionProfile", dolbyVisionProfile)
+        mark("aspectRatio", aspectRatio)
+        mark("bestEnglishAudioBitrate", bestEnglishAudioBitrate)
+        mark("bestEnglishAudioSampleRate", bestEnglishAudioSampleRate)
+        if !allAudioTrackBitrates.isEmpty {
+            fields.insert("allAudioTrackBitrates")
+        }
+        mark("totalAudioTrackBitrate", totalAudioTrackBitrate)
+        mark("calculatedVideoBitrate", calculatedVideoBitrate)
+        mark("overallBitrate", overallBitrate)
+        mark("runtime", runtime)
+        mark("releaseHintText", releaseHintText)
+
+        return TorrentDetailSpecs(
+            fullTorrentName: fullTorrentName,
+            videoBitrate: videoBitrate,
+            resolutionWidth: resolutionWidth,
+            resolutionHeight: resolutionHeight,
+            frameRate: frameRate,
+            bitDepth: bitDepth,
+            crf: crf,
+            preset: preset,
+            encodingPasses: encodingPasses,
+            colorGamut: colorGamut,
+            dolbyVisionProfile: dolbyVisionProfile,
+            aspectRatio: aspectRatio,
+            bestEnglishAudioBitrate: bestEnglishAudioBitrate,
+            bestEnglishAudioSampleRate: bestEnglishAudioSampleRate,
+            allAudioTrackBitrates: allAudioTrackBitrates,
+            totalAudioTrackBitrate: totalAudioTrackBitrate,
+            calculatedVideoBitrate: calculatedVideoBitrate,
+            overallBitrate: overallBitrate,
+            runtime: runtime,
+            calculatedFields: calculatedFields,
+            externalMetadataFields: fields,
+            releaseHintText: releaseHintText,
+            hasBestEnglishAudioDetails: hasBestEnglishAudioDetails,
+            hasDynamicRangeDetails: hasDynamicRangeDetails
         )
     }
 }

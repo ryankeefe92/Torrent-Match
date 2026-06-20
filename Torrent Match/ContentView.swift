@@ -7,12 +7,13 @@
 
 import SwiftUI
 import SwiftData
+import Foundation
 import TorrentMatcherCore
 
 struct ContentView: View {
     private let searchService = TorrentSearchService(configs: BuiltInProviderConfigs.default)
     private let maxConcurrentMagnetPrefetches = 8
-    private let maxConcurrentDetailPrefetches = 4
+    private let maxConcurrentDetailPrefetches = 16
 
     // MARK: - Search / Results State
     @AppStorage("transmission.rpcURL") private var transmissionRPCURL: String = ""
@@ -236,13 +237,13 @@ struct ContentView: View {
             let report = await searchService.searchAndRankReport(searchQuery) { update in
                 Task { @MainActor in
                     foundSoFar = update.foundSoFar
-                    results = dedupedResults(update.results.map(SearchResult.init))
+                    results = mergedSearchResultsPreservingResolvedData(update.results.map(SearchResult.init))
                     reconcileSelectedResult()
                     prefetchDetailMetadataIfNeeded(from: results)
                     prefetchMagnetsIfNeeded(from: results)
                 }
             }
-            results = dedupedResults(report.results.map(SearchResult.init))
+            results = mergedSearchResultsPreservingResolvedData(report.results.map(SearchResult.init))
             foundSoFar = results.count
             if results.isEmpty, !report.failures.isEmpty {
                 let details = report.failures
@@ -478,7 +479,7 @@ struct ContentView: View {
             }
             await MainActor.run {
                 detailMetadataStatuses[searchResult.id] = metadata.specs?.hasDisplayableFields == true ? .fetched : .checkedNoMetadata
-                applyResolvedDetailMetadata(metadata, to: searchResult.id)
+                applyResolvedDetailMetadata(metadata, to: searchResult)
             }
         } catch {
             let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
@@ -503,8 +504,44 @@ struct ContentView: View {
         }
     }
 
-    private func applyResolvedDetailMetadata(_ metadata: TorrentDetailMetadata, to resultID: UUID) {
-        guard let index = results.firstIndex(where: { $0.id == resultID }) else { return }
+    private func mergedSearchResultsPreservingResolvedData(_ incomingResults: [SearchResult]) -> [SearchResult] {
+        let enriched = incomingResults.map { incoming in
+            guard let existing = existingResolvedResult(for: incoming) else { return incoming }
+            return incoming.withResolvedData(from: existing)
+        }
+        return dedupedResults(enriched)
+    }
+
+    private func existingResolvedResult(for incoming: SearchResult) -> SearchResult? {
+        if let match = results.first(where: { $0.id == incoming.id }) {
+            return match
+        }
+
+        if incoming.detailURL != nil {
+            let incomingKey = detailPrefetchDedupKey(for: incoming)
+            if let match = results.first(where: { detailPrefetchDedupKey(for: $0) == incomingKey }) {
+                return match
+            }
+        }
+
+        if let incomingHash = incoming.magnet?.infoHashFromMagnet?.lowercased(),
+           let match = results.first(where: { $0.magnet?.infoHashFromMagnet?.lowercased() == incomingHash }) {
+            return match
+        }
+
+        let incomingTitleKey = incoming.title.normalizedDedupeKey
+        guard !incomingTitleKey.isEmpty else { return nil }
+        return results.first {
+            $0.provider == incoming.provider &&
+                $0.title.normalizedDedupeKey == incomingTitleKey
+        }
+    }
+
+    private func applyResolvedDetailMetadata(_ metadata: TorrentDetailMetadata, to searchResult: SearchResult) {
+        let fallbackKey = detailPrefetchDedupKey(for: searchResult)
+        guard let index = results.firstIndex(where: { $0.id == searchResult.id }) ??
+            results.firstIndex(where: { detailPrefetchDedupKey(for: $0) == fallbackKey }) else { return }
+        let resultID = results[index].id
         let updated = results[index].withDetailMetadata(metadata)
         results[index] = updated
         results = dedupedResults(results)
@@ -852,7 +889,8 @@ struct ContentView: View {
     }
 
     private func dedupedResults(_ results: [SearchResult]) -> [SearchResult] {
-        let byHash = dedupeByInfoHash(results)
+        let visibleResults = results.filter { !$0.excluded }
+        let byHash = dedupeByInfoHash(visibleResults)
         return dedupeByNormalizedTitle(byHash)
     }
 
@@ -1071,6 +1109,7 @@ struct SearchResult: Identifiable, Hashable {
     let scoreNotes: [String]
     let detailMetadata: String?
     let detailSpecs: TorrentDetailSpecs?
+    let excluded: Bool
 
     init(ranked: RankedTorrentResult) {
         id = ranked.id
@@ -1092,6 +1131,7 @@ struct SearchResult: Identifiable, Hashable {
         scoreNotes = ranked.notes
         detailMetadata = ranked.raw.detailMetadata
         detailSpecs = ranked.raw.detailSpecs
+        excluded = ranked.excluded
     }
 
     func withMagnet(_ magnet: String) -> SearchResult {
@@ -1125,7 +1165,8 @@ struct SearchResult: Identifiable, Hashable {
             score: score,
             scoreNotes: scoreNotes,
             detailMetadata: detailMetadata,
-            detailSpecs: detailSpecs
+            detailSpecs: detailSpecs,
+            excluded: excluded
         )
     }
 
@@ -1142,6 +1183,23 @@ struct SearchResult: Identifiable, Hashable {
             leechers: raw.leechers,
             provider: raw.provider,
             size: raw.size
+        )
+        return SearchResult(ranked: TorrentRanker.score(updatedRaw))
+    }
+
+    func withResolvedData(from existing: SearchResult) -> SearchResult {
+        let mergedSpecs = existing.raw.detailSpecs?.mergedMissingFields(from: raw.detailSpecs) ?? raw.detailSpecs
+        let updatedRaw = TorrentSearchResult(
+            id: raw.id,
+            title: raw.title,
+            detailMetadata: existing.raw.detailMetadata ?? raw.detailMetadata,
+            detailSpecs: mergedSpecs,
+            magnet: existing.raw.magnet ?? raw.magnet,
+            detailURL: raw.detailURL ?? existing.raw.detailURL,
+            seeders: raw.seeders,
+            leechers: raw.leechers,
+            provider: raw.provider,
+            size: raw.size ?? existing.raw.size
         )
         return SearchResult(ranked: TorrentRanker.score(updatedRaw))
     }
@@ -1165,7 +1223,8 @@ struct SearchResult: Identifiable, Hashable {
         score: Int,
         scoreNotes: [String],
         detailMetadata: String?,
-        detailSpecs: TorrentDetailSpecs?
+        detailSpecs: TorrentDetailSpecs?,
+        excluded: Bool
     ) {
         self.id = id
         self.raw = raw
@@ -1186,6 +1245,7 @@ struct SearchResult: Identifiable, Hashable {
         self.scoreNotes = scoreNotes
         self.detailMetadata = detailMetadata
         self.detailSpecs = detailSpecs
+        self.excluded = excluded
     }
 }
 
@@ -1345,11 +1405,9 @@ private struct SearchBar: View {
             }
 
             if !suggestions.isEmpty {
-                VStack(spacing: 0) {
-                    ForEach(suggestions) { suggestion in
-                        Button {
-                            onSuggestionSelected(suggestion)
-                        } label: {
+                ScrollView {
+                    VStack(spacing: 0) {
+                        ForEach(suggestions) { suggestion in
                             HStack {
                                 Text(suggestion.displayTitle)
                                     .lineLimit(1)
@@ -1358,21 +1416,26 @@ private struct SearchBar: View {
                             .padding(.horizontal, 10)
                             .padding(.vertical, 8)
                             .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
+                            .onTapGesture {
+                                onSuggestionSelected(suggestion)
+                            }
 
-                        if suggestion.id != suggestions.last?.id {
-                            Divider()
+                            if suggestion.id != suggestions.last?.id {
+                                Divider()
+                            }
                         }
                     }
                 }
+                .frame(maxHeight: 320)
                 .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
                 .overlay(
                     RoundedRectangle(cornerRadius: 10, style: .continuous)
                         .strokeBorder(.quaternary, lineWidth: 1)
                 )
+                .zIndex(20)
             }
         }
+        .zIndex(20)
     }
 }
 
@@ -1512,7 +1575,7 @@ private struct ResultDetailView: View {
                     DetailSection(title: "Score") {
                         VStack(alignment: .leading, spacing: 6) {
                             ForEach(result.scoreNotes, id: \.self) { note in
-                                Text(note)
+                                Text(displayBitratesAsKbps(note))
                                     .font(.callout)
                                     .foregroundStyle(.secondary)
                                     .fixedSize(horizontal: false, vertical: true)
@@ -1582,7 +1645,7 @@ private struct QualityEquationView: View {
                     .font(.callout.weight(.semibold))
                 FractionEquation(
                     value: formatDecimal(breakdown.video.adjustedBPPPF, places: 6),
-                    numerator: "\(formatInteger(breakdown.video.bitrateKbps)) kb/s (bitrate) x 1000 x \(formatDecimal(breakdown.video.codecFactor, places: 2)) (codec)",
+                    numerator: "\(formatInteger(breakdown.video.bitrateKbps)) kbps (bitrate) x 1000 x \(formatDecimal(breakdown.video.codecFactor, places: 2)) (codec)",
                     denominator: "\(breakdown.video.width) x \(breakdown.video.height) (pixels) x \(formatDecimal(breakdown.video.frameRate, places: 3)) (fps)"
                 )
                 Text("Bitrate source: \(breakdown.video.bitrateSourceLabel)")
@@ -1591,7 +1654,7 @@ private struct QualityEquationView: View {
                 Text("Curved compression health: \(formatDecimal(breakdown.video.adjustedBPPPF, places: 6)) BPPPF -> \(formatDecimal(breakdown.video.compressionHealth, places: 4))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text("Curve points: 0.025=0.35, 0.050=0.50, 0.080=0.65, 0.120=0.80, 0.180=0.90, 0.300=0.97, 0.450=1.00")
+                Text("Curve points: 0.025=0.35, 0.075=0.58, 0.150=0.80, 0.280=0.90, 0.500=0.96, 0.750=0.98, 1.000=1.00")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -1605,7 +1668,7 @@ private struct QualityEquationView: View {
                    let density = breakdown.audio.density {
                     FractionEquation(
                         value: formatDecimal(density, places: 3),
-                        numerator: "\(formatInteger(audioBitrate)) kb/s (bitrate) x \(formatDecimal(breakdown.audio.codecFactor, places: 2)) (codec)",
+                        numerator: "\(formatInteger(audioBitrate)) kbps (bitrate) x \(formatDecimal(breakdown.audio.codecFactor, places: 2)) (codec)",
                         denominator: "\(formatDecimal(breakdown.audio.effectiveChannelCount, places: 0)) (channels)"
                     )
                 } else {
@@ -1626,7 +1689,7 @@ private struct QualityEquationView: View {
                     Text("Curved compression health: \(formatDecimal(density, places: 3)) density -> \(formatDecimal(breakdown.audio.compressionHealth, places: 4))")
                         .font(.caption)
                         .foregroundStyle(.secondary)
-                    Text("Curve points: 48=0.35, 64=0.50, 96=0.65, 128=0.80, 180=0.90, 250=0.97, 320=1.00")
+                    Text("Curve points: 32=0.82, 64=0.87, 96=0.90, 160=0.94, 240=0.97, 360=0.99, 500=1.00")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } else {
@@ -1673,6 +1736,62 @@ private struct FractionEquation: View {
     }
 }
 
+private func displayBitratesAsKbps(_ text: String) -> String {
+    text
+        .split(separator: "\n", omittingEmptySubsequences: false)
+        .map { displayBitratesAsKbpsLine(String($0)) }
+        .joined(separator: "\n")
+}
+
+private func displayBitratesAsKbpsLine(_ line: String) -> String {
+    let bitratePattern = #"(?i)(?:VBR|CBR|ABR)?\s*(?<![0-9.])([0-9]+(?:[\s,][0-9]{3})*(?:\.[0-9]+)?)\s*([kmgt]i?b/s|[kmgt]bps|b/s)"#
+    guard let regex = try? NSRegularExpression(pattern: bitratePattern) else { return line }
+    let fullRange = NSRange(line.startIndex..<line.endIndex, in: line)
+    let matches = regex.matches(in: line, range: fullRange)
+    guard !matches.isEmpty else { return line }
+
+    if let parentheticalKbps = parentheticalKbpsValue(in: line),
+       let firstMatch = matches.first,
+       let firstRange = Range(firstMatch.range, in: line),
+       line[firstRange].localizedCaseInsensitiveContains("mb/s") || line[firstRange].localizedCaseInsensitiveContains("mbps") {
+        return String(line[..<firstRange.lowerBound]) + "\(formatKbps(parentheticalKbps)) kbps"
+    }
+
+    var output = line
+    for match in matches.reversed() {
+        guard let matchRange = Range(match.range, in: output),
+              let valueRange = Range(match.range(at: 1), in: output),
+              let unitRange = Range(match.range(at: 2), in: output),
+              let kbps = bitrateKbps(value: String(output[valueRange]), unit: String(output[unitRange])) else { continue }
+        output.replaceSubrange(matchRange, with: "\(formatKbps(kbps)) kbps")
+    }
+    return output
+}
+
+private func parentheticalKbpsValue(in text: String) -> Int? {
+    let pattern = #"(?i)\(([0-9]+(?:[\s,][0-9]{3})*(?:\.[0-9]+)?)\s*(?:k(?:i)?b/s|kbps)\)"#
+    guard let regex = try? NSRegularExpression(pattern: pattern),
+          let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..<text.endIndex, in: text)),
+          let valueRange = Range(match.range(at: 1), in: text) else { return nil }
+    return bitrateKbps(value: String(text[valueRange]), unit: "kb/s")
+}
+
+private func bitrateKbps(value rawValue: String, unit rawUnit: String) -> Int? {
+    guard let value = Double(rawValue.replacingOccurrences(of: " ", with: "").replacingOccurrences(of: ",", with: "")) else { return nil }
+    let unit = rawUnit.lowercased()
+    if unit.contains("gb/s") || unit.contains("gbps") { return Int(value * 1_000_000) }
+    if unit.contains("mb/s") || unit.contains("mbps") { return Int(value * 1_000) }
+    if unit == "b/s" { return Int(value / 1_000) }
+    return Int(value)
+}
+
+private func formatKbps(_ value: Int) -> String {
+    let formatter = NumberFormatter()
+    formatter.numberStyle = .decimal
+    formatter.groupingSeparator = ","
+    return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
+}
+
 private struct DetailSpecList: View {
     let specs: TorrentDetailSpecs
     let result: TorrentSearchResult
@@ -1680,14 +1799,14 @@ private struct DetailSpecList: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             ForEach(rows, id: \.label) { row in
-                DetailSpecRow(label: row.label, value: row.value, isCalculated: row.isCalculated)
+                DetailSpecRow(label: row.label, value: row.value, isCalculated: row.isCalculated, isExternalMetadata: row.isExternalMetadata)
             }
         }
         .textSelection(.enabled)
     }
 
-    private var rows: [(label: String, value: String, isCalculated: Bool)] {
-        var rows: [(String, String, Bool)] = []
+    private var rows: [(label: String, value: String, isCalculated: Bool, isExternalMetadata: Bool)] {
+        var rows: [(String, String, Bool, Bool)] = []
         append("Full torrent name", specs.fullTorrentName, field: "fullTorrentName", to: &rows)
         append("Video bitrate", specs.videoBitrate ?? derivedVideoBitrate, field: "videoBitrate", to: &rows, forceCalculated: specs.videoBitrate == nil && derivedVideoBitrate != nil)
         append("Resolution width", specs.resolutionWidth, field: "resolutionWidth", to: &rows)
@@ -1703,7 +1822,7 @@ private struct DetailSpecList: View {
         append("Best English audio bitrate", specs.bestEnglishAudioBitrate, field: "bestEnglishAudioBitrate", to: &rows)
         append("Best English audio sample rate", specs.bestEnglishAudioSampleRate, field: "bestEnglishAudioSampleRate", to: &rows)
         if !specs.allAudioTrackBitrates.isEmpty {
-            rows.append(("All audio track bitrates", specs.allAudioTrackBitrates.joined(separator: "\n"), specs.isCalculated("allAudioTrackBitrates")))
+            rows.append(("All audio track bitrates", displayBitratesAsKbps(specs.allAudioTrackBitrates.joined(separator: "\n")), specs.isCalculated("allAudioTrackBitrates"), specs.isExternalMetadata("allAudioTrackBitrates")))
         }
         append("Total audio bitrate", specs.totalAudioTrackBitrate, field: "totalAudioTrackBitrate", to: &rows)
         append("Overall bitrate", specs.overallBitrate, field: "overallBitrate", to: &rows)
@@ -1718,13 +1837,25 @@ private struct DetailSpecList: View {
         let breakdown = TorrentRanker.qualityBreakdown(for: result)
         guard !breakdown.video.bitrateIsEstimated else { return nil }
         guard breakdown.video.bitrateSourceLabel != "explicit" else { return nil }
-        return "\(breakdown.video.bitrateKbps) kb/s"
+        return "\(formatKbps(breakdown.video.bitrateKbps)) kbps"
     }
 
-    private func append(_ label: String, _ value: String?, field: String, to rows: inout [(String, String, Bool)], forceCalculated: Bool = false) {
+    private func append(_ label: String, _ value: String?, field: String, to rows: inout [(String, String, Bool, Bool)], forceCalculated: Bool = false) {
         guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
               !value.isEmpty else { return }
-        rows.append((label, value, forceCalculated || specs.isCalculated(field)))
+        let displayValue = bitrateFields.contains(field) ? displayBitratesAsKbps(value) : value
+        rows.append((label, displayValue, forceCalculated || specs.isCalculated(field), specs.isExternalMetadata(field)))
+    }
+
+    private var bitrateFields: Set<String> {
+        [
+            "videoBitrate",
+            "bestEnglishAudioBitrate",
+            "allAudioTrackBitrates",
+            "totalAudioTrackBitrate",
+            "overallBitrate",
+            "calculatedVideoBitrate"
+        ]
     }
 }
 
@@ -1732,20 +1863,27 @@ private struct DetailSpecRow: View {
     let label: String
     let value: String
     let isCalculated: Bool
+    let isExternalMetadata: Bool
 
     var body: some View {
         Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
             GridRow(alignment: .firstTextBaseline) {
                 Text(label)
                     .font(.callout.weight(.medium))
-                    .foregroundStyle(isCalculated ? .orange : .secondary)
+                    .foregroundStyle(foregroundStyle(isPrimary: false))
                     .frame(width: 190, alignment: .leading)
                 Text(value)
                     .font(.callout)
-                    .foregroundStyle(isCalculated ? .orange : .primary)
+                    .foregroundStyle(foregroundStyle(isPrimary: true))
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+
+    private func foregroundStyle(isPrimary: Bool) -> Color {
+        if isExternalMetadata { return .teal }
+        if isCalculated { return .orange }
+        return isPrimary ? .primary : .secondary
     }
 }
 
@@ -1827,6 +1965,8 @@ private struct ResultsListView: View {
         List(results) { result in
             ResultRow(result: result) {
                 selected = result
+            } onShowDetails: {
+                selected = result
                 presentedResult = result
             }
             .listRowBackground(selected?.id == result.id ? Color.accentColor.opacity(0.1) : Color.clear)
@@ -1850,6 +1990,7 @@ private struct ContentMarginsZero: ViewModifier {
 private struct ResultRow: View {
     let result: SearchResult
     var onSelect: () -> Void
+    var onShowDetails: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -1887,6 +2028,15 @@ private struct ResultRow: View {
                         }
                     }
                 }
+                Button(action: onShowDetails) {
+                    Image(systemName: "info.circle")
+                        .imageScale(.large)
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.borderless)
+#if os(macOS)
+                .help("Show Details")
+#endif
             }
         }
         .contentShape(Rectangle())

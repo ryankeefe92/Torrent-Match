@@ -161,15 +161,7 @@ public enum ReleaseParser {
         }
 
         let atmosTokenPresent = containsToken("ATMOS", in: upper) || upper.contains("DDPA")
-        let inferredDDPFromAtmosContext = atmosTokenPresent && audioCodec == .unknown && (channels == .fiveOne || channels == .sevenOne || channels == .unknown)
-        if inferredDDPFromAtmosContext {
-            audioCodec = .ddp
-        }
-        let inferredChannelsFromAtmosContext = atmosTokenPresent && channels == .unknown
-        if inferredChannelsFromAtmosContext {
-            channels = .fiveOne
-        }
-        let atmos = atmosTokenPresent && !inferredDDPFromAtmosContext && (audioCodec == .ddp || audioCodec == .truehd)
+        let atmos = atmosTokenPresent && (audioCodec == .ddp || audioCodec == .truehd)
         let imax = containsToken("IMAX", in: upper)
 
         return ParsedRelease(
@@ -208,23 +200,23 @@ public enum ReleaseParser {
     private static func detectChannels(in upper: String) -> ChannelLayout {
         let audioPrefix = #"(TRUEHD|TRUE-HD|LPCM|PCM|DDP|EAC3|E-AC-3|EAC-3|DD|AC3|AC-3|DTSHD|DTS-HDMA|DTS-HD(?:\.MA)?|DTS-MA|DTS HDMA|DTS HD MA|DTS MA|DTS|ATMOS)"#
 
-        if matches(#"(^|[^A-Z0-9])(7\.1|8CH|8 CH)([^A-Z0-9]|$)"#, in: upper) ||
-            matches(audioPrefix + #"[\.\s_-]?(7[\.\s]?1)([^A-Z0-9]|$)"#, in: upper) {
+        if matches(#"(^|[^A-Z0-9])(7\.1\s*CH|7\.1|8CH|8 CH)([^A-Z0-9]|$)"#, in: upper) ||
+            matches(audioPrefix + #"[\.\s_-]?(7[\.\s]?1)(?:\s*CH)?([^A-Z0-9]|$)"#, in: upper) {
             return .sevenOne
         }
 
-        if matches(#"(^|[^A-Z0-9])(5\.1|6CH|6 CH)([^A-Z0-9]|$)"#, in: upper) ||
-            matches(audioPrefix + #"[\.\s_-]?(5[\.\s]?1)([^A-Z0-9]|$)"#, in: upper) {
+        if matches(#"(^|[^A-Z0-9])(5\.1\s*CH|5\.1|6CH|6 CH)([^A-Z0-9]|$)"#, in: upper) ||
+            matches(audioPrefix + #"[\.\s_-]?(5[\.\s]?1)(?:\s*CH)?([^A-Z0-9]|$)"#, in: upper) {
             return .fiveOne
         }
 
-        if matches(#"(^|[^A-Z0-9])(2\.0|2CH|2 CH|STEREO)([^A-Z0-9]|$)"#, in: upper) ||
-            matches(audioPrefix + #"[\.\s_-]?(2[\.\s]?0)([^A-Z0-9]|$)"#, in: upper) {
+        if matches(#"(^|[^A-Z0-9])(2\.0\s*CH|2\.0|2CH|2 CH|STEREO)([^A-Z0-9]|$)"#, in: upper) ||
+            matches(audioPrefix + #"[\.\s_-]?(2[\.\s]?0)(?:\s*CH)?([^A-Z0-9]|$)"#, in: upper) {
             return .twoZero
         }
 
-        if matches(#"(^|[^A-Z0-9])(1\.0|1CH|1 CH|MONO)([^A-Z0-9]|$)"#, in: upper) ||
-            matches(audioPrefix + #"[\.\s_-]?(1\.0|1CH|1 CH)([^A-Z0-9]|$)"#, in: upper) {
+        if matches(#"(^|[^A-Z0-9.])(1\.0\s*CH|1\.0|1CH|1 CH|MONO)([^A-Z0-9]|$)"#, in: upper) ||
+            matches(audioPrefix + #"[\.\s_-]?(1\.0(?:\s*CH)?|1CH|1 CH)([^A-Z0-9]|$)"#, in: upper) {
             return .mono
         }
 

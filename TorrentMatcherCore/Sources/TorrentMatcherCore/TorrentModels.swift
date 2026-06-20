@@ -70,9 +70,39 @@ public struct TorrentDetailSpecs: Hashable, Codable, Sendable {
     public let overallBitrate: String?
     public let runtime: String?
     public let calculatedFields: Set<String>
+    public let externalMetadataFields: Set<String>
     public let releaseHintText: String?
     public let hasBestEnglishAudioDetails: Bool
+    public let hasOnlyExplicitNonEnglishAudioTracks: Bool
     public let hasDynamicRangeDetails: Bool
+
+    private enum CodingKeys: String, CodingKey {
+        case fullTorrentName
+        case videoBitrate
+        case resolutionWidth
+        case resolutionHeight
+        case frameRate
+        case bitDepth
+        case crf
+        case preset
+        case encodingPasses
+        case colorGamut
+        case dolbyVisionProfile
+        case aspectRatio
+        case bestEnglishAudioBitrate
+        case bestEnglishAudioSampleRate
+        case allAudioTrackBitrates
+        case totalAudioTrackBitrate
+        case calculatedVideoBitrate
+        case overallBitrate
+        case runtime
+        case calculatedFields
+        case externalMetadataFields
+        case releaseHintText
+        case hasBestEnglishAudioDetails
+        case hasOnlyExplicitNonEnglishAudioTracks
+        case hasDynamicRangeDetails
+    }
 
     public init(
         fullTorrentName: String? = nil,
@@ -95,8 +125,10 @@ public struct TorrentDetailSpecs: Hashable, Codable, Sendable {
         overallBitrate: String? = nil,
         runtime: String? = nil,
         calculatedFields: Set<String> = [],
+        externalMetadataFields: Set<String> = [],
         releaseHintText: String? = nil,
         hasBestEnglishAudioDetails: Bool = false,
+        hasOnlyExplicitNonEnglishAudioTracks: Bool = false,
         hasDynamicRangeDetails: Bool = false
     ) {
         self.fullTorrentName = fullTorrentName
@@ -119,9 +151,42 @@ public struct TorrentDetailSpecs: Hashable, Codable, Sendable {
         self.overallBitrate = overallBitrate
         self.runtime = runtime
         self.calculatedFields = calculatedFields
+        self.externalMetadataFields = externalMetadataFields
         self.releaseHintText = releaseHintText
         self.hasBestEnglishAudioDetails = hasBestEnglishAudioDetails
+        self.hasOnlyExplicitNonEnglishAudioTracks = hasOnlyExplicitNonEnglishAudioTracks
         self.hasDynamicRangeDetails = hasDynamicRangeDetails
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.init(
+            fullTorrentName: try container.decodeIfPresent(String.self, forKey: .fullTorrentName),
+            videoBitrate: try container.decodeIfPresent(String.self, forKey: .videoBitrate),
+            resolutionWidth: try container.decodeIfPresent(String.self, forKey: .resolutionWidth),
+            resolutionHeight: try container.decodeIfPresent(String.self, forKey: .resolutionHeight),
+            frameRate: try container.decodeIfPresent(String.self, forKey: .frameRate),
+            bitDepth: try container.decodeIfPresent(String.self, forKey: .bitDepth),
+            crf: try container.decodeIfPresent(String.self, forKey: .crf),
+            preset: try container.decodeIfPresent(String.self, forKey: .preset),
+            encodingPasses: try container.decodeIfPresent(String.self, forKey: .encodingPasses),
+            colorGamut: try container.decodeIfPresent(String.self, forKey: .colorGamut),
+            dolbyVisionProfile: try container.decodeIfPresent(String.self, forKey: .dolbyVisionProfile),
+            aspectRatio: try container.decodeIfPresent(String.self, forKey: .aspectRatio),
+            bestEnglishAudioBitrate: try container.decodeIfPresent(String.self, forKey: .bestEnglishAudioBitrate),
+            bestEnglishAudioSampleRate: try container.decodeIfPresent(String.self, forKey: .bestEnglishAudioSampleRate),
+            allAudioTrackBitrates: try container.decodeIfPresent([String].self, forKey: .allAudioTrackBitrates) ?? [],
+            totalAudioTrackBitrate: try container.decodeIfPresent(String.self, forKey: .totalAudioTrackBitrate),
+            calculatedVideoBitrate: try container.decodeIfPresent(String.self, forKey: .calculatedVideoBitrate),
+            overallBitrate: try container.decodeIfPresent(String.self, forKey: .overallBitrate),
+            runtime: try container.decodeIfPresent(String.self, forKey: .runtime),
+            calculatedFields: try container.decodeIfPresent(Set<String>.self, forKey: .calculatedFields) ?? [],
+            externalMetadataFields: try container.decodeIfPresent(Set<String>.self, forKey: .externalMetadataFields) ?? [],
+            releaseHintText: try container.decodeIfPresent(String.self, forKey: .releaseHintText),
+            hasBestEnglishAudioDetails: try container.decodeIfPresent(Bool.self, forKey: .hasBestEnglishAudioDetails) ?? false,
+            hasOnlyExplicitNonEnglishAudioTracks: try container.decodeIfPresent(Bool.self, forKey: .hasOnlyExplicitNonEnglishAudioTracks) ?? false,
+            hasDynamicRangeDetails: try container.decodeIfPresent(Bool.self, forKey: .hasDynamicRangeDetails) ?? false
+        )
     }
 
     public var hasDisplayableFields: Bool {
@@ -164,6 +229,7 @@ public struct TorrentDetailSpecs: Hashable, Codable, Sendable {
             totalAudioTrackBitrate?.isEmpty == false ||
             releaseHintText?.isEmpty == false ||
             hasBestEnglishAudioDetails ||
+            hasOnlyExplicitNonEnglishAudioTracks ||
             hasDynamicRangeDetails
     }
 
@@ -171,10 +237,16 @@ public struct TorrentDetailSpecs: Hashable, Codable, Sendable {
         calculatedFields.contains(field)
     }
 
-    public func mergedMissingFields(from other: TorrentDetailSpecs?) -> TorrentDetailSpecs {
+    public func isExternalMetadata(_ field: String) -> Bool {
+        externalMetadataFields.contains(field)
+    }
+
+    public func mergedMissingFields(from other: TorrentDetailSpecs?, markingExternalFields: Bool = false) -> TorrentDetailSpecs {
         guard let other else { return self }
         var mergedCalculatedFields = calculatedFields
         mergedCalculatedFields.formUnion(other.calculatedFields)
+        var mergedExternalMetadataFields = externalMetadataFields
+        mergedExternalMetadataFields.formUnion(other.externalMetadataFields)
         let mergedVideoBitrate = preferredValue(for: "videoBitrate", fallback: other.videoBitrate, fallbackIsCalculated: other.isCalculated("videoBitrate"))
         let mergedOverallBitrate = preferredValue(for: "overallBitrate", fallback: other.overallBitrate, fallbackIsCalculated: other.isCalculated("overallBitrate"))
         let mergedRuntime = preferredValue(for: "runtime", fallback: other.runtime, fallbackIsCalculated: other.isCalculated("runtime"))
@@ -195,6 +267,9 @@ public struct TorrentDetailSpecs: Hashable, Codable, Sendable {
         }
         if mergedRuntime == other.runtime, other.runtime?.isEmpty == false, !other.isCalculated("runtime") {
             mergedCalculatedFields.remove("runtime")
+        }
+        if markingExternalFields {
+            markExternalFields(from: other, mergedVideoBitrate: mergedVideoBitrate, mergedOverallBitrate: mergedOverallBitrate, mergedRuntime: mergedRuntime, into: &mergedExternalMetadataFields)
         }
         return TorrentDetailSpecs(
             fullTorrentName: fullTorrentName ?? other.fullTorrentName,
@@ -217,8 +292,10 @@ public struct TorrentDetailSpecs: Hashable, Codable, Sendable {
             overallBitrate: mergedOverallBitrate,
             runtime: mergedRuntime,
             calculatedFields: mergedCalculatedFields,
+            externalMetadataFields: mergedExternalMetadataFields,
             releaseHintText: releaseHintText ?? other.releaseHintText,
             hasBestEnglishAudioDetails: hasBestEnglishAudioDetails || other.hasBestEnglishAudioDetails,
+            hasOnlyExplicitNonEnglishAudioTracks: hasOnlyExplicitNonEnglishAudioTracks || other.hasOnlyExplicitNonEnglishAudioTracks,
             hasDynamicRangeDetails: hasDynamicRangeDetails || other.hasDynamicRangeDetails
         )
     }
@@ -236,6 +313,49 @@ public struct TorrentDetailSpecs: Hashable, Codable, Sendable {
             return fallback
         }
         return preferred
+    }
+
+    private func markExternalFields(
+        from other: TorrentDetailSpecs,
+        mergedVideoBitrate: String?,
+        mergedOverallBitrate: String?,
+        mergedRuntime: String?,
+        into fields: inout Set<String>
+    ) {
+        func markIfBorrowed(_ field: String, current: String?, borrowed: String?) {
+            if current?.isEmpty != false, borrowed?.isEmpty == false {
+                fields.insert(field)
+            }
+        }
+
+        markIfBorrowed("fullTorrentName", current: fullTorrentName, borrowed: other.fullTorrentName)
+        if videoBitrate?.isEmpty != false, mergedVideoBitrate == other.videoBitrate, other.videoBitrate?.isEmpty == false {
+            fields.insert("videoBitrate")
+        }
+        markIfBorrowed("resolutionWidth", current: resolutionWidth, borrowed: other.resolutionWidth)
+        markIfBorrowed("resolutionHeight", current: resolutionHeight, borrowed: other.resolutionHeight)
+        markIfBorrowed("frameRate", current: frameRate, borrowed: other.frameRate)
+        markIfBorrowed("bitDepth", current: bitDepth, borrowed: other.bitDepth)
+        markIfBorrowed("crf", current: crf, borrowed: other.crf)
+        markIfBorrowed("preset", current: preset, borrowed: other.preset)
+        markIfBorrowed("encodingPasses", current: encodingPasses, borrowed: other.encodingPasses)
+        markIfBorrowed("colorGamut", current: colorGamut, borrowed: other.colorGamut)
+        markIfBorrowed("dolbyVisionProfile", current: dolbyVisionProfile, borrowed: other.dolbyVisionProfile)
+        markIfBorrowed("aspectRatio", current: aspectRatio, borrowed: other.aspectRatio)
+        markIfBorrowed("bestEnglishAudioBitrate", current: bestEnglishAudioBitrate, borrowed: other.bestEnglishAudioBitrate)
+        markIfBorrowed("bestEnglishAudioSampleRate", current: bestEnglishAudioSampleRate, borrowed: other.bestEnglishAudioSampleRate)
+        if allAudioTrackBitrates.isEmpty, !other.allAudioTrackBitrates.isEmpty {
+            fields.insert("allAudioTrackBitrates")
+        }
+        markIfBorrowed("totalAudioTrackBitrate", current: totalAudioTrackBitrate, borrowed: other.totalAudioTrackBitrate)
+        markIfBorrowed("calculatedVideoBitrate", current: calculatedVideoBitrate, borrowed: other.calculatedVideoBitrate)
+        if overallBitrate?.isEmpty != false, mergedOverallBitrate == other.overallBitrate, other.overallBitrate?.isEmpty == false {
+            fields.insert("overallBitrate")
+        }
+        if runtime?.isEmpty != false, mergedRuntime == other.runtime, other.runtime?.isEmpty == false {
+            fields.insert("runtime")
+        }
+        markIfBorrowed("releaseHintText", current: releaseHintText, borrowed: other.releaseHintText)
     }
 
     public func withFallbackRuntime(_ runtime: String, overallBitrate: String? = nil) -> TorrentDetailSpecs {
@@ -270,8 +390,10 @@ public struct TorrentDetailSpecs: Hashable, Codable, Sendable {
             overallBitrate: self.overallBitrate ?? overallBitrate,
             runtime: self.runtime ?? runtime,
             calculatedFields: mergedCalculatedFields,
+            externalMetadataFields: externalMetadataFields,
             releaseHintText: releaseHintText,
             hasBestEnglishAudioDetails: hasBestEnglishAudioDetails,
+            hasOnlyExplicitNonEnglishAudioTracks: hasOnlyExplicitNonEnglishAudioTracks,
             hasDynamicRangeDetails: hasDynamicRangeDetails
         )
     }
