@@ -54,6 +54,79 @@ struct Torrent_MatchTests {
         #expect(results.first?.title.contains("The Matrix 1999") == true)
     }
 
+    @Test func htmlProviderBatchesProgressForParsedPage() async throws {
+        let sampleHTML = """
+        <table>
+          <tr>
+            <td><a href="/torrent/1/first/">Movie 2025 2160p WEB-DL H265-FIRST</a></td>
+            <td class="seeds">20</td><td class="leeches">2</td>
+          </tr>
+          <tr>
+            <td><a href="/torrent/2/second/">Movie 2025 1080p WEB-DL H265-SECOND</a></td>
+            <td class="seeds">10</td><td class="leeches">1</td>
+          </tr>
+        </table>
+        """
+        let config = ProviderConfig(
+            id: "test-html",
+            name: "TestHTML",
+            enabled: true,
+            searchURLTemplate: "https://example.com/search/{{query}}",
+            resultBlockPattern: #"<tr[^>]*>([\s\S]*?)</tr>"#,
+            titlePattern: #"<a[^>]+href=[\"'](?:https?://[^\"']+)?/torrent/[^\"']+[\"'][^>]*>([^<]+)</a>"#,
+            detailURLPattern: #"<a[^>]+href=[\"']((?:https?://[^\"']+)?/torrent/[^\"']+)[\"'][^>]*>[^<]+</a>"#,
+            magnetPattern: nil,
+            fetchMagnetFromDetailDuringSearch: false,
+            seedersPattern: #"<td[^>]*class=[\"'][^\"']*seeds[^\"']*[\"'][^>]*>\s*(\d+)\s*</td>"#,
+            leechersPattern: #"<td[^>]*class=[\"'][^\"']*leeches[^\"']*[\"'][^>]*>\s*(\d+)\s*</td>"#,
+            detailBaseURL: "https://example.com",
+            timeoutSeconds: 5,
+            searchPageCount: 1
+        )
+        let session = URLSession(configuration: MockURLProtocol.ephemeralConfiguration { _ in
+            .immediate(status: 200, body: sampleHTML)
+        })
+        let recorder = ProgressBatchRecorder()
+        let provider = RegexHTMLProvider(config: config, session: session)
+
+        let results = try await provider.search("movie") { batch in
+            await recorder.record(batch)
+        }
+        let batchSizes = await recorder.batchSizes
+
+        #expect(results.count == 2)
+        #expect(batchSizes == [2])
+    }
+
+    @Test func pirateBayRetriesWithCapitalizedYearlessQuery() async throws {
+        let resultJSON = """
+        [{
+          "id": "12345",
+          "name": "Inception 2010 2160p BluRay HEVC-GROUP",
+          "info_hash": "0123456789ABCDEF0123456789ABCDEF01234567",
+          "leechers": "2",
+          "seeders": "20",
+          "size": "10000000000"
+        }]
+        """
+        let noResultsJSON = """
+        [{"id": "0", "name": "No results returned", "info_hash": "", "leechers": "0", "seeders": "0", "size": "0"}]
+        """
+        let session = URLSession(configuration: MockURLProtocol.ephemeralConfiguration { request in
+            let query = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
+                .queryItems?
+                .first(where: { $0.name == "q" })?
+                .value
+            return .immediate(status: 200, body: query == "Inception" ? resultJSON : noResultsJSON)
+        })
+        let provider = PirateBayAPIProvider(config: BuiltInProviderConfigs.pirateBay, session: session)
+
+        let results = try await provider.search("inception 2010")
+
+        #expect(results.count == 3)
+        #expect(results.allSatisfy { $0.title.contains("Inception 2010") })
+    }
+
     @Test func x1337SearchUsesLeadingArticleStrippedVariant() async throws {
         let sampleHTML = """
         <table>
@@ -98,6 +171,44 @@ struct Torrent_MatchTests {
 
         #expect(results.count == 1)
         #expect(results.first?.title.contains("The Matrix 1999") == true)
+    }
+
+    @Test func x1337SearchStripsTrailingYearFromPathQuery() async throws {
+        let sampleHTML = """
+        <table>
+          <tr>
+            <td><a href="/torrent/12345/test/">Oppenheimer 2023 2160p BluRay HEVC-GROUP</a></td>
+            <td class="seeds">20</td><td class="leeches">2</td>
+          </tr>
+        </table>
+        """
+        let config = ProviderConfig(
+            id: "1337x",
+            name: "1337x",
+            enabled: true,
+            searchURLTemplate: "https://example.com/category-search/{{query}}/Movies/{{page}}/",
+            resultBlockPattern: #"<tr[^>]*>([\s\S]*?)</tr>"#,
+            titlePattern: #"<a[^>]+href=[\"'](?:https?://[^\"']+)?/torrent/[^\"']+[\"'][^>]*>([^<]+)</a>"#,
+            detailURLPattern: #"<a[^>]+href=[\"']((?:https?://[^\"']+)?/torrent/[^\"']+)[\"'][^>]*>[^<]+</a>"#,
+            magnetPattern: nil,
+            fetchMagnetFromDetailDuringSearch: false,
+            seedersPattern: #"<td[^>]*class=[\"'][^\"']*seeds[^\"']*[\"'][^>]*>\s*(\d+)\s*</td>"#,
+            leechersPattern: #"<td[^>]*class=[\"'][^\"']*leeches[^\"']*[\"'][^>]*>\s*(\d+)\s*</td>"#,
+            detailBaseURL: "https://example.com",
+            timeoutSeconds: 5,
+            searchPageCount: 1
+        )
+        let session = URLSession(configuration: MockURLProtocol.ephemeralConfiguration { request in
+            request.url?.path.contains("/category-search/Oppenheimer/Movies/") == true
+                ? .immediate(status: 200, body: sampleHTML)
+                : .immediate(status: 200, body: "<table></table>")
+        })
+        let provider = RegexHTMLProvider(config: config, session: session)
+
+        let results = try await provider.search("Oppenheimer 2023")
+
+        #expect(results.count == 1)
+        #expect(results.first?.title.contains("Oppenheimer 2023") == true)
     }
 
     @Test func x1337SearchReturnsFromFirstUsableMirror() async throws {
@@ -430,6 +541,16 @@ struct Torrent_MatchTests {
         #expect(parsed.audioCodec == .dtsHDMA)
     }
 
+    @Test func parserTreatsTruHDAndMLPFBAAsTrueHD() {
+        let truHD = ReleaseParser.parse("Movie.2025.2160p.BluRay.TruHD.5.1.HDR.H.265-GROUP")
+        let mlp = ReleaseParser.parse("Movie.2025.2160p.BluRay.MLP.FBA.5.1.HDR.H.265-GROUP")
+
+        #expect(truHD.audioCodec == .truehd)
+        #expect(truHD.channels == .fiveOne)
+        #expect(mlp.audioCodec == .truehd)
+        #expect(mlp.channels == .fiveOne)
+    }
+
     @Test func parserTreatsPackedDtsMaVariantsAsDtsHDMA() {
         let a = ReleaseParser.parse("Movie.2025.2160p.BluRay.DTS-MA5 1.HDR.H.265-GROUP")
         let b = ReleaseParser.parse("Movie.2025.2160p.BluRay.DTS-MA7 1.HDR.H.265-GROUP")
@@ -496,6 +617,21 @@ struct Torrent_MatchTests {
         #expect(parsed.sourceType == .bluray)
     }
 
+    @Test func parserTreatsSpacedWebDLAsWebDL() {
+        let parsed = ReleaseParser.parse("Movie 2025 1080p WEB DL DDP5 1 H264-GROUP")
+        #expect(parsed.sourceType == .webdl)
+    }
+
+    @Test func parserTreatsMultiSeparatorWebDLAsWebDL() {
+        let parsed = ReleaseParser.parse("Movie 2025 1080p WEB  DL DDP5 1 H264-GROUP")
+        #expect(parsed.sourceType == .webdl)
+    }
+
+    @Test func parserTreatsCAMRipAsCAMSource() {
+        let parsed = ReleaseParser.parse("Movie.2025.1080p.CAMRip.x264-GROUP")
+        #expect(parsed.sourceType == .cam)
+    }
+
     @Test func parserTreatsHDRipAsHDTVNotHDR() {
         let parsed = ReleaseParser.parse("Movie.2025.HDRip-GROUP")
         #expect(parsed.sourceType == .hdtv)
@@ -542,16 +678,16 @@ struct Torrent_MatchTests {
         #expect(parsed.dynamicRange == .hdr)
     }
 
-    @Test func parserDoesNotInferDDPFromBareAtmosChannelContext() {
+    @Test func parserTreatsBareAtmosAsDDPForCodecMathWithoutObjectAudio() {
         let parsed = ReleaseParser.parse("Movie.2025.2160p.WEB-DL.Atmos.7 1.HDR.H.265-GROUP")
-        #expect(parsed.audioCodec == .unknown)
+        #expect(parsed.audioCodec == .ddp)
         #expect(parsed.channels == .sevenOne)
         #expect(parsed.atmos == false)
     }
 
-    @Test func parserDoesNotTreatBareAtmosAsDDP51() {
+    @Test func parserDoesNotTreatBareAtmosAsObjectAudioOrDDP51() {
         let parsed = ReleaseParser.parse("Movie.2025.2160p.WEB-DL.Atmos.HDR.H.265-GROUP")
-        #expect(parsed.audioCodec == .unknown)
+        #expect(parsed.audioCodec == .ddp)
         #expect(parsed.channels == .unknown)
         #expect(parsed.atmos == false)
     }
@@ -849,6 +985,17 @@ struct Torrent_MatchTests {
         #expect(specs?.fullTorrentName == "Movie.2025.1080p.WEB-DL.x264-GROUP")
     }
 
+    @Test func detailSpecParserTreatsSpacedWebDLAsReleaseSignal() {
+        let specs = TorrentDetailSpecParser.parse("""
+        MediaInfo
+        General
+        Title : Movie 2025 1080p WEB DL DDP5 1 H264-GROUP
+        Duration : 1 h 44 min
+        """)
+
+        #expect(specs?.fullTorrentName == "Movie 2025 1080p WEB DL DDP5 1 H264-GROUP")
+    }
+
     @Test func detailSpecParserHandles1337xDescriptionSpecs() {
         let text = """
         Title : Mortal Kombat II 2026 2160p iT WEB-DL DDP5 1 Atmos DV HDR H 265-BYNDR
@@ -1080,6 +1227,64 @@ struct Torrent_MatchTests {
         #expect(specs?.calculatedFields.contains("bestEnglishAudioBitrate") == true)
     }
 
+    @Test func detailSpecParserUsesExplicitTrackLabelBeforeCalculatingAudioBitrate() {
+        let specs = TorrentDetailSpecParser.parse("""
+        MediaInfo
+        General
+        Overall bit rate : 12.0 Mb/s
+
+        Video
+        Bit rate : 10.0 Mb/s
+
+        English AC-3: 640 kb/s
+        """)
+
+        #expect(specs?.allAudioTrackBitrates == ["English AC-3: 640 kb/s"])
+        #expect(specs?.bestEnglishAudioBitrate == "640 kb/s")
+        #expect(specs?.calculatedFields.contains("bestEnglishAudioBitrate") != true)
+    }
+
+    @Test func detailSpecParserSubtractsSubtitleBitratesFromCalculatedAudioBitrate() {
+        let specs = TorrentDetailSpecParser.parse("""
+        MediaInfo
+        General
+        Overall bit rate : 12.0 Mb/s
+
+        Video
+        Bit rate : 10.0 Mb/s
+
+        Audio
+        Format : E-AC-3
+        Channel(s) : 6 channels
+        Language : English
+
+        Subtitle
+        Format : PGS
+        Bit rate : 80 kb/s
+        """)
+
+        #expect(specs?.bestEnglishAudioBitrate == "1.92 Mb/s (1920 kb/s)")
+        #expect(specs?.calculatedFields.contains("bestEnglishAudioBitrate") == true)
+    }
+
+    @Test func detailSpecParserDeduplicatesRepeatedAudioBitrateLabelsBeforeSumming() {
+        let specs = TorrentDetailSpecParser.parse("""
+        MediaInfo
+        General
+        Overall bit rate : 12.0 Mb/s
+
+        Audio
+        Format : E-AC-3
+        Bit rate : 640 kb/s
+        Language : English
+
+        English E-AC-3: 640 kb/s
+        """)
+
+        #expect(specs?.allAudioTrackBitrates == ["English E-AC-3: 640 kb/s"])
+        #expect(specs?.totalAudioTrackBitrate == "640 kb/s")
+    }
+
     @Test func detailSpecParserDoesNotFoldChannelSuffixIntoAudioBitrate() {
         let specs = TorrentDetailSpecParser.parse("""
         MediaInfo
@@ -1100,6 +1305,135 @@ struct Torrent_MatchTests {
         #expect(specs?.totalAudioTrackBitrate == "4.98 Mb/s (4978 kb/s)")
         #expect(specs?.bestEnglishAudioBitrate == "4338 kbps")
         #expect(specs?.releaseHintText?.contains("TrueHD 7.1") == true)
+    }
+
+    @Test func detailSpecParserPrefersTrueHDOverAC3ForEnglishScoringBlock() {
+        let specs = TorrentDetailSpecParser.parse("""
+        Audio
+        Commercial name: Dolby TrueHD
+        Title name: Dolby TrueHD 5.1
+        Audio language: English
+        Audio Codec: TrueHD
+        Bitrate Mode: Variable
+        Bitrate: 1457 Kbps
+        Sample Rate: 48.0 KHz
+        Channel Count: 6 channels (L R C LFE Ls Rs)
+
+        Audio
+        Commercial name: Dolby Digital
+        Title name: Dolby Digital 5.1
+        Audio language: English
+        Audio Codec: A_AC3
+        Bitrate Mode: Constant
+        Bitrate: 640 Kbps
+        Sample Rate: 48.0 KHz
+        Channel Count: 6 channels (L R C LFE Ls Rs)
+        """)
+
+        let ranked = TorrentRanker.score(TorrentSearchResult(
+            title: "Movie.2025.1080p.BluRay.x265-GROUP",
+            detailSpecs: specs,
+            magnet: nil,
+            detailURL: nil,
+            seeders: 10,
+            leechers: 2,
+            provider: "A"
+        ))
+
+        #expect(specs?.bestEnglishAudioBitrate == "1457 Kbps")
+        #expect(specs?.releaseHintText?.contains("TrueHD 5.1") == true)
+        #expect(ranked.parsed.audioCodec == .truehd)
+        #expect(ranked.parsed.channels == .fiveOne)
+    }
+
+    @Test func detailSpecParserParsesBracedAudioFields() {
+        let specs = TorrentDetailSpecParser.parse("""
+        {Size} : 3.11 GiB
+        {Duration} : 2 h 29 min
+        {Resolution} : 1920 x 800 pixels
+        {Display aspect ratio} : 2.40:1
+        {Frame Rate} : 23.976 fps
+        {Video Bitrate} : 2 510 kb/s
+        {Video Format Info} : High Efficiency Video Coding
+        {Video Format} : HEVC
+        {Audio Format} : AC-3
+        {Audio Language} : English
+        {Audio Channels} : 6 CH
+        """)
+
+        #expect(specs?.runtime == "2 h 29 min")
+        #expect(specs?.resolutionWidth == "1920 px")
+        #expect(specs?.resolutionHeight == "800 px")
+        #expect(specs?.aspectRatio == "2.40:1")
+        #expect(specs?.videoBitrate == "2 510 kb/s")
+        #expect(specs?.releaseHintText?.contains("HEVC") == true)
+        #expect(specs?.releaseHintText?.contains("DD 5.1") == true)
+    }
+
+    @Test func detailSpecParserInfersAudioFieldsFromValuesWhenKeysAreGeneric() {
+        let specs = TorrentDetailSpecParser.parse("""
+        MediaInfo
+        General
+        Duration : 1 h 45 min
+
+        Audio
+        Kind : E-AC-3 JOC
+        Layout : 6 channels
+        Rate : 768 kb/s
+        Language : English
+        Sample Rate : 48.0 kHz
+        """)
+
+        #expect(specs?.allAudioTrackBitrates == ["English E-AC-3 JOC: 768 kb/s"])
+        #expect(specs?.bestEnglishAudioBitrate == "768 kb/s")
+        #expect(specs?.bestEnglishAudioSampleRate == "48.0 kHz")
+        #expect(specs?.releaseHintText?.contains("DDP 5.1 Atmos") == true)
+    }
+
+    @Test func detailSpecParserDoesNotInferSubtitleCodecIDsAsAudio() {
+        let specs = TorrentDetailSpecParser.parse("""
+        Subtitle
+        Format : UTF-8
+        Codec ID : S_TEXT/UTF8
+        Bit rate : 40 b/s
+        Language : English
+        """)
+
+        #expect(specs == nil || specs?.allAudioTrackBitrates.isEmpty == true)
+        #expect(specs?.releaseHintText?.contains("UTF-8") != true)
+    }
+
+    @Test func detailSpecParserPrefersTrackBitrateOverMaximumBitrate() {
+        let specs = TorrentDetailSpecParser.parse("""
+        Audio
+        Format : E-AC-3
+        Language : English
+        Maximum bit rate : 1 536 kb/s
+        Bit rate : 768 kb/s
+        """)
+
+        #expect(specs?.allAudioTrackBitrates == ["English E-AC-3: 768 kb/s"])
+        #expect(specs?.bestEnglishAudioBitrate == "768 kb/s")
+    }
+
+    @Test func detailSpecParserDoesNotTreatOverallOrTotalBitrateAsTrackBitrate() {
+        let specs = TorrentDetailSpecParser.parse("""
+        General
+        Overall bit rate : 12.0 Mb/s
+
+        Video Max Bitrate : 14.0 Mb/s
+
+        Audio
+        Format : E-AC-3
+        Language : English
+        Total bit rate : 2 000 kb/s
+        Overall bit rate : 2 000 kb/s
+        """)
+
+        #expect(specs?.overallBitrate == "12.0 Mb/s")
+        #expect(specs?.videoBitrate == nil)
+        #expect(specs?.allAudioTrackBitrates.isEmpty == true)
+        #expect(specs?.bestEnglishAudioBitrate == nil)
     }
 
     @Test func detailSpecParserUsesBestAudioTrackWhenLanguageIsMissing() {
@@ -1529,6 +1863,14 @@ struct Torrent_MatchTests {
         #expect(report.results.first?.raw.title == result.title)
     }
 
+    @Test func movieAutocompleteMatchesInteriorTitleText() async {
+        let shawshank = await MovieCatalog.shared.suggestions(for: "Shawshank", limit: 12)
+        let xMen = await MovieCatalog.shared.suggestions(for: "x-men", limit: 12)
+
+        #expect(shawshank.contains { $0.title == "The Shawshank Redemption" })
+        #expect(xMen.contains { $0.title == "X2: X-Men United" })
+    }
+
     @Test func searchKeeps1337xMovieReleaseWithoutYearWhenCodecMarkersExist() async {
         let result = TorrentSearchResult(
             title: "The Matrix Resurrections WEB-DL DDP5 1 Atmos H265-GROUP",
@@ -1647,6 +1989,20 @@ struct Torrent_MatchTests {
         #expect(ranked.parsed.atmos == true)
     }
 
+    @Test func searchResultPreferredTitleUsesDetailPageTorrentName() {
+        let result = TorrentSearchResult(
+            title: "Movie 2025...",
+            detailSpecs: TorrentDetailSpecs(fullTorrentName: "Movie.2025.2160p.WEB-DL-GROUP.mkv"),
+            magnet: nil,
+            detailURL: nil,
+            seeders: 10,
+            leechers: 2,
+            provider: "A"
+        )
+
+        #expect(result.preferredTitle == "Movie.2025.2160p.WEB-DL-GROUP.mkv")
+    }
+
     @Test func rankerAlwaysExcludesRiffTraxReleases() {
         let result = TorrentSearchResult(
             title: "Movie.2025.1080p.BluRay.RiffTrax.x264-GROUP",
@@ -1709,13 +2065,13 @@ struct Torrent_MatchTests {
     }
 
     @Test func pictureQualityUsesBitrateDensityAndResolutionTogether() {
-        let healthy2160p = TorrentSearchResult(
+        let strong2160p = TorrentSearchResult(
             title: "Movie.2025.2160p.WEB-DL.DDP5.1.HDR.HEVC-GROUP",
             detailSpecs: TorrentDetailSpecs(
-                videoBitrate: "22 Mb/s",
+                videoBitrate: "25 Mb/s",
                 resolutionWidth: "3840 px",
                 resolutionHeight: "2160 px",
-                frameRate: "23.976 FPS",
+                frameRate: "24 FPS",
                 bestEnglishAudioBitrate: "768 kb/s",
                 releaseHintText: "2160p HEVC HDR DDP 5.1"
             ),
@@ -1726,12 +2082,12 @@ struct Torrent_MatchTests {
             provider: "A"
         )
         let perfect1080p = TorrentSearchResult(
-            title: "Movie.2025.1080p.BluRay.DDP5.1.HDR.HEVC-GROUP",
+            title: "Movie.2025.1080p.WEB-DL.DDP5.1.HDR.HEVC-GROUP",
             detailSpecs: TorrentDetailSpecs(
                 videoBitrate: "60 Mb/s",
                 resolutionWidth: "1920 px",
                 resolutionHeight: "1080 px",
-                frameRate: "23.976 FPS",
+                frameRate: "24 FPS",
                 bestEnglishAudioBitrate: "768 kb/s",
                 releaseHintText: "1080p HEVC HDR DDP 5.1"
             ),
@@ -1747,7 +2103,7 @@ struct Torrent_MatchTests {
                 videoBitrate: "3 Mb/s",
                 resolutionWidth: "3840 px",
                 resolutionHeight: "2160 px",
-                frameRate: "23.976 FPS",
+                frameRate: "24 FPS",
                 bestEnglishAudioBitrate: "768 kb/s",
                 releaseHintText: "2160p HEVC HDR DDP 5.1"
             ),
@@ -1758,7 +2114,7 @@ struct Torrent_MatchTests {
             provider: "A"
         )
 
-        #expect(TorrentRanker.score(healthy2160p).score > TorrentRanker.score(perfect1080p).score)
+        #expect(TorrentRanker.score(strong2160p).score > TorrentRanker.score(perfect1080p).score)
         #expect(TorrentRanker.score(bad2160p).score < TorrentRanker.score(perfect1080p).score)
     }
 
@@ -1779,7 +2135,7 @@ struct Torrent_MatchTests {
 
         let breakdown = TorrentRanker.qualityBreakdown(for: result)
         #expect(breakdown.video.bitrateIsEstimated == false)
-        #expect(breakdown.video.bitrateSourceLabel == "derived from size/runtime")
+        #expect(breakdown.video.bitrateSourceLabel == "calculated from size ÷ runtime - audio")
         #expect(breakdown.video.bitrateKbps > 5_900)
         #expect(breakdown.video.bitrateKbps < 6_100)
     }
@@ -1800,9 +2156,9 @@ struct Torrent_MatchTests {
         #expect(breakdown.audio.bitrateKbps == 640)
         #expect(breakdown.audio.bitrateIsEstimated == true)
         #expect(breakdown.video.bitrateIsEstimated == false)
-        #expect(breakdown.video.bitrateSourceLabel == "derived from size/runtime + estimated audio")
-        #expect(breakdown.video.bitrateKbps > 5_900)
-        #expect(breakdown.video.bitrateKbps < 6_100)
+        #expect(breakdown.video.bitrateSourceLabel == "calculated from size ÷ runtime - audio")
+        #expect(breakdown.video.bitrateKbps > 5_990)
+        #expect(breakdown.video.bitrateKbps < 6_010)
     }
 
     @Test func rankerEstimatesLosslessAudioBitrateFromTitleCodecAndChannels() {
@@ -1822,7 +2178,7 @@ struct Torrent_MatchTests {
         #expect(breakdown.audio.bitrateKbps == 4_500)
         #expect(breakdown.audio.bitrateIsEstimated == true)
         #expect(breakdown.video.bitrateIsEstimated == false)
-        #expect(breakdown.video.bitrateSourceLabel == "derived from size/runtime + estimated audio")
+        #expect(breakdown.video.bitrateSourceLabel == "calculated from size ÷ runtime - audio")
     }
 
     @Test func calculatedFallbackSpecsDoNotCountAsDetailPageMetadata() {
@@ -1919,25 +2275,36 @@ struct Torrent_MatchTests {
             leechers: 2,
             provider: "A"
         )
+        let highOverall = TorrentSearchResult(
+            title: "Movie.2025.1080p.WEB-DL.HDR.HEVC-GROUP",
+            detailSpecs: TorrentDetailSpecs(overallBitrate: "50 Mb/s"),
+            magnet: nil,
+            detailURL: nil,
+            seeders: 10,
+            leechers: 2,
+            provider: "A"
+        )
 
         #expect(TorrentRanker.qualityBreakdown(for: standard).video.bitrateKbps == 9_000)
+        #expect(TorrentRanker.qualityBreakdown(for: standard).video.bitrateSourceLabel == "estimated from overall bitrate")
         #expect(TorrentRanker.qualityBreakdown(for: multi).video.bitrateKbps == 8_000)
         #expect(TorrentRanker.qualityBreakdown(for: multiverse).video.bitrateKbps == 9_000)
+        #expect(TorrentRanker.qualityBreakdown(for: highOverall).video.bitrateKbps == 45_000)
     }
 
-    @Test func audioDensityCurveHasHigherFloorAndEarlierCeiling() {
-        let highDensity = TorrentSearchResult(
-            title: "Movie.2025.2160p.BluRay.REMUX.TrueHD.7.1.HEVC-GROUP",
-            detailSpecs: TorrentDetailSpecs(bestEnglishAudioBitrate: "6.4 Mb/s"),
+    @Test func knownAudioCodecAndChannelsUseEstimatedAudioForCalculatedVideoBitrate() {
+        let standard = TorrentSearchResult(
+            title: "Movie.2025.2160p.WEB-DL.DDP5.1.HDR.HEVC-GROUP",
+            detailSpecs: TorrentDetailSpecs(overallBitrate: "10 Mb/s"),
             magnet: nil,
             detailURL: nil,
             seeders: 10,
             leechers: 2,
             provider: "A"
         )
-        let lowDensity = TorrentSearchResult(
-            title: "Movie.2025.1080p.WEB-DL.AAC.2.0.x264-GROUP",
-            detailSpecs: TorrentDetailSpecs(bestEnglishAudioBitrate: "64 kb/s"),
+        let multi = TorrentSearchResult(
+            title: "Movie.2025.2160p.WEB-DL.MULTi.DDP5.1.HDR.HEVC-GROUP",
+            detailSpecs: TorrentDetailSpecs(overallBitrate: "10 Mb/s"),
             magnet: nil,
             detailURL: nil,
             seeders: 10,
@@ -1945,14 +2312,120 @@ struct Torrent_MatchTests {
             provider: "A"
         )
 
-        let highBreakdown = TorrentRanker.qualityBreakdown(for: highDensity)
-        let lowBreakdown = TorrentRanker.qualityBreakdown(for: lowDensity)
+        let standardBreakdown = TorrentRanker.qualityBreakdown(for: standard)
+        let multiBreakdown = TorrentRanker.qualityBreakdown(for: multi)
 
-        #expect(highBreakdown.audio.density == 800)
-        #expect(highBreakdown.audio.compressionHealth == 1.0)
-        #expect((lowBreakdown.audio.density ?? 0) > 35)
-        #expect((lowBreakdown.audio.density ?? 0) < 36)
-        #expect(lowBreakdown.audio.compressionHealth > 0.82)
+        #expect(standardBreakdown.audio.bitrateKbps == 640)
+        #expect(standardBreakdown.audio.bitrateIsEstimated == true)
+        #expect(standardBreakdown.video.bitrateKbps == 9_360)
+        #expect(standardBreakdown.video.bitrateIsEstimated == false)
+        #expect(standardBreakdown.video.bitrateSourceLabel == "calculated from size ÷ runtime - audio")
+        #expect(multiBreakdown.video.bitrateKbps == 9_360)
+    }
+
+    @Test func hevcVideoCodecFactorsScaleByScoredResolution() {
+        func factor(_ title: String, specs: TorrentDetailSpecs? = nil) -> Double {
+            TorrentRanker.qualityBreakdown(for: TorrentSearchResult(
+                title: title,
+                detailSpecs: specs,
+                magnet: nil,
+                detailURL: nil,
+                seeders: 10,
+                leechers: 2,
+                provider: "A"
+            )).video.codecFactor
+        }
+
+        #expect(factor("Movie.2025.2160p.WEB-DL.HEVC-GROUP") == 1.75)
+        #expect(factor("Movie.2025.1080p.WEB-DL.HEVC-GROUP") == 1.50)
+        #expect(factor("Movie.2025.720p.WEB-DL.HEVC-GROUP") == 1.35)
+        #expect(factor("Movie.2025.480p.WEB-DL.HEVC-GROUP") == 1.25)
+        #expect(factor(
+            "Movie.2025.1080p.WEB-DL.HEVC-GROUP",
+            specs: TorrentDetailSpecs(resolutionWidth: "3840", resolutionHeight: "2160")
+        ) == 1.75)
+    }
+
+    @Test func videoDensityUsesResolutionSpecificTargetsAndSharedCurve() {
+        func breakdown(_ title: String, bitrate: String, width: String, height: String) -> VideoQualityBreakdown {
+            TorrentRanker.qualityBreakdown(for: TorrentSearchResult(
+                title: title,
+                detailSpecs: TorrentDetailSpecs(
+                    videoBitrate: bitrate,
+                    resolutionWidth: width,
+                    resolutionHeight: height,
+                    frameRate: "24 FPS"
+                ),
+                magnet: nil,
+                detailURL: nil,
+                seeders: 10,
+                leechers: 2,
+                provider: "A"
+            )).video
+        }
+
+        let p2160 = breakdown("Movie.2025.2160p.WEB-DL.HEVC-GROUP", bitrate: "25.025 Mb/s", width: "3840", height: "2160")
+        let p1080 = breakdown("Movie.2025.1080p.WEB-DL.HEVC-GROUP", bitrate: "10.617 Mb/s", width: "1920", height: "1080")
+        let p720 = breakdown("Movie.2025.720p.WEB-DL.HEVC-GROUP", bitrate: "7.373 Mb/s", width: "1280", height: "720")
+        let p480 = breakdown("Movie.2025.480p.WEB-DL.HEVC-GROUP", bitrate: "4.313 Mb/s", width: "720", height: "480")
+
+        #expect(p2160.targetBPPPF == 0.22)
+        #expect(p1080.targetBPPPF == 0.32)
+        #expect(p720.targetBPPPF == 0.45)
+        #expect(p480.targetBPPPF == 0.65)
+        #expect(abs(p2160.densityRatio - 1.0) < 0.001)
+        #expect(abs(p1080.densityRatio - 1.0) < 0.001)
+        #expect(abs(p720.densityRatio - 1.0) < 0.001)
+        #expect(abs(p480.densityRatio - 1.0) < 0.001)
+        #expect(abs(p2160.compressionHealth - 1.0) < 0.001)
+    }
+
+    @Test func videoDensityCrossoversFavor4KNearTunedBitrate() {
+        func result(_ title: String, bitrate: String, width: String, height: String) -> TorrentSearchResult {
+            TorrentSearchResult(
+                title: title,
+                detailSpecs: TorrentDetailSpecs(
+                    videoBitrate: bitrate,
+                    resolutionWidth: width,
+                    resolutionHeight: height,
+                    frameRate: "24 FPS",
+                    bestEnglishAudioBitrate: "768 kb/s"
+                ),
+                magnet: nil,
+                detailURL: nil,
+                seeders: 10,
+                leechers: 2,
+                provider: "A"
+            )
+        }
+
+        let p2160Below = result("Movie.2025.2160p.WEB-DL.DDP5.1.HDR.HEVC-GROUP", bitrate: "21 Mb/s", width: "3840", height: "2160")
+        let p2160Above = result("Movie.2025.2160p.WEB-DL.DDP5.1.HDR.HEVC-GROUP", bitrate: "22 Mb/s", width: "3840", height: "2160")
+        let p1080 = result("Movie.2025.1080p.WEB-DL.DDP5.1.HDR.HEVC-GROUP", bitrate: "21.5 Mb/s", width: "1920", height: "1080")
+        let p720Below = result("Movie.2025.720p.WEB-DL.DDP5.1.HEVC-GROUP", bitrate: "2.3 Mb/s", width: "1280", height: "720")
+        let p720Above = result("Movie.2025.720p.WEB-DL.DDP5.1.HEVC-GROUP", bitrate: "2.5 Mb/s", width: "1280", height: "720")
+        let p480 = result("Movie.2025.480p.WEB-DL.DDP5.1.HEVC-GROUP", bitrate: "2.4 Mb/s", width: "720", height: "480")
+
+        #expect(TorrentRanker.score(p2160Below).score < TorrentRanker.score(p1080).score)
+        #expect(TorrentRanker.score(p2160Above).score > TorrentRanker.score(p1080).score)
+        #expect(TorrentRanker.score(p720Below).score < TorrentRanker.score(p480).score)
+        #expect(TorrentRanker.score(p720Above).score > TorrentRanker.score(p480).score)
+    }
+
+    @Test func audioDensityHealthMatchesFinalCurveAnchors() {
+        let collapse = audioBreakdown("Movie.2025.1080p.WEB-DL.AC3.2.0.x264-GROUP", bitrate: "64 kb/s")
+        let acceptable = audioBreakdown("Movie.2025.1080p.WEB-DL.AC3.2.0.x264-GROUP", bitrate: "128 kb/s")
+        let healthy = audioBreakdown("Movie.2025.1080p.WEB-DL.AC3.2.0.x264-GROUP", bitrate: "192 kb/s")
+        let transparent = audioBreakdown("Movie.2025.1080p.WEB-DL.AC3.2.0.x264-GROUP", bitrate: "320 kb/s")
+
+        #expect(abs((collapse.density ?? 0) - 32) < 0.001)
+        #expect(abs(collapse.compressionHealth - 0.09) < 0.001)
+        #expect(abs((acceptable.density ?? 0) - 64) < 0.001)
+        #expect(abs(acceptable.compressionHealth - 0.62) < 0.001)
+        #expect(abs((healthy.density ?? 0) - 96) < 0.001)
+        #expect(abs(healthy.compressionHealth - 0.82017) < 0.001)
+        #expect(abs((transparent.density ?? 0) - 160) < 0.001)
+        #expect(abs(transparent.compressionHealth - 1) < 0.001)
     }
 
     @Test func estimatedAudioBitrateIncreasesWithChannelCount() {
@@ -1977,19 +2450,204 @@ struct Torrent_MatchTests {
         #expect(TorrentRanker.qualityBreakdown(for: surround).audio.bitrateKbps == 1_509)
     }
 
-    @Test func aacEfficiencyDoesNotOverrideAc3CodecCompatibilityScore() {
+    @Test func codecAndSampleRateHaveNoRawBonusBeyondDensityConversion() {
+        let ac3 = audioBreakdown(
+            "Movie.2025.1080p.WEB-DL.AC3.5.1.x264-GROUP",
+            bitrate: "336 kb/s",
+            sampleRate: "48 kHz"
+        )
+        let aac = audioBreakdown(
+            "Movie.2025.1080p.WEB-DL.AAC.5.1.x264-GROUP",
+            bitrate: "210 kb/s",
+            sampleRate: "192 kHz"
+        )
         let ranked = TorrentRanker.score(TorrentSearchResult(
             title: "Movie.2025.1080p.WEB-DL.AAC.5.1.x264-GROUP",
+            detailSpecs: TorrentDetailSpecs(bestEnglishAudioBitrate: "210 kb/s", bestEnglishAudioSampleRate: "192 kHz"),
             magnet: nil,
             detailURL: nil,
             seeders: 10,
             leechers: 2,
             provider: "A"
         ))
-        let breakdown = TorrentRanker.qualityBreakdown(for: ranked.raw)
 
-        #expect(breakdown.audio.codecFactor == 1.10)
-        #expect(ranked.notes.contains { $0.contains("Audio codec quality") && $0.contains("+3") && $0.contains("aac") })
+        #expect(ac3.codecFactor == 1.0)
+        #expect(aac.codecFactor == 1.6)
+        #expect(abs((ac3.density ?? 0) - (aac.density ?? 0)) < 0.001)
+        #expect(abs(ac3.score - aac.score) < 0.001)
+        #expect(!ranked.notes.contains { $0.contains("Audio codec quality") || $0.contains("Sample rate") })
+    }
+
+    @Test func audioCodecDensityFactorsMatchRequestedEfficiencyMultipliers() {
+        func factor(codecToken: String, rawKbpsPerChannel: Int) -> Double {
+            let totalBitrate = rawKbpsPerChannel * 2
+            let breakdown = TorrentRanker.qualityBreakdown(for: TorrentSearchResult(
+                title: "Movie.2025.1080p.WEB-DL.\(codecToken).2.0.x264-GROUP",
+                detailSpecs: TorrentDetailSpecs(bestEnglishAudioBitrate: "\(totalBitrate) kb/s"),
+                magnet: nil,
+                detailURL: nil,
+                seeders: 10,
+                leechers: 2,
+                provider: "A"
+            ))
+            return breakdown.audio.codecFactor
+        }
+
+        let rows: [(rawKbpsPerChannel: Int, factors: [Double])] = [
+            (40,  [1.00, 1.90, 1.60, 2.80, 2.20, 0.70, 0.25, 0.40]),
+            (60,  [1.00, 1.75, 1.50, 2.50, 2.05, 0.75, 0.27, 0.42]),
+            (80,  [1.00, 1.65, 1.45, 2.25, 1.90, 0.78, 0.29, 0.44]),
+            (100, [1.00, 1.55, 1.40, 2.05, 1.75, 0.80, 0.30, 0.45]),
+            (125, [1.00, 1.47, 1.36, 1.85, 1.62, 0.82, 0.31, 0.46]),
+            (150, [1.00, 1.40, 1.32, 1.70, 1.52, 0.83, 0.31, 0.47]),
+            (200, [1.00, 1.33, 1.28, 1.50, 1.42, 0.84, 0.30, 0.47]),
+            (300, [1.00, 1.28, 1.23, 1.35, 1.35, 0.85, 0.30, 0.45])
+        ]
+        let codecTokens = ["AC3", "DDP", "AAC-LC", "HE-AAC", "OPUS", "MP3", "DTS", "DTS-HD.HRA"]
+
+        for row in rows {
+            for (codecToken, expected) in zip(codecTokens, row.factors) {
+                #expect(factor(codecToken: codecToken, rawKbpsPerChannel: row.rawKbpsPerChannel) == expected)
+            }
+        }
+
+        #expect(abs(factor(codecToken: "DDP", rawKbpsPerChannel: 50) - 1.825) < 0.000_001)
+        #expect(abs(factor(codecToken: "DDP", rawKbpsPerChannel: 250) - 1.305) < 0.000_001)
+        #expect(abs(factor(codecToken: "HE-AAC", rawKbpsPerChannel: 175) - 1.60) < 0.000_001)
+        #expect(factor(codecToken: "OPUS", rawKbpsPerChannel: 20) == 2.20)
+        #expect(factor(codecToken: "OPUS", rawKbpsPerChannel: 400) == 1.35)
+    }
+
+    @Test func unknownChannelsUseTheSameBaseAndDensityRulesAsStereo() {
+        let unknown = TorrentSearchResult(
+            title: "Movie.2025.1080p.WEB-DL.AAC.x264-GROUP",
+            magnet: nil,
+            detailURL: nil,
+            seeders: 10,
+            leechers: 2,
+            provider: "A"
+        )
+        let stereo = TorrentSearchResult(
+            title: "Movie.2025.1080p.WEB-DL.AAC.2.0.x264-GROUP",
+            magnet: nil,
+            detailURL: nil,
+            seeders: 10,
+            leechers: 2,
+            provider: "A"
+        )
+
+        let unknownAudio = TorrentRanker.qualityBreakdown(for: unknown).audio
+        let stereoAudio = TorrentRanker.qualityBreakdown(for: stereo).audio
+
+        #expect(unknownAudio.bitrateKbps == 192)
+        #expect(unknownAudio.channelBaseScore == 60)
+        #expect(unknownAudio.effectiveChannelCount == 2)
+        #expect(unknownAudio.density == stereoAudio.density)
+        #expect(unknownAudio.score == stereoAudio.score)
+    }
+
+    @Test func scoreNotesUseIntegratedAudioExperienceWithoutRawCodecOrSampleBumps() {
+        let ranked = TorrentRanker.score(TorrentSearchResult(
+            title: "Movie.2025.2160p.WEB-DL.DDP.7.1.Atmos.HEVC-GROUP",
+            detailSpecs: TorrentDetailSpecs(
+                videoBitrate: "80 Mb/s",
+                frameRate: "23.976 FPS",
+                bestEnglishAudioBitrate: "2.0 Mb/s"
+            ),
+            magnet: nil,
+            detailURL: nil,
+            seeders: 10,
+            leechers: 2,
+            provider: "A"
+        ))
+
+        #expect(ranked.notes.contains { $0.contains("Picture quality") && $0.contains("+571") })
+        #expect(ranked.notes.contains { $0.contains("Audio experience") && $0.contains("+421") })
+        #expect(!ranked.notes.contains { $0.contains("Audio codec quality") || $0.contains("Object audio") || $0.contains("Sample rate") })
+    }
+
+    @Test func audioOrderingMatchesFinalModelAtEqualLowDensity() {
+        let fiveOneAt24 = audioBreakdown("Movie.2025.1080p.WEB-DL.DDP.5.1.x264-GROUP", bitrate: "84 kb/s")
+        let sevenOneAt24 = audioBreakdown("Movie.2025.1080p.WEB-DL.DDP.7.1.x264-GROUP", bitrate: "116 kb/s")
+        let fiveOneAtmosAt24 = audioBreakdown("Movie.2025.1080p.WEB-DL.DDP.5.1.Atmos.x264-GROUP", bitrate: "84 kb/s")
+        let sevenOneAtmosAt24 = audioBreakdown("Movie.2025.1080p.WEB-DL.DDP.7.1.Atmos.x264-GROUP", bitrate: "116 kb/s")
+
+        #expect(fiveOneAtmosAt24.atmosBonusScore > 0)
+        #expect(fiveOneAtmosAt24.atmosBonusScore < 1)
+        #expect(sevenOneAtmosAt24.score > fiveOneAtmosAt24.score)
+        #expect(sevenOneAt24.score > fiveOneAt24.score)
+    }
+
+    @Test func audioDensityCurveDrivesFinalizedLayoutCrossovers() {
+        let stereoAt96 = audioBreakdown("Movie.2025.1080p.WEB-DL.AC3.2.0.x264-GROUP", bitrate: "192 kb/s")
+        let surroundAtSameTotal = [
+            audioBreakdown("Movie.2025.1080p.WEB-DL.DDP.5.1.x264-GROUP", bitrate: "128 kb/s"),
+            audioBreakdown("Movie.2025.1080p.WEB-DL.DDP.7.1.x264-GROUP", bitrate: "128 kb/s"),
+            audioBreakdown("Movie.2025.1080p.WEB-DL.DDP.5.1.Atmos.x264-GROUP", bitrate: "128 kb/s"),
+            audioBreakdown("Movie.2025.1080p.WEB-DL.DDP.7.1.Atmos.x264-GROUP", bitrate: "128 kb/s")
+        ]
+        #expect(surroundAtSameTotal.contains { $0.score < stereoAt96.score })
+        #expect(surroundAtSameTotal.contains { $0.score > stereoAt96.score })
+
+        let regularFiveBelow = audioBreakdown("Movie.2025.1080p.WEB-DL.DDP.5.1.x264-GROUP", bitrate: "416 kb/s")
+        let regularSevenBelow = audioBreakdown("Movie.2025.1080p.WEB-DL.DDP.7.1.x264-GROUP", bitrate: "381 kb/s")
+        let regularFiveAtCrossover = audioBreakdown("Movie.2025.1080p.WEB-DL.DDP.5.1.x264-GROUP", bitrate: "422 kb/s")
+        let regularSevenAtCrossover = audioBreakdown("Movie.2025.1080p.WEB-DL.DDP.7.1.x264-GROUP", bitrate: "387 kb/s")
+        let regularFiveAbove = audioBreakdown("Movie.2025.1080p.WEB-DL.DDP.5.1.x264-GROUP", bitrate: "429 kb/s")
+        let regularSevenAbove = audioBreakdown("Movie.2025.1080p.WEB-DL.DDP.7.1.x264-GROUP", bitrate: "392 kb/s")
+        #expect(regularFiveBelow.score > regularSevenBelow.score)
+        #expect(abs(regularFiveAtCrossover.score - regularSevenAtCrossover.score) < 1)
+        #expect(regularSevenAbove.score > regularFiveAbove.score)
+
+        // These DDP bitrates bracket the 812 kbps AC3-equivalent Atmos crossover.
+        let atmosFiveBelow = audioBreakdown("Movie.2025.1080p.WEB-DL.DDP.5.1.Atmos.x264-GROUP", bitrate: "517 kb/s")
+        let atmosSevenBelow = audioBreakdown("Movie.2025.1080p.WEB-DL.DDP.7.1.Atmos.x264-GROUP", bitrate: "466 kb/s")
+        let atmosFiveAbove = audioBreakdown("Movie.2025.1080p.WEB-DL.DDP.5.1.Atmos.x264-GROUP", bitrate: "529 kb/s")
+        let atmosSevenAbove = audioBreakdown("Movie.2025.1080p.WEB-DL.DDP.7.1.Atmos.x264-GROUP", bitrate: "476 kb/s")
+        let atmosSevenAtCrossover = audioBreakdown("Movie.2025.1080p.WEB-DL.DDP.7.1.Atmos.x264-GROUP", bitrate: "471 kb/s")
+        #expect(atmosFiveBelow.score > atmosSevenBelow.score)
+        #expect(atmosSevenAbove.score > atmosFiveAbove.score)
+        #expect(atmosSevenAtCrossover.atmosReliefScore > 11.39)
+        #expect(atmosSevenAtCrossover.atmosReliefScore <= 11.4)
+    }
+
+    @Test func lossySurroundDensityBonusApproachesThirteenPoints() {
+        let fiveOne = audioBreakdown("Movie.2025.1080p.WEB-DL.AC3.5.1.x264-GROUP", bitrate: "5 Mb/s")
+        let sevenOne = audioBreakdown("Movie.2025.1080p.WEB-DL.AC3.7.1.x264-GROUP", bitrate: "5 Mb/s")
+
+        #expect(fiveOne.densityAdjustmentScore > 12.99)
+        #expect(fiveOne.densityAdjustmentScore < 13)
+        #expect(sevenOne.densityAdjustmentScore > 12.99)
+        #expect(sevenOne.densityAdjustmentScore < 13)
+    }
+
+    @Test func losslessAudioUsesCompressedLayoutSpecificBonuses() {
+        let mono = audioBreakdown("Movie.2025.1080p.BluRay.PCM.1.0.x264-GROUP", bitrate: "1 Mb/s")
+        let stereo = audioBreakdown("Movie.2025.1080p.BluRay.TrueHD.2.0.x264-GROUP", bitrate: "2 Mb/s")
+        let fiveOne = audioBreakdown("Movie.2025.1080p.BluRay.TrueHD.5.1.x264-GROUP", bitrate: "4 Mb/s")
+        let sevenOne = audioBreakdown("Movie.2025.1080p.BluRay.TrueHD.7.1.x264-GROUP", bitrate: "5 Mb/s")
+
+        #expect(mono.channels == .mono)
+        #expect(mono.density == nil)
+        #expect(mono.score == 15)
+        #expect(stereo.score == 69)
+        #expect(fiveOne.score == 318)
+        #expect(sevenOne.score == 363)
+    }
+
+    @Test func titleDVProfile7ReceivesAppleTVPenalty() {
+        let ranked = TorrentRanker.score(TorrentSearchResult(
+            title: "Movie.2025.2160p.WEB-DL.DV.P7.DDP5.1.HEVC-GROUP",
+            detailSpecs: TorrentDetailSpecs(videoBitrate: "20 Mb/s"),
+            magnet: nil,
+            detailURL: nil,
+            seeders: 10,
+            leechers: 2,
+            provider: "A"
+        ))
+
+        #expect(ranked.parsed.dynamicRange == .dolbyVision)
+        #expect(ranked.notes.contains { $0.contains("Dolby Vision profile") && $0.contains("-6") && $0.contains("Profile 7") })
     }
 
     @Test func rankerExcludesExplicitNonEnglishOnlyAudioTracks() {
@@ -2066,6 +2724,34 @@ struct Torrent_MatchTests {
         let ranked = TorrentRanker.score(h264HDR)
         #expect(ranked.parsed.dynamicRange == .hdr)
         #expect(ranked.notes.contains { $0.contains("Dynamic range") && $0.contains("+0") && $0.contains("sdr") })
+    }
+
+    @Test func dynamicRangeUsesRescaledFiftyPointHDRScale() {
+        let expectations: [(token: String, label: String, score: Int)] = [
+            ("DV", "dolby_vision", 50),
+            ("HDR10+", "hdr10plus", 46),
+            ("HDR10", "hdr10", 43),
+            ("HDR", "hdr", 33),
+            ("UHD", "likely_hdr", 26),
+            ("SDR", "sdr", 0)
+        ]
+
+        for expectation in expectations {
+            let ranked = TorrentRanker.score(TorrentSearchResult(
+                title: "Movie.2025.2160p.WEB-DL.\(expectation.token).HEVC.DDP5.1-GROUP",
+                magnet: nil,
+                detailURL: nil,
+                seeders: 10,
+                leechers: 2,
+                provider: "A"
+            ))
+
+            #expect(ranked.notes.contains {
+                $0.contains("Dynamic range") &&
+                    $0.contains("+\(expectation.score)") &&
+                    $0.contains(expectation.label)
+            })
+        }
     }
 
     @Test func webHDRDoesNotInferUHDBluraySource() {
@@ -2165,6 +2851,33 @@ struct Torrent_MatchTests {
         #expect(ranked.notes.contains { $0.contains("Source context") && $0.contains("+18") })
     }
 
+    private func audioBreakdown(
+        _ title: String,
+        bitrate: String,
+        sampleRate: String? = nil
+    ) -> AudioQualityBreakdown {
+        TorrentRanker.qualityBreakdown(for: TorrentSearchResult(
+            title: title,
+            detailSpecs: TorrentDetailSpecs(
+                bestEnglishAudioBitrate: bitrate,
+                bestEnglishAudioSampleRate: sampleRate
+            ),
+            magnet: nil,
+            detailURL: nil,
+            seeders: 10,
+            leechers: 2,
+            provider: "A"
+        )).audio
+    }
+
+}
+
+private actor ProgressBatchRecorder {
+    private(set) var batchSizes: [Int] = []
+
+    func record(_ results: [TorrentSearchResult]) {
+        batchSizes.append(results.count)
+    }
 }
 
 private struct MockTorrentProvider: TorrentProvider {

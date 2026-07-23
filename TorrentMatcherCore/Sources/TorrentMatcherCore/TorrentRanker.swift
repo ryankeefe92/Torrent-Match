@@ -1,33 +1,7 @@
 import Foundation
 
-public struct RankerWeights: Codable, Hashable, Sendable {
-    public var source: [SourceType: Int]
-    public var resolution: [Resolution: Int]
-    public var dynamicRange: [DynamicRange: Int]
-    public var audioCodec: [AudioCodec: Int]
-    public var channels: [ChannelLayout: Int]
-    public var videoCodec: [VideoCodec: Int]
-    public var ddpAtmosBonus: Int
-    public var trueHDAtmosBonus: Int
-    public var topTierUHDRemuxBonus: Int
-    public var imaxBonus: Int
-
-    public static let appleTVDefault = RankerWeights(
-        source: [.remux: 90, .bluray: 68, .webdl: 42, .webrip: 22, .dvd: 16, .hdtv: 14, .cam: 7, .unknown: 22],
-        resolution: [.p2160: 100, .p1080: 85, .likely1080: 80, .p720: 50, .sd: 30, .unknown: 10],
-        dynamicRange: [.dolbyVision: 21, .hdr10plus: 19, .hdr10: 16, .hdr: 12, .likelyHDR: 10, .unknown: 8, .sdr: 8],
-        audioCodec: [.truehd: 42, .dtsHDMA: 42, .dtsHDHRA: 36, .pcm: 42, .ddp: 35, .dts: 30, .dd: 21, .aac: 12, .unknown: 12],
-        channels: [.sevenOne: 32, .fiveOne: 24, .twoZero: 5, .mono: 0, .unknown: 4],
-        videoCodec: [.hevc: 16, .avc: 8, .vc1: -30, .mpeg2: -25, .unknown: 0],
-        ddpAtmosBonus: 9,
-        trueHDAtmosBonus: 0,
-        topTierUHDRemuxBonus: 100,
-        imaxBonus: 13
-    )
-}
-
 public enum TorrentRanker {
-    private static let maxRawScore = 955.0
+    private static let maxRawScore = 1_132.0
     private static let seedTieThreshold = 5
 
     public static func qualityBreakdown(for result: TorrentSearchResult) -> QualityScoreBreakdown {
@@ -37,7 +11,7 @@ public enum TorrentRanker {
         return qualityBreakdown(for: result, parsed: parsed)
     }
 
-    public static func score(_ result: TorrentSearchResult, weights: RankerWeights = .appleTVDefault) -> RankedTorrentResult {
+    public static func score(_ result: TorrentSearchResult) -> RankedTorrentResult {
         let titleParsed = ReleaseParser.parse(result.title)
         let detailParsed = result.detailSpecs?.releaseHintText.map { ReleaseParser.parse($0) }
         let parsed = titleParsed.mergedWithDetail(parsed: detailParsed, specs: result.detailSpecs)
@@ -126,13 +100,13 @@ public enum TorrentRanker {
         add(
             "Picture quality",
             pictureScore,
-            detail: "\(video.width)x\(video.height), \(video.bitrateKbps) kb/s \(video.bitrateSourceLabel), health \(formatMultiplier(video.compressionHealth))"
+            detail: "\(video.width)x\(video.height),  \(video.bitrateKbps) kb/s \(video.bitrateSourceLabel), density \(formatMultiplier(video.densityRatio)), health \(formatMultiplier(video.compressionHealth))"
         )
 
         let effectiveDynamicRange = dynamicRangeForScoring(parsed: parsed)
         add("Dynamic range", dynamicRangeScore(effectiveDynamicRange), detail: effectiveDynamicRange.rawValue)
-        if let dvPenalty = dolbyVisionProfilePenalty(result.detailSpecs), dvPenalty != 0 {
-            add("Dolby Vision profile", Double(dvPenalty), detail: result.detailSpecs?.dolbyVisionProfile)
+        if let dvProfile = dolbyVisionProfileText(result), let dvPenalty = dolbyVisionProfilePenalty(dvProfile), dvPenalty != 0 {
+            add("Dolby Vision profile", Double(dvPenalty), detail: dvProfile)
         }
 
         add("Bit depth", Double(bitDepthScore(result: result)), detail: result.detailSpecs?.bitDepth)
@@ -144,15 +118,25 @@ public enum TorrentRanker {
 
         add("Encode/remux signal", Double(encodeRemuxScore(parsed: parsed, specs: result.detailSpecs)), detail: encodeRemuxDetail(parsed: parsed, specs: result.detailSpecs))
 
-        let audioExperience = channelPotential(parsed.channels) * audio.compressionHealth
-        add("Audio channel experience", audioExperience, detail: "\(parsed.channels.rawValue), health \(formatMultiplier(audio.compressionHealth))")
-        add("Audio codec quality", Double(audioCodecQualityScore(parsed.audioCodec)), detail: parsed.audioCodec.rawValue)
-        if parsed.audioCodec == .ddp && parsed.atmos {
-            add("Object audio", 30, detail: "DDP Atmos")
-        } else {
-            add("Object audio", 0, detail: parsed.atmos ? "not Apple TV-usable object audio" : nil)
+        var audioDetails = [parsed.channels.rawValue, audioCodecLabel(parsed.audioCodec)]
+        if let bitrate = audio.bitrateKbps {
+            audioDetails.append("\(bitrate) kb/s \(audio.bitrateSourceLabel ?? "")".trimmingCharacters(in: .whitespaces))
         }
-        add("Sample rate", Double(sampleRateScore(result.detailSpecs?.bestEnglishAudioSampleRate)), detail: result.detailSpecs?.bestEnglishAudioSampleRate)
+        if let density = audio.density {
+            audioDetails.append("density \(formatMultiplier(density)) kb/ch")
+            audioDetails.append("health \(formatMultiplier(audio.compressionHealth))")
+        } else if audio.isLossless {
+            audioDetails.append("lossless")
+        }
+        audioDetails.append("layout \(Int(audio.channelBaseScore.rounded()))")
+        audioDetails.append("density \(formatSignedScore(audio.densityAdjustmentScore))")
+        if audio.atmosBonusScore > 0 {
+            audioDetails.append("Atmos \(formatSignedScore(audio.atmosBonusScore))")
+        }
+        if audio.atmosReliefScore > 0.05 {
+            audioDetails.append("7.1 relief \(formatSignedScore(audio.atmosReliefScore))")
+        }
+        add("Audio experience", audio.score, detail: audioDetails.joined(separator: ", "))
 
         add("Source context", Double(sourceContextScore(parsed, specs: result.detailSpecs)), detail: parsed.sourceType.rawValue)
         add("Low-quality source penalty", Double(lowQualitySourcePenalty(in: upperTitle)), detail: lowQualitySourceLabel(in: upperTitle))
@@ -165,8 +149,8 @@ public enum TorrentRanker {
         return RankedTorrentResult(raw: result, parsed: parsed, score: displayScore, notes: notes, excluded: false)
     }
 
-    public static func rank(_ results: [TorrentSearchResult], hideExcluded: Bool = true, weights: RankerWeights = .appleTVDefault) -> [RankedTorrentResult] {
-        var ranked = results.map { score($0, weights: weights) }
+    public static func rank(_ results: [TorrentSearchResult], hideExcluded: Bool = true) -> [RankedTorrentResult] {
+        var ranked = results.map { score($0) }
         if hideExcluded {
             ranked.removeAll { $0.excluded }
         }
@@ -196,12 +180,73 @@ private extension TorrentRanker {
         let kbps: Int
         let estimated: Bool
         let label: String
+        let usedEstimatedAudio: Bool
     }
 
     struct AudioBitrateSource {
         let kbps: Int?
         let estimated: Bool
         let label: String?
+    }
+
+    struct AudioScoreComponents {
+        let channelBase: Double
+        let densityAdjustment: Double
+        let atmosBonus: Double
+        let atmosRelief: Double
+        let compressionHealth: Double
+        let score: Double
+        let isLossless: Bool
+    }
+
+    enum AudioCurve {
+        static let transparentDensity = 160.0
+        static let densityReferenceBase = 300.0
+        static let lossyDensityBonusMaximum = 13.0
+        static let lossyDensityBonusScale = 84.5
+        static let collapseDensity = 32.0
+        static let acceptableDensity = 64.0
+        static let collapseHealth = 0.09
+        static let acceptableHealth = 0.62
+        static let collapseSlope = 0.01175
+        static let collapseCurvature = 0.001475
+        static let fullHealthSlope = (lossyDensityBonusMaximum / lossyDensityBonusScale) / densityReferenceBase
+        static let tailWidth = transparentDensity - acceptableDensity
+        static let tailLinearWeight = tailWidth * fullHealthSlope
+        static let tailQuadraticWeight = 1 - acceptableHealth - tailLinearWeight
+        static let acceptableSlope = (2 * tailQuadraticWeight + tailLinearWeight) / tailWidth
+        static let acceptableCurvature = -2 * tailQuadraticWeight / (tailWidth * tailWidth)
+
+        static let surroundDensityFloor = -300.0
+        static let surroundCollapsePower = 6.873467331845618
+        static let surroundAnchorDensities = [32.0, 64.0, 96.0, 112.0, 132.57142857142858, 160.0]
+        static let surroundAnchorAdjustments = [
+            -272.06649995840667,
+            -128.06649995840667,
+            -54.65274725274725,
+            -30.29262930428054,
+            -9.652747252747249,
+            0.0
+        ]
+        static let surroundAnchorSlopes = [
+            6.0,
+            3.0,
+            1.5883595441037144,
+            1.4566551994546242,
+            0.55,
+            lossyDensityBonusMaximum / lossyDensityBonusScale
+        ]
+
+        static let atmosGateStart = 32.0
+        static let atmosGateFull = 96.0
+        static let atmosGateAtCollapse = 0.005
+        static let atmosCrossoverDensity = 112.0
+        static let reliefMaximum = 11.4
+        static let reliefEndDensity = transparentDensity
+        static let reliefTailStartScore = 389.10737069571945
+        static let reliefTailStartSlope = 1.4566551994546242
+        static let reliefTailEndSlope = lossyDensityBonusMaximum / lossyDensityBonusScale
+        static let reliefTailPower = 4.4340249000173335
     }
 
     struct VideoDimensions {
@@ -216,18 +261,28 @@ private extension TorrentRanker {
 
     static func qualityBreakdown(for result: TorrentSearchResult, parsed: ParsedRelease) -> QualityScoreBreakdown {
         let dimensions = videoDimensions(parsed: parsed, specs: result.detailSpecs)
-        let frameRate = frameRate(from: result.detailSpecs) ?? 23.976
+        let frameRate = frameRate(from: result.detailSpecs) ?? 24
         let bitrateSource = videoBitrateKbps(result: result, parsed: parsed)
-        let codecFactor = videoCodecFactor(parsed.videoCodec)
+        let codecFactor = videoCodecFactor(parsed.videoCodec, width: dimensions.width, height: dimensions.height)
         let adjustedBPPPF = Double(bitrateSource.kbps) * 1_000 * codecFactor / Double(max(dimensions.width, 1)) / Double(max(dimensions.height, 1)) / frameRate
-        let compressionHealth = videoCompressionHealth(adjustedBPPPF)
+        let targetBPPPF = videoTargetBPPPF(width: dimensions.width, height: dimensions.height)
+        let densityRatio = adjustedBPPPF / targetBPPPF
+        let compressionHealth = videoCompressionHealth(densityRatio)
 
         let audioBitrateSource = audioBitrateKbps(result: result, parsed: parsed, videoBitrate: bitrateSource)
         let audioBitrate = audioBitrateSource.kbps
-        let audioCodecFactor = audioCodecDensityFactor(parsed.audioCodec)
         let effectiveChannels = effectiveChannelCount(parsed.channels)
-        let audioDensity = audioBitrate.map { Double($0) * audioCodecFactor / effectiveChannels }
-        let audioHealth = audioCompressionHealth(codec: parsed.audioCodec, bitrateKbps: audioBitrate, channels: parsed.channels)
+        let audioCodecFactor = audioCodecDensityFactor(
+            parsed.audioCodec,
+            rawBitrateKbpsPerEffectiveChannel: audioBitrate.map { Double($0) / effectiveChannels }
+        )
+        let audioDensity = audioDensity(codec: parsed.audioCodec, bitrateKbps: audioBitrate, channels: parsed.channels)
+        let audioScore = audioScoreComponents(
+            codec: parsed.audioCodec,
+            bitrateKbps: audioBitrate,
+            channels: parsed.channels,
+            atmos: parsed.atmos
+        )
 
         return QualityScoreBreakdown(
             parsed: parsed,
@@ -241,6 +296,8 @@ private extension TorrentRanker {
                 height: dimensions.height,
                 frameRate: frameRate,
                 adjustedBPPPF: adjustedBPPPF,
+                targetBPPPF: targetBPPPF,
+                densityRatio: densityRatio,
                 compressionHealth: compressionHealth
             ),
             audio: AudioQualityBreakdown(
@@ -252,7 +309,13 @@ private extension TorrentRanker {
                 channels: parsed.channels,
                 effectiveChannelCount: effectiveChannels,
                 density: audioDensity,
-                compressionHealth: audioHealth
+                compressionHealth: audioScore.compressionHealth,
+                channelBaseScore: audioScore.channelBase,
+                densityAdjustmentScore: audioScore.densityAdjustment,
+                atmosBonusScore: audioScore.atmosBonus,
+                atmosReliefScore: audioScore.atmosRelief,
+                score: audioScore.score,
+                isLossless: audioScore.isLossless
             )
         )
     }
@@ -265,27 +328,27 @@ private extension TorrentRanker {
     static func videoBitrateKbps(result: TorrentSearchResult, parsed: ParsedRelease) -> VideoBitrateSource {
         if let videoBitrate = bitrateKbps(result.detailSpecs?.videoBitrate) {
             let isCalculated = result.detailSpecs?.isCalculated("videoBitrate") == true
-            return VideoBitrateSource(kbps: videoBitrate, estimated: false, label: isCalculated ? "derived" : "explicit")
+            return VideoBitrateSource(kbps: videoBitrate, estimated: false, label: isCalculated ? "derived" : "explicit", usedEstimatedAudio: false)
         }
         if let calculated = bitrateKbps(result.detailSpecs?.calculatedVideoBitrate) {
-            return VideoBitrateSource(kbps: calculated, estimated: false, label: "derived")
+            return VideoBitrateSource(kbps: calculated, estimated: false, label: "derived", usedEstimatedAudio: false)
         }
         if let derived = derivedVideoBitrateFromSizeRuntimeAndAudio(result: result, parsed: parsed) {
-            let label = derived.usedEstimatedAudio ? "derived from size/runtime + estimated audio" : "derived from size/runtime"
-            return VideoBitrateSource(kbps: derived.kbps, estimated: false, label: label)
+            return VideoBitrateSource(kbps: derived.kbps, estimated: false, label: "calculated from size ÷ runtime - audio", usedEstimatedAudio: derived.usedEstimatedAudio)
         }
         let estimated = estimatedVideoBitrateKbps(result: result, parsed: parsed)
-        return VideoBitrateSource(kbps: estimated, estimated: true, label: "estimated")
+        return VideoBitrateSource(kbps: estimated.kbps, estimated: true, label: estimated.label, usedEstimatedAudio: false)
     }
 
     static func derivedVideoBitrateFromSizeRuntimeAndAudio(result: TorrentSearchResult, parsed: ParsedRelease) -> (kbps: Int, usedEstimatedAudio: Bool)? {
         guard let overall = overallBitrateKbps(result: result),
               let audio = audioBitrateForVideoDerivation(result: result, parsed: parsed),
+              audio.kbps > 0,
               overall > audio.kbps else { return nil }
         return (overall - audio.kbps, audio.estimated)
     }
 
-    static func estimatedVideoBitrateKbps(result: TorrentSearchResult, parsed: ParsedRelease) -> Int {
+    static func estimatedVideoBitrateKbps(result: TorrentSearchResult, parsed: ParsedRelease) -> (kbps: Int, label: String) {
         let sourceEstimate: Int
         switch (parsed.resolution, parsed.sourceType) {
         case (.p2160, .remux): sourceEstimate = 55_000
@@ -307,10 +370,10 @@ private extension TorrentRanker {
         case (.unknown, _): sourceEstimate = 5_000
         }
         guard let overall = overallBitrateKbps(result: result) else {
-            return sourceEstimate
+            return (sourceEstimate, "estimated")
         }
         let share = result.title.containsStandaloneMultiToken ? 0.80 : 0.90
-        return min(sourceEstimate, max(1, Int(Double(overall) * share)))
+        return (max(1, Int(Double(overall) * share)), "estimated from overall bitrate")
     }
 
     static func videoDimensions(parsed: ParsedRelease, specs: TorrentDetailSpecs?) -> VideoDimensions {
@@ -332,40 +395,44 @@ private extension TorrentRanker {
 
     static func resolutionPotential(parsed: ParsedRelease, specs: TorrentDetailSpecs?, width: Int, height: Int) -> Double {
         let hasExactDimensions = specs?.resolutionWidth != nil && specs?.resolutionHeight != nil
-        if width >= 3_000 || height >= 1_600 { return 560 }
-        if width >= 1_600 || height >= 900 { return 430 }
-        if width >= 1_200 || height >= 650 { return 280 }
-        if hasExactDimensions { return 150 }
-        if parsed.resolution == .p2160 { return 560 }
-        if parsed.resolution == .p1080 || parsed.resolution == .likely1080 { return 430 }
-        if parsed.resolution == .p720 { return 280 }
+        if width >= 3_000 || height >= 1_600 { return 510 }
+        if width >= 1_600 || height >= 900 { return 440 }
+        if width >= 1_200 || height >= 650 { return 375 }
+        if width >= 700 || height >= 430 { return 272 }
+        if width <= 640 || height <= 360 { return 0 }
+        if hasExactDimensions { return 35 }
+        if parsed.resolution == .p2160 { return 510 }
+        if parsed.resolution == .p1080 || parsed.resolution == .likely1080 { return 440 }
+        if parsed.resolution == .p720 { return 375 }
         if parsed.resolution == .unknown { return 200 }
-        return 150
+        return 35
     }
 
-    static func videoCodecFactor(_ codec: VideoCodec) -> Double {
+    static func videoTargetBPPPF(width: Int, height: Int) -> Double {
+        if width >= 3_000 || height >= 1_600 { return 0.22 }
+        if width >= 1_600 || height >= 900 { return 0.32 }
+        if width >= 1_200 || height >= 650 { return 0.45 }
+        return 0.65
+    }
+
+    static func videoCodecFactor(_ codec: VideoCodec, width: Int, height: Int) -> Double {
         switch codec {
         case .mpeg2: return 0.55
         case .vc1: return 0.75
         case .avc, .unknown: return 1.0
-        case .hevc: return 1.65
+        case .hevc:
+            if width >= 3_000 || height >= 1_600 { return 1.75 }
+            if width >= 1_600 || height >= 900 { return 1.50 }
+            if width >= 1_200 || height >= 650 { return 1.35 }
+            return 1.25
         case .av1: return 1.0
         }
     }
 
-    static func videoCompressionHealth(_ adjustedBPPPF: Double) -> Double {
-        piecewiseMultiplier(
-            adjustedBPPPF,
-            points: [
-                (0.025, 0.35),
-                (0.075, 0.58),
-                (0.150, 0.80),
-                (0.280, 0.90),
-                (0.500, 0.96),
-                (0.750, 0.98),
-                (1.000, 1.00)
-            ]
-        )
+    static func videoCompressionHealth(_ densityRatio: Double) -> Double {
+        let cap = 1.12
+        let curveK = -log(1 - 1 / cap)
+        return cap * (1 - exp(-curveK * max(densityRatio, 0)))
     }
 
     static func dynamicRangeForScoring(parsed: ParsedRelease) -> DynamicRange {
@@ -384,19 +451,46 @@ private extension TorrentRanker {
         switch dynamicRange {
         case .dolbyVision: return 50
         case .hdr10plus: return 46
-        case .hdr10: return 44
-        case .hdr: return 32
-        case .likelyHDR: return 25
+        case .hdr10: return 43
+        case .hdr: return 33
+        case .likelyHDR: return 26
         case .unknown, .sdr: return 0
         }
     }
 
-    static func dolbyVisionProfilePenalty(_ specs: TorrentDetailSpecs?) -> Int? {
-        guard let profile = specs?.dolbyVisionProfile?.uppercased() else { return nil }
-        if profile.range(of: #"PROFILE\s*7|PROFILE\s*07|DVH[EI][\._-]?07"#, options: .regularExpression) != nil {
+    static func dolbyVisionProfileText(_ result: TorrentSearchResult) -> String? {
+        if let profile = result.detailSpecs?.dolbyVisionProfile?.nonEmptyString {
+            return profile
+        }
+        let text = [result.title, result.detailSpecs?.releaseHintText]
+            .compactMap { $0 }
+            .joined(separator: " ")
+        return dolbyVisionProfileFromText(text)
+    }
+
+    static func dolbyVisionProfilePenalty(_ rawProfile: String?) -> Int? {
+        guard let profile = rawProfile?.uppercased() else { return nil }
+        if profile.range(of: #"PROFILE\s*7|PROFILE\s*07|DVH[EI][\._-]?07|DV[\._-]?P7"#, options: .regularExpression) != nil {
             return -6
         }
         return 0
+    }
+
+    static func dolbyVisionProfileFromText(_ text: String) -> String? {
+        guard text.range(of: #"(?i)\b(?:dolby vision|dovi|dvhe|dvh1|DV[\._-]?P[0-9]+)\b"#, options: .regularExpression) != nil else {
+            return nil
+        }
+        if let profile = firstRegexCapture(#"(?i)\bDV[\._-]?P([0-9]+)\b"#, in: text) {
+            return "Profile \(profile)"
+        }
+        if let dvhe = firstRegexCapture(#"(?i)\b(?:dvhe|dvh1)[\._-]?(\d{2})\b"#, in: text) {
+            let numeric = String(Int(dvhe) ?? 0)
+            return "Profile \(numeric) (\(dvhe))"
+        }
+        if let profile = firstRegexCapture(#"(?i)\bprofile\s*([0-9]+)\b"#, in: text) {
+            return "Profile \(profile)"
+        }
+        return "Dolby Vision"
     }
 
     static func bitDepthScore(result: TorrentSearchResult) -> Int {
@@ -452,7 +546,7 @@ private extension TorrentRanker {
             let isCalculated = result.detailSpecs?.isCalculated("bestEnglishAudioBitrate") == true
             return AudioBitrateSource(kbps: bitrate, estimated: false, label: isCalculated ? "derived" : "explicit")
         }
-        if videoBitrate.label.contains("estimated audio"),
+        if videoBitrate.usedEstimatedAudio,
            let estimated = estimatedAudioBitrateKbps(parsed: parsed) {
             return AudioBitrateSource(kbps: estimated, estimated: true, label: "estimated")
         }
@@ -469,7 +563,9 @@ private extension TorrentRanker {
         if let total = totalAudioBitrateKbps(specs: result.detailSpecs) {
             return (total, false)
         }
-        if let estimated = estimatedAudioBitrateKbps(parsed: parsed) {
+        if parsed.audioCodec != .unknown,
+           parsed.channels != .unknown,
+           let estimated = estimatedAudioBitrateKbps(parsed: parsed) {
             return (estimated, true)
         }
         return nil
@@ -507,78 +603,364 @@ private extension TorrentRanker {
         case (.aac, .fiveOne), (.aac, .sevenOne): return 384
         case (.aac, .twoZero): return 192
         case (.aac, .mono): return 96
+        case (.heAAC, .fiveOne), (.heAAC, .sevenOne): return 256
+        case (.heAAC, .twoZero): return 128
+        case (.heAAC, .mono): return 64
+        case (.opus, .fiveOne), (.opus, .sevenOne): return 384
+        case (.opus, .twoZero): return 160
+        case (.opus, .mono): return 80
+        case (.mp3, .sevenOne), (.mp3, .fiveOne): return 320
+        case (.mp3, .twoZero): return 192
+        case (.mp3, .mono): return 96
         case (_, .twoZero): return 192
         case (_, .mono): return 96
         case (.unknown, .sevenOne): return 768
         case (.unknown, .fiveOne): return 384
-        case (_, .unknown): return nil
+        case (.unknown, .unknown): return 192
+        case (_, .unknown): return estimatedStereoAudioBitrateKbps(codec: parsed.audioCodec, atmos: parsed.atmos)
         }
     }
 
-    static func audioCompressionHealth(codec: AudioCodec, bitrateKbps: Int?, channels: ChannelLayout) -> Double {
-        guard let bitrateKbps else { return 0.65 }
-        let density = Double(bitrateKbps) * audioCodecDensityFactor(codec) / effectiveChannelCount(channels)
-        return piecewiseMultiplier(
-            density,
-            points: [
-                (32, 0.82),
-                (64, 0.87),
-                (96, 0.90),
-                (160, 0.94),
-                (240, 0.97),
-                (360, 0.99),
-                (500, 1.00)
-            ]
-        )
+    static func estimatedStereoAudioBitrateKbps(codec: AudioCodec, atmos: Bool) -> Int? {
+        switch codec {
+        case .truehd: return 3_000
+        case .dtsHDMA: return 2_500
+        case .pcm: return 1_536
+        case .dtsHDHRA: return 1_000
+        case .ddp: return 256
+        case .dts: return 768
+        case .dd: return 384
+        case .aac: return 192
+        case .heAAC: return 128
+        case .opus: return 160
+        case .mp3: return 192
+        case .unknown: return 192
+        }
     }
 
-    static func audioCodecDensityFactor(_ codec: AudioCodec) -> Double {
+    static func audioDensity(codec: AudioCodec, bitrateKbps: Int?, channels: ChannelLayout) -> Double? {
+        guard !codec.isLosslessForDensity else { return nil }
+        guard let bitrateKbps else { return nil }
+        let effectiveChannels = effectiveChannelCount(channels)
+        let rawBitratePerEffectiveChannel = Double(bitrateKbps) / effectiveChannels
+        return Double(bitrateKbps) * audioCodecDensityFactor(
+            codec,
+            rawBitrateKbpsPerEffectiveChannel: rawBitratePerEffectiveChannel
+        ) / effectiveChannels
+    }
+
+    static func audioCodecDensityFactor(
+        _ codec: AudioCodec,
+        rawBitrateKbpsPerEffectiveChannel: Double?
+    ) -> Double {
+        guard let rawBitrateKbpsPerEffectiveChannel else { return 1.0 }
+
+        let factors: [Double]
         switch codec {
-        case .dd: return 1.00
-        case .aac: return 1.10
-        case .dts: return 1.00
-        case .ddp: return 1.35
-        case .dtsHDHRA: return 1.10
+        case .dd: factors = [1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00, 1.00]
+        case .ddp: factors = [1.90, 1.75, 1.65, 1.55, 1.47, 1.40, 1.33, 1.28]
+        case .aac: factors = [1.60, 1.50, 1.45, 1.40, 1.36, 1.32, 1.28, 1.23]
+        case .heAAC: factors = [2.80, 2.50, 2.25, 2.05, 1.85, 1.70, 1.50, 1.35]
+        case .opus: factors = [2.20, 2.05, 1.90, 1.75, 1.62, 1.52, 1.42, 1.35]
+        case .mp3: factors = [0.70, 0.75, 0.78, 0.80, 0.82, 0.83, 0.84, 0.85]
+        case .dts: factors = [0.25, 0.27, 0.29, 0.30, 0.31, 0.31, 0.30, 0.30]
+        case .dtsHDHRA: factors = [0.40, 0.42, 0.44, 0.45, 0.46, 0.47, 0.47, 0.45]
         case .truehd, .dtsHDMA, .pcm, .unknown: return 1.0
+        }
+
+        let rowBitrates: [Double] = [40, 60, 80, 100, 125, 150, 200, 300]
+        if rawBitrateKbpsPerEffectiveChannel <= rowBitrates[0] { return factors[0] }
+        if rawBitrateKbpsPerEffectiveChannel >= rowBitrates[7] { return factors[7] }
+
+        for upperIndex in 1..<rowBitrates.count {
+            let upperBitrate = rowBitrates[upperIndex]
+            guard rawBitrateKbpsPerEffectiveChannel <= upperBitrate else { continue }
+            let lowerIndex = upperIndex - 1
+            let lowerBitrate = rowBitrates[lowerIndex]
+            let progress = (rawBitrateKbpsPerEffectiveChannel - lowerBitrate) / (upperBitrate - lowerBitrate)
+            return factors[lowerIndex] + (factors[upperIndex] - factors[lowerIndex]) * progress
+        }
+        return factors[7]
+    }
+
+    static func audioCodecLabel(_ codec: AudioCodec) -> String {
+        switch codec {
+        case .truehd: return "TrueHD"
+        case .dtsHDMA: return "DTS-HD MA"
+        case .dtsHDHRA: return "DTS-HD HRA"
+        case .pcm: return "PCM"
+        case .ddp: return "DDP"
+        case .dts: return "DTS"
+        case .dd: return "AC3"
+        case .aac: return "AAC-LC"
+        case .heAAC: return "HE-AAC"
+        case .opus: return "Opus"
+        case .mp3: return "MP3"
+        case .unknown: return "Unknown"
         }
     }
 
     static func channelPotential(_ channels: ChannelLayout) -> Double {
         switch channels {
-        case .sevenOne: return 205
-        case .fiveOne: return 160
-        case .twoZero, .unknown: return 40
-        case .mono: return 12
+        case .sevenOne: return 345
+        case .fiveOne: return 300
+        case .twoZero, .unknown: return 60
+        case .mono: return 10
         }
     }
 
     static func effectiveChannelCount(_ channels: ChannelLayout) -> Double {
         switch channels {
-        case .sevenOne: return 8
-        case .fiveOne: return 6
+        case .sevenOne: return 7.25
+        case .fiveOne: return 5.25
         case .twoZero, .unknown: return 2
         case .mono: return 1
         }
     }
 
-    static func audioCodecQualityScore(_ codec: AudioCodec) -> Int {
-        switch codec {
-        case .truehd: return 15
-        case .dtsHDMA, .pcm: return 14
-        case .dtsHDHRA: return 10
-        case .ddp: return 9
-        case .dts: return 7
-        case .dd: return 5
-        case .aac: return 3
-        case .unknown: return 2
+    static func audioScoreComponents(
+        codec: AudioCodec,
+        bitrateKbps: Int?,
+        channels: ChannelLayout,
+        atmos: Bool
+    ) -> AudioScoreComponents {
+        let channelBase = channelPotential(channels)
+        if codec.isLosslessForDensity {
+            let densityAdjustment = audioLosslessDensityBonus(channelBase: channelBase)
+            return AudioScoreComponents(
+                channelBase: channelBase,
+                densityAdjustment: densityAdjustment,
+                atmosBonus: 0,
+                atmosRelief: 0,
+                compressionHealth: 1,
+                score: channelBase + densityAdjustment,
+                isLossless: true
+            )
         }
+
+        let density = audioDensity(codec: codec, bitrateKbps: bitrateKbps, channels: channels) ?? AudioCurve.acceptableDensity
+        let bedScore = audioBedScore(channels: channels, density: density)
+        let usableAtmos = codec == .ddp && atmos && (channels == .fiveOne || channels == .sevenOne)
+        let atmosBonus = usableAtmos ? audioAtmosBonus(channels: channels, density: density) : 0
+        let atmosRelief = usableAtmos && channels == .sevenOne ? audioSevenOneAtmosRelief(density: density) : 0
+        return AudioScoreComponents(
+            channelBase: channelBase,
+            densityAdjustment: bedScore - channelBase,
+            atmosBonus: atmosBonus,
+            atmosRelief: atmosRelief,
+            compressionHealth: audioDensityHealth(density),
+            score: bedScore + atmosBonus + atmosRelief,
+            isLossless: false
+        )
     }
 
-    static func sampleRateScore(_ raw: String?) -> Int {
-        guard let value = Double(firstNumber(in: raw) ?? "") else { return 0 }
-        if value >= 96 { return 5 }
-        if value >= 48 { return 2 }
-        return 0
+    static func audioBedScore(channels: ChannelLayout, density: Double) -> Double {
+        let channelBase = channelPotential(channels)
+        guard channels == .fiveOne || channels == .sevenOne else {
+            return audioBaseWithDensity(channelBase: channelBase, density: density)
+        }
+
+        let additiveScore = max(0, channelBase + audioSurroundDensityAdjustment(density: density))
+        let multipliedScore = channelBase * audioDensityHealth(density)
+        let additiveBlend = audioSurroundAdditiveBlend(density: density)
+        return multipliedScore + (additiveScore - multipliedScore) * additiveBlend
+    }
+
+    static func audioSurroundAdditiveBlend(density: Double) -> Double {
+        if density <= AudioCurve.collapseDensity { return 0 }
+        if density >= AudioCurve.acceptableDensity { return 1 }
+        let progress = (density - AudioCurve.collapseDensity) /
+            (AudioCurve.acceptableDensity - AudioCurve.collapseDensity)
+        return quinticSmootherstep(progress)
+    }
+
+    static func audioSurroundDensityAdjustment(density: Double) -> Double {
+        if density <= 0 { return AudioCurve.surroundDensityFloor }
+
+        let firstDensity = AudioCurve.surroundAnchorDensities[0]
+        let firstAdjustment = AudioCurve.surroundAnchorAdjustments[0]
+        if density < firstDensity {
+            let progress = density / firstDensity
+            return AudioCurve.surroundDensityFloor +
+                (firstAdjustment - AudioCurve.surroundDensityFloor) *
+                pow(progress, AudioCurve.surroundCollapsePower)
+        }
+
+        if density <= AudioCurve.transparentDensity {
+            var interval = AudioCurve.surroundAnchorDensities.count - 2
+            for index in 0..<(AudioCurve.surroundAnchorDensities.count - 1) {
+                if density <= AudioCurve.surroundAnchorDensities[index + 1] {
+                    interval = index
+                    break
+                }
+            }
+
+            let startDensity = AudioCurve.surroundAnchorDensities[interval]
+            let endDensity = AudioCurve.surroundAnchorDensities[interval + 1]
+            let width = endDensity - startDensity
+            let progress = (density - startDensity) / width
+            let startSlope = AudioCurve.surroundAnchorSlopes[interval]
+            let endSlope = AudioCurve.surroundAnchorSlopes[interval + 1]
+            return AudioCurve.surroundAnchorAdjustments[interval] + width * (
+                startSlope * progress +
+                (endSlope - startSlope) * integratedCubicSmoothstep(progress)
+            )
+        }
+
+        return AudioCurve.lossyDensityBonusMaximum *
+            tanh((density - AudioCurve.transparentDensity) / AudioCurve.lossyDensityBonusScale)
+    }
+
+    static func audioBaseWithDensity(channelBase: Double, density: Double) -> Double {
+        max(0, channelBase + audioRawDensityAdjustment(channelBase: channelBase, density: density))
+    }
+
+    static func audioRawDensityAdjustment(channelBase: Double, density: Double) -> Double {
+        if density <= AudioCurve.transparentDensity {
+            let adjustmentScale = min(1, channelBase / AudioCurve.densityReferenceBase)
+            return adjustmentScale * AudioCurve.densityReferenceBase * (audioDensityHealth(density) - 1)
+        }
+        return audioDensityBonus(channelBase: channelBase, density: density)
+    }
+
+    static func audioDensityBonus(channelBase: Double, density: Double) -> Double {
+        guard density > AudioCurve.transparentDensity else { return 0 }
+        let profile: (maximum: Double, scale: Double)
+        if channelBase <= 10 {
+            profile = (2, 390)
+        } else if channelBase <= 60 {
+            profile = (4, 130)
+        } else {
+            profile = (AudioCurve.lossyDensityBonusMaximum, AudioCurve.lossyDensityBonusScale)
+        }
+        return profile.maximum * tanh((density - AudioCurve.transparentDensity) / profile.scale)
+    }
+
+    static func audioLosslessDensityBonus(channelBase: Double) -> Double {
+        if channelBase <= 10 { return 5 }
+        if channelBase <= 60 { return 9 }
+        return 18
+    }
+
+    static func audioDensityHealth(_ density: Double) -> Double {
+        if density <= 0 { return 0 }
+        if density >= AudioCurve.transparentDensity { return 1 }
+
+        if density <= AudioCurve.collapseDensity {
+            return quinticHermite(
+                progress: density / AudioCurve.collapseDensity,
+                width: AudioCurve.collapseDensity,
+                startValue: 0,
+                startSlope: 0,
+                startCurvature: 0,
+                endValue: AudioCurve.collapseHealth,
+                endSlope: AudioCurve.collapseSlope,
+                endCurvature: AudioCurve.collapseCurvature
+            )
+        }
+
+        if density <= AudioCurve.acceptableDensity {
+            let width = AudioCurve.acceptableDensity - AudioCurve.collapseDensity
+            return quinticHermite(
+                progress: (density - AudioCurve.collapseDensity) / width,
+                width: width,
+                startValue: AudioCurve.collapseHealth,
+                startSlope: AudioCurve.collapseSlope,
+                startCurvature: AudioCurve.collapseCurvature,
+                endValue: AudioCurve.acceptableHealth,
+                endSlope: AudioCurve.acceptableSlope,
+                endCurvature: AudioCurve.acceptableCurvature
+            )
+        }
+
+        let remaining = (AudioCurve.transparentDensity - density) / AudioCurve.tailWidth
+        return 1 - AudioCurve.tailQuadraticWeight * remaining * remaining - AudioCurve.tailLinearWeight * remaining
+    }
+
+    static func audioAtmosUsability(density: Double) -> Double {
+        if density <= 0 { return 0 }
+        if density <= AudioCurve.atmosGateStart {
+            return AudioCurve.atmosGateAtCollapse * quinticSmootherstep(density / AudioCurve.atmosGateStart)
+        }
+        let progress = min(
+            1,
+            max(0, (density - AudioCurve.atmosGateStart) / (AudioCurve.atmosGateFull - AudioCurve.atmosGateStart))
+        )
+        return AudioCurve.atmosGateAtCollapse +
+            (1 - AudioCurve.atmosGateAtCollapse) * quinticSmootherstep(progress)
+    }
+
+    static func audioAtmosBonus(channels: ChannelLayout, density: Double) -> Double {
+        let fullBonus: Double
+        switch channels {
+        case .fiveOne: fullBonus = 90
+        case .sevenOne: fullBonus = 63
+        case .mono, .twoZero, .unknown: return 0
+        }
+        return fullBonus * audioAtmosUsability(density: density)
+    }
+
+    static func audioSevenOneAtmosRelief(density: Double) -> Double {
+        guard density > 0, density < AudioCurve.reliefEndDensity else { return 0 }
+        let baseline = audioSevenOneAtmosScoreWithoutRelief(density: density)
+
+        if density <= AudioCurve.atmosCrossoverDensity {
+            let progress = density / AudioCurve.atmosCrossoverDensity
+            return AudioCurve.reliefMaximum * quinticSmootherstep(progress) *
+                audioAtmosUsability(density: density)
+        }
+
+        let width = AudioCurve.reliefEndDensity - AudioCurve.atmosCrossoverDensity
+        let progress = (density - AudioCurve.atmosCrossoverDensity) / width
+        let integratedSlope = AudioCurve.reliefTailEndSlope * progress +
+            (AudioCurve.reliefTailStartSlope - AudioCurve.reliefTailEndSlope) *
+            (1 - pow(1 - progress, AudioCurve.reliefTailPower + 1)) /
+            (AudioCurve.reliefTailPower + 1)
+        let targetScore = AudioCurve.reliefTailStartScore + width * integratedSlope
+        return max(0, targetScore - baseline)
+    }
+
+    static func audioSevenOneAtmosScoreWithoutRelief(density: Double) -> Double {
+        audioBedScore(channels: .sevenOne, density: density) +
+            audioAtmosBonus(channels: .sevenOne, density: density)
+    }
+
+    static func quinticSmootherstep(_ progress: Double) -> Double {
+        let progress2 = progress * progress
+        let progress3 = progress2 * progress
+        return progress3 * (10 - 15 * progress + 6 * progress2)
+    }
+
+    static func integratedCubicSmoothstep(_ progress: Double) -> Double {
+        pow(progress, 3) - 0.5 * pow(progress, 4)
+    }
+
+    static func quinticHermite(
+        progress: Double,
+        width: Double,
+        startValue: Double,
+        startSlope: Double,
+        startCurvature: Double,
+        endValue: Double,
+        endSlope: Double,
+        endCurvature: Double
+    ) -> Double {
+        let t2 = progress * progress
+        let t3 = t2 * progress
+        let t4 = t3 * progress
+        let t5 = t4 * progress
+        let h00 = 1 - 10 * t3 + 15 * t4 - 6 * t5
+        let h10 = progress - 6 * t3 + 8 * t4 - 3 * t5
+        let h20 = 0.5 * (t2 - 3 * t3 + 3 * t4 - t5)
+        let h01 = 10 * t3 - 15 * t4 + 6 * t5
+        let h11 = -4 * t3 + 7 * t4 - 3 * t5
+        let h21 = 0.5 * (t3 - 2 * t4 + t5)
+        return h00 * startValue +
+            h10 * width * startSlope +
+            h20 * width * width * startCurvature +
+            h01 * endValue +
+            h11 * width * endSlope +
+            h21 * width * width * endCurvature
     }
 
     static func sourceContextScore(_ parsed: ParsedRelease, specs: TorrentDetailSpecs? = nil) -> Int {
@@ -618,7 +1000,7 @@ private extension TorrentRanker {
     }
 
     static func lowQualitySourcePenalty(in upper: String) -> Int {
-        if upper.range(of: #"(^|[^A-Z0-9])(HDCAM|CAM)([^A-Z0-9]|$)"#, options: .regularExpression) != nil { return -150 }
+        if upper.range(of: #"(^|[^A-Z0-9])(HDCAM|CAM[\s._-]?RIP|CAM)([^A-Z0-9]|$)"#, options: .regularExpression) != nil { return -150 }
         if upper.range(of: #"(^|[^A-Z0-9])(TELESYNC|TS)([^A-Z0-9]|$)"#, options: .regularExpression) != nil { return -130 }
         if upper.range(of: #"(^|[^A-Z0-9])(TELECINE|TC)([^A-Z0-9]|$)"#, options: .regularExpression) != nil { return -100 }
         if upper.range(of: #"(^|[^A-Z0-9])(SCR|SCREENER)([^A-Z0-9]|$)"#, options: .regularExpression) != nil { return -60 }
@@ -781,22 +1163,12 @@ private extension TorrentRanker {
         }
     }
 
-    static func piecewiseMultiplier(_ value: Double, points: [(Double, Double)]) -> Double {
-        guard let first = points.first else { return 0 }
-        if value <= first.0 { return first.1 }
-        for index in 1..<points.count {
-            let previous = points[index - 1]
-            let current = points[index]
-            if value <= current.0 {
-                let progress = (value - previous.0) / (current.0 - previous.0)
-                return previous.1 + progress * (current.1 - previous.1)
-            }
-        }
-        return points.last?.1 ?? first.1
-    }
-
     static func formatMultiplier(_ value: Double) -> String {
         String(format: "%.2f", value)
+    }
+
+    static func formatSignedScore(_ value: Double) -> String {
+        String(format: "%+.1f", value)
     }
 }
 
@@ -814,6 +1186,17 @@ private extension String {
 
     var containsStandaloneMultiToken: Bool {
         range(of: #"(^|[^A-Za-z0-9])multi([^A-Za-z0-9]|$)"#, options: [.regularExpression, .caseInsensitive]) != nil
+    }
+}
+
+private extension AudioCodec {
+    var isLosslessForDensity: Bool {
+        switch self {
+        case .truehd, .dtsHDMA, .pcm:
+            return true
+        case .dtsHDHRA, .ddp, .dts, .dd, .aac, .heAAC, .opus, .mp3, .unknown:
+            return false
+        }
     }
 }
 

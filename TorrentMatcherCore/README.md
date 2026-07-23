@@ -50,14 +50,14 @@ Resolution:
 - 2160p 100
 - 1080p 92
 - 720p 50
-- SD/480p 30
+- SD/480p 60
 - Unknown 10
 
 Dynamic range:
-- Dolby Vision 30
-- HDR10+ 27
-- HDR10 24
-- HDR 20
+- Dolby Vision 45
+- HDR10+ 41
+- HDR10 39
+- HDR 30
 - Unknown 12
 - SDR -5
 
@@ -73,9 +73,10 @@ Channels:
 - 7.1 32
 - 5.1 24
 - 2.0/unknown 0
+- Mono 5
 
 Atmos:
-- DDP Atmos +6
+- DDP Atmos +45
 - TrueHD Atmos +0
 
 Video codec:

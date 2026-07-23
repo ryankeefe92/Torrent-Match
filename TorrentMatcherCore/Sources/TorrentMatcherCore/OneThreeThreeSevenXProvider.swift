@@ -112,9 +112,9 @@ public final class OneThreeThreeSevenXProvider: TorrentProvider, @unchecked Send
                 size: size
             )
             results.append(result)
-            if let onProgress {
-                await onProgress([result])
-            }
+        }
+        if let onProgress, !results.isEmpty {
+            await onProgress(results)
         }
         return results
     }

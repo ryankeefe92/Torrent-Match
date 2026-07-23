@@ -44,7 +44,7 @@ public enum ReleaseParser {
         let sourceType: SourceType
         if hasRemux {
             sourceType = .remux
-        } else if upper.contains("WEB-DL") || upper.contains("WEBDL") {
+        } else if containsWebDL(in: upper) {
             sourceType = .webdl
         } else if upper.contains("WEBRIP") || upper.contains("WEB-RIP") {
             sourceType = .webrip
@@ -54,7 +54,7 @@ public enum ReleaseParser {
             sourceType = .dvd
         } else if hasHDTV {
             sourceType = .hdtv
-        } else if containsAnyToken(["HDCAM", "CAM", "TELESYNC", "TS", "TELECINE", "TC"], in: upper) {
+        } else if containsAnyToken(["HDCAM", "CAMRIP", "CAM RIP", "CAM", "TELESYNC", "TS", "TELECINE", "TC"], in: upper) {
             sourceType = .cam
         } else {
             sourceType = .unknown
@@ -103,7 +103,14 @@ public enum ReleaseParser {
         var channels = detectChannels(in: upper)
 
         var audioCodec: AudioCodec
-        if upper.contains("TRUEHD") || upper.contains("TRUE-HD") {
+        if upper.contains("TRUEHD") ||
+            upper.contains("TRUE-HD") ||
+            upper.contains("TRUHD") ||
+            upper.contains("TRU-HD") ||
+            upper.contains("MLP FBA") ||
+            upper.contains("MLP.FBA") ||
+            upper.contains("MLP-FBA") ||
+            upper.contains("A_TRUEHD") {
             audioCodec = .truehd
         } else if containsAnyToken(["LPCM", "PCM"], in: upper) {
             audioCodec = .pcm
@@ -140,10 +147,26 @@ public enum ReleaseParser {
             upper.contains("DOLBY DIGITAL") ||
             upper.contains("AC3") || upper.contains("AC-3") {
             audioCodec = .dd
+        } else if upper.contains("HE-AAC") ||
+            upper.contains("HE AAC") ||
+            upper.contains("HEAAC") ||
+            upper.contains("AAC-HE") ||
+            upper.contains("AAC HE") {
+            audioCodec = .heAAC
+        } else if containsToken("OPUS", in: upper) {
+            audioCodec = .opus
         } else if upper.contains("AAC") {
             audioCodec = .aac
+        } else if containsAnyToken(["MP3", "MPEG AUDIO", "MPEG-AUDIO", "MPEG LAYER 3", "MPEG-1 LAYER 3"], in: upper) {
+            audioCodec = .mp3
         } else {
             audioCodec = .unknown
+        }
+
+        let atmosTokenPresent = containsToken("ATMOS", in: upper) || upper.contains("DDPA")
+        let inferredDDPFromBareAtmos = audioCodec == .unknown && atmosTokenPresent
+        if inferredDDPFromBareAtmos {
+            audioCodec = .ddp
         }
 
         if hasRemux && audioCodec == .unknown {
@@ -160,8 +183,7 @@ public enum ReleaseParser {
             channels = .fiveOne
         }
 
-        let atmosTokenPresent = containsToken("ATMOS", in: upper) || upper.contains("DDPA")
-        let atmos = atmosTokenPresent && (audioCodec == .ddp || audioCodec == .truehd)
+        let atmos = atmosTokenPresent && !inferredDDPFromBareAtmos && (audioCodec == .ddp || audioCodec == .truehd)
         let imax = containsToken("IMAX", in: upper)
 
         return ParsedRelease(
@@ -193,12 +215,17 @@ public enum ReleaseParser {
         containsToken("HDR10", in: text)
     }
 
+    private static func containsWebDL(in text: String) -> Bool {
+        matches(#"(^|[^A-Z0-9])WEB[\s._-]+DL([^A-Z0-9]|$)"#, in: text) ||
+            matches(#"(^|[^A-Z0-9])WEBDL([^A-Z0-9]|$)"#, in: text)
+    }
+
     private static func containsNonDownscaled4K(in text: String) -> Bool {
         matches(#"(^|[^A-Z0-9])(?<!DS)4K([^A-Z0-9]|$)"#, in: text)
     }
 
     private static func detectChannels(in upper: String) -> ChannelLayout {
-        let audioPrefix = #"(TRUEHD|TRUE-HD|LPCM|PCM|DDP|EAC3|E-AC-3|EAC-3|DD|AC3|AC-3|DTSHD|DTS-HDMA|DTS-HD(?:\.MA)?|DTS-MA|DTS HDMA|DTS HD MA|DTS MA|DTS|ATMOS)"#
+        let audioPrefix = #"(TRUEHD|TRUE-HD|TRUHD|TRU-HD|MLP[\s.-]?FBA|A_TRUEHD|LPCM|PCM|DDP|EAC3|E-AC-3|EAC-3|DD|AC3|AC-3|DTSHD|DTS-HDMA|DTS-HD(?:\.MA)?|DTS-MA|DTS HDMA|DTS HD MA|DTS MA|DTS|AAC|MP3|MPEG[\s.-]?AUDIO|ATMOS)"#
 
         if matches(#"(^|[^A-Z0-9])(7\.1\s*CH|7\.1|8CH|8 CH)([^A-Z0-9]|$)"#, in: upper) ||
             matches(audioPrefix + #"[\.\s_-]?(7[\.\s]?1)(?:\s*CH)?([^A-Z0-9]|$)"#, in: upper) {

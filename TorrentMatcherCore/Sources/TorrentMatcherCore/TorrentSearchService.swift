@@ -23,16 +23,17 @@ public struct RankedSearchReport: Sendable {
 public struct RankedSearchUpdate: Sendable {
     public let results: [RankedTorrentResult]
     public let foundSoFar: Int
+    public let sequence: Int
 
-    public init(results: [RankedTorrentResult], foundSoFar: Int) {
+    public init(results: [RankedTorrentResult], foundSoFar: Int, sequence: Int = 0) {
         self.results = results
         self.foundSoFar = foundSoFar
+        self.sequence = sequence
     }
 }
 
 public final class TorrentSearchService: @unchecked Sendable {
     private let providers: [TorrentProvider]
-    private let weights: RankerWeights
     private let providerTimeoutSeconds: Int
     private let magnetResolveTimeoutSeconds: Int
     private let magnetCache = MagnetResolutionCache()
@@ -40,38 +41,34 @@ public final class TorrentSearchService: @unchecked Sendable {
 
     public init(
         configs: [ProviderConfig],
-        weights: RankerWeights = .appleTVDefault,
         providerTimeoutSeconds: Int = 30,
         magnetResolveTimeoutSeconds: Int = 35
     ) {
         self.providers = configs.map(Self.provider(for:))
-        self.weights = weights
         self.providerTimeoutSeconds = providerTimeoutSeconds
         self.magnetResolveTimeoutSeconds = magnetResolveTimeoutSeconds
     }
 
     public init(
         providers: [TorrentProvider],
-        weights: RankerWeights = .appleTVDefault,
         providerTimeoutSeconds: Int = 30,
         magnetResolveTimeoutSeconds: Int = 35
     ) {
         self.providers = providers
-        self.weights = weights
         self.providerTimeoutSeconds = providerTimeoutSeconds
         self.magnetResolveTimeoutSeconds = magnetResolveTimeoutSeconds
     }
 
     public func searchAndRank(_ query: String) async -> [RankedTorrentResult] {
         let rawResults = await searchAll(query)
-        return TorrentRanker.rank(rawResults, hideExcluded: true, weights: weights)
+        return TorrentRanker.rank(rawResults, hideExcluded: true)
     }
 
     public func searchAndRankReport(_ query: String) async -> RankedSearchReport {
         let report = await searchReport(query, onProgress: nil, onUpdate: nil)
         let results = await applyRuntimeFallbacks(to: report.results, query: query)
         return RankedSearchReport(
-            results: rankVisibleResults(results, matching: query, weights: weights),
+            results: rankVisibleResults(results, matching: query),
             failures: report.failures
         )
     }
@@ -83,7 +80,7 @@ public final class TorrentSearchService: @unchecked Sendable {
         let report = await searchReport(query, onProgress: onProgress, onUpdate: nil)
         let results = await applyRuntimeFallbacks(to: report.results, query: query)
         return RankedSearchReport(
-            results: rankVisibleResults(results, matching: query, weights: weights),
+            results: rankVisibleResults(results, matching: query),
             failures: report.failures
         )
     }
@@ -95,7 +92,7 @@ public final class TorrentSearchService: @unchecked Sendable {
         let report = await searchReport(query, onProgress: nil, onUpdate: onUpdate)
         let results = await applyRuntimeFallbacks(to: report.results, query: query)
         return RankedSearchReport(
-            results: rankVisibleResults(results, matching: query, weights: weights),
+            results: rankVisibleResults(results, matching: query),
             failures: report.failures
         )
     }
@@ -160,7 +157,7 @@ public final class TorrentSearchService: @unchecked Sendable {
         onProgress: (@Sendable (_ foundSoFar: Int) -> Void)?,
         onUpdate: (@Sendable (_ update: RankedSearchUpdate) -> Void)?
     ) async -> (results: [TorrentSearchResult], failures: [ProviderFailure]) {
-        let progressTracker = SearchProgressTracker(query: query, weights: weights)
+        let progressTracker = SearchProgressTracker(query: query)
         let collected = await withTaskGroup(of: ([TorrentSearchResult], ProviderFailure?).self) { group in
             for provider in providers {
                 group.addTask {
@@ -260,7 +257,7 @@ public final class TorrentSearchService: @unchecked Sendable {
     }
 
     private func dedupe(_ results: [TorrentSearchResult]) -> [TorrentSearchResult] {
-        dedupeResults(results, weights: weights)
+        dedupeResults(results)
     }
 
     private func filterResults(_ results: [TorrentSearchResult], matching query: String) -> [TorrentSearchResult] {
@@ -335,18 +332,18 @@ public final class TorrentSearchService: @unchecked Sendable {
 
 private actor SearchProgressTracker {
     private let query: String
-    private let weights: RankerWeights
     private var results: [TorrentSearchResult] = []
+    private var sequence = 0
 
-    init(query: String, weights: RankerWeights) {
+    init(query: String) {
         self.query = query
-        self.weights = weights
     }
 
     func append(_ addedResults: [TorrentSearchResult]) -> RankedSearchUpdate {
-        results.append(contentsOf: addedResults)
-        let ranked = rankVisibleResults(results, matching: query, weights: weights)
-        return RankedSearchUpdate(results: ranked, foundSoFar: ranked.count)
+        results = dedupeResults(results + addedResults)
+        sequence += 1
+        let ranked = rankVisibleResults(results, matching: query)
+        return RankedSearchUpdate(results: ranked, foundSoFar: ranked.count, sequence: sequence)
     }
 }
 
@@ -354,7 +351,7 @@ private actor PartialResultCollector {
     private var results: [TorrentSearchResult] = []
 
     func append(_ addedResults: [TorrentSearchResult]) {
-        results.append(contentsOf: addedResults)
+        results = dedupeResults(results + addedResults)
     }
 
     func snapshot() -> [TorrentSearchResult] {
@@ -375,18 +372,17 @@ private func filterSearchResults(_ results: [TorrentSearchResult], matching quer
     }
 }
 
-private func dedupeResults(_ results: [TorrentSearchResult], weights: RankerWeights) -> [TorrentSearchResult] {
-    TorrentResultDedupe.dedupe(results, weights: weights)
+private func dedupeResults(_ results: [TorrentSearchResult]) -> [TorrentSearchResult] {
+    TorrentResultDedupe.dedupe(results)
 }
 
 private func rankVisibleResults(
     _ results: [TorrentSearchResult],
-    matching query: String,
-    weights: RankerWeights
+    matching query: String
 ) -> [RankedTorrentResult] {
     let filtered = filterSearchResults(results, matching: query)
-    let deduped = dedupeResults(filtered, weights: weights)
-    return TorrentRanker.rank(deduped, hideExcluded: true, weights: weights)
+    let deduped = dedupeResults(filtered)
+    return TorrentRanker.rank(deduped, hideExcluded: true)
 }
 
 private extension String {

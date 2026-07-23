@@ -137,7 +137,10 @@ public actor MovieCatalog {
         minimumVotes: Int
     ) throws -> [MovieCatalogSuggestion] {
         let prefixPattern = normalizedQuery + "%"
-        let compactPrefixPattern = normalizedQuery.replacingOccurrences(of: " ", with: "") + "%"
+        let containsPattern = "%" + normalizedQuery + "%"
+        let compactQuery = normalizedQuery.replacingOccurrences(of: " ", with: "")
+        let compactPrefixPattern = compactQuery + "%"
+        let compactContainsPattern = "%" + compactQuery + "%"
 
         let sql = """
         SELECT id, title, year, provider_query
@@ -147,6 +150,10 @@ public actor MovieCatalog {
              OR canonical_title LIKE ?1
              OR REPLACE(normalized_title, ' ', '') LIKE ?2
              OR REPLACE(canonical_title, ' ', '') LIKE ?2
+             OR normalized_title LIKE ?6
+             OR canonical_title LIKE ?6
+             OR REPLACE(normalized_title, ' ', '') LIKE ?7
+             OR REPLACE(canonical_title, ' ', '') LIKE ?7
         )
           AND (
                 num_votes >= ?4
@@ -160,7 +167,11 @@ public actor MovieCatalog {
                 WHEN canonical_title LIKE ?1 THEN 2
                 WHEN normalized_title LIKE ?1 THEN 3
                 WHEN REPLACE(canonical_title, ' ', '') LIKE ?2 THEN 4
-                ELSE 5
+                WHEN REPLACE(normalized_title, ' ', '') LIKE ?2 THEN 5
+                WHEN canonical_title LIKE ?6 THEN 6
+                WHEN normalized_title LIKE ?6 THEN 7
+                WHEN REPLACE(canonical_title, ' ', '') LIKE ?7 THEN 8
+                ELSE 9
             END,
             CASE
                 WHEN runtime_minutes IS NULL THEN 1
@@ -184,6 +195,8 @@ public actor MovieCatalog {
         bind(normalizedQuery, at: 3, in: statement)
         sqlite3_bind_int(statement, 4, Int32(minimumVotes))
         sqlite3_bind_int(statement, 5, Int32(limit))
+        bind(containsPattern, at: 6, in: statement)
+        bind(compactContainsPattern, at: 7, in: statement)
 
         var suggestions: [MovieCatalogSuggestion] = []
         suggestions.reserveCapacity(limit)

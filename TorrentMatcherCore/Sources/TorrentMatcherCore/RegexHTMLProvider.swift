@@ -306,9 +306,9 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
                 size: size
             )
             results.append(result)
-            if let onProgress {
-                await onProgress([result])
-            }
+        }
+        if let onProgress, !results.isEmpty {
+            await onProgress(results)
         }
         return results
     }
@@ -466,7 +466,8 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
             "height", "frame rate", "channel", "hdr", "dolby", "dts", "truehd",
             ".mkv", ".mp4", ".m2ts", ".avi", "1080p", "2160p", "720p", "bluray",
             "web-dl", "webdl", "webrip", "remux"
-        ].contains { normalized.contains($0) }
+        ].contains { normalized.contains($0) } ||
+            normalized.range(of: #"(^|[^a-z0-9])web[\s._-]?dl([^a-z0-9]|$)"#, options: .regularExpression) != nil
     }
 
     private static func isBoilerplateDetailText(_ normalized: String) -> Bool {
@@ -489,9 +490,10 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
             ".mkv", ".mp4", ".m2ts", ".avi", "1080p", "2160p", "720p", "bluray",
             "web-dl", "webdl", "webrip", "remux"
         ]
+        let webDLScore = normalized.range(of: #"(^|[^a-z0-9])web[\s._-]?dl([^a-z0-9]|$)"#, options: .regularExpression) != nil ? 1 : 0
         return signals.reduce(0) { score, signal in
             score + (normalized.contains(signal) ? 1 : 0)
-        } + min(text.count / 500, 10)
+        } + webDLScore + min(text.count / 500, 10)
     }
 
     private static func releaseFilenames(from raw: String) -> [String] {
@@ -529,13 +531,21 @@ public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
         guard !trimmed.isEmpty else { return [query] }
         guard config.id == "1337x" else { return [trimmed] }
 
-        let tokens = trimmed.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
+        let withoutTrailingYear = trimmed
+            .replacingOccurrences(
+                of: #"\s*(?:\(\s*)?(?:19|20)\d{2}(?:\s*\))?\s*$"#,
+                with: "",
+                options: .regularExpression
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let providerQuery = withoutTrailingYear.isEmpty ? trimmed : withoutTrailingYear
+        let tokens = providerQuery.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
         guard tokens.count > 1,
               ["a", "an", "the"].contains(tokens[0].lowercased()) else {
-            return [trimmed]
+            return [providerQuery]
         }
 
-        return [trimmed, tokens.dropFirst().joined(separator: " ")]
+        return [providerQuery, tokens.dropFirst().joined(separator: " ")]
     }
 
     private func searchRequestTimeoutSeconds() -> Int {

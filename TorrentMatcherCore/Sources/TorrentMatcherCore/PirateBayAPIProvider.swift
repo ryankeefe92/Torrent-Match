@@ -55,10 +55,40 @@ public final class PirateBayAPIProvider: TorrentProvider, @unchecked Sendable {
         onProgress: (@Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)?
     ) async throws -> [TorrentSearchResult] {
         guard config.enabled else { return [] }
-        let encodedQuery = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
         let templates = [config.searchURLTemplate] + config.alternateSearchURLTemplates
 
-        let outcome = await withTaskGroup(of: Result<[TorrentSearchResult], Error>.self) { group in
+        var firstError: Error?
+        for queryVariant in searchQueryVariants(query) {
+            let encodedQuery = queryVariant.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? queryVariant
+            let outcome = await searchTemplates(
+                templates,
+                encodedQuery: encodedQuery,
+                onProgress: onProgress
+            )
+            switch outcome {
+            case .success(let results) where !results.isEmpty:
+                return results
+            case .success:
+                continue
+            case .failure(let error):
+                if firstError == nil {
+                    firstError = error
+                }
+            }
+        }
+
+        if let firstError {
+            throw firstError
+        }
+        return []
+    }
+
+    private func searchTemplates(
+        _ templates: [String],
+        encodedQuery: String,
+        onProgress: (@Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)?
+    ) async -> Result<[TorrentSearchResult], Error> {
+        await withTaskGroup(of: Result<[TorrentSearchResult], Error>.self) { group in
             for template in templates {
                 group.addTask {
                     do {
@@ -87,13 +117,30 @@ public final class PirateBayAPIProvider: TorrentProvider, @unchecked Sendable {
             }
             return Result<[TorrentSearchResult], Error>.success(results)
         }
+    }
 
-        switch outcome {
-        case .success(let results):
-            return results
-        case .failure(let error):
-            throw error
+    private func searchQueryVariants(_ query: String) -> [String] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [query] }
+
+        let withoutYear = trimmed
+            .replacingOccurrences(
+                of: #"\s*(?:\(\s*)?(?:19|20)\d{2}(?:\s*\))?\s*$"#,
+                with: "",
+                options: .regularExpression
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let bases = withoutYear == trimmed || withoutYear.isEmpty
+            ? [trimmed]
+            : [trimmed, withoutYear]
+
+        var variants: [String] = []
+        for base in bases {
+            variants.append(base)
+            variants.append(base.capitalized)
         }
+        var seen: Set<String> = []
+        return variants.filter { seen.insert($0).inserted }
     }
 
     private func search(
@@ -142,9 +189,9 @@ public final class PirateBayAPIProvider: TorrentProvider, @unchecked Sendable {
                 size: torrent.size.flatMap(Self.formattedByteSize)
             )
             output.append(result)
-            if let onProgress {
-                await onProgress([result])
-            }
+        }
+        if let onProgress, !output.isEmpty {
+            await onProgress(output)
         }
         return output
     }

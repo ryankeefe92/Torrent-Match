@@ -35,6 +35,10 @@ public struct TorrentSearchResult: Identifiable, Hashable, Sendable {
         self.provider = provider
         self.size = size
     }
+
+    public var preferredTitle: String {
+        detailSpecs?.fullTorrentName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? title
+    }
 }
 
 public struct TorrentDetailMetadata: Hashable, Sendable {
@@ -374,7 +378,7 @@ public struct TorrentDetailSpecs: Hashable, Codable, Sendable {
             videoBitrate: videoBitrate,
             resolutionWidth: resolutionWidth,
             resolutionHeight: resolutionHeight,
-            frameRate: frameRate ?? "23.976 FPS",
+            frameRate: frameRate ?? "24 FPS",
             bitDepth: bitDepth,
             crf: crf,
             preset: preset,
@@ -427,6 +431,8 @@ public struct VideoQualityBreakdown: Hashable, Sendable {
     public let height: Int
     public let frameRate: Double
     public let adjustedBPPPF: Double
+    public let targetBPPPF: Double
+    public let densityRatio: Double
     public let compressionHealth: Double
 
     public init(
@@ -439,6 +445,8 @@ public struct VideoQualityBreakdown: Hashable, Sendable {
         height: Int,
         frameRate: Double,
         adjustedBPPPF: Double,
+        targetBPPPF: Double,
+        densityRatio: Double,
         compressionHealth: Double
     ) {
         self.bitrateKbps = bitrateKbps
@@ -450,6 +458,8 @@ public struct VideoQualityBreakdown: Hashable, Sendable {
         self.height = height
         self.frameRate = frameRate
         self.adjustedBPPPF = adjustedBPPPF
+        self.targetBPPPF = targetBPPPF
+        self.densityRatio = densityRatio
         self.compressionHealth = compressionHealth
     }
 }
@@ -464,6 +474,12 @@ public struct AudioQualityBreakdown: Hashable, Sendable {
     public let effectiveChannelCount: Double
     public let density: Double?
     public let compressionHealth: Double
+    public let channelBaseScore: Double
+    public let densityAdjustmentScore: Double
+    public let atmosBonusScore: Double
+    public let atmosReliefScore: Double
+    public let score: Double
+    public let isLossless: Bool
 
     public init(
         bitrateKbps: Int?,
@@ -474,7 +490,13 @@ public struct AudioQualityBreakdown: Hashable, Sendable {
         channels: ChannelLayout,
         effectiveChannelCount: Double,
         density: Double?,
-        compressionHealth: Double
+        compressionHealth: Double,
+        channelBaseScore: Double,
+        densityAdjustmentScore: Double,
+        atmosBonusScore: Double,
+        atmosReliefScore: Double,
+        score: Double,
+        isLossless: Bool
     ) {
         self.bitrateKbps = bitrateKbps
         self.bitrateSourceLabel = bitrateSourceLabel
@@ -485,6 +507,12 @@ public struct AudioQualityBreakdown: Hashable, Sendable {
         self.effectiveChannelCount = effectiveChannelCount
         self.density = density
         self.compressionHealth = compressionHealth
+        self.channelBaseScore = channelBaseScore
+        self.densityAdjustmentScore = densityAdjustmentScore
+        self.atmosBonusScore = atmosBonusScore
+        self.atmosReliefScore = atmosReliefScore
+        self.score = score
+        self.isLossless = isLossless
     }
 }
 
@@ -528,7 +556,7 @@ public enum VideoCodec: String, Codable, Sendable {
 }
 
 public enum AudioCodec: String, Codable, Sendable {
-    case truehd, dtsHDMA = "dts_hd_ma", dtsHDHRA = "dts_hd_hra", pcm, ddp, dts, dd, aac, unknown
+    case truehd, dtsHDMA = "dts_hd_ma", dtsHDHRA = "dts_hd_hra", pcm, ddp, dts, dd, aac, heAAC = "he_aac", opus, mp3, unknown
 }
 
 public enum ChannelLayout: String, Codable, Sendable {
@@ -567,5 +595,11 @@ public struct ParsedRelease: Hashable, Codable, Sendable {
         self.channels = channels
         self.atmos = atmos
         self.imax = imax
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
     }
 }
