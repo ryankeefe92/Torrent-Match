@@ -72,14 +72,45 @@ public extension String {
     }
 
     var normalizedProperInsensitiveDedupeKey: String {
+        normalizedCorrectionInsensitiveDedupeKey
+    }
+
+    var normalizedCorrectionInsensitiveDedupeKey: String {
         self.lowercased()
-            .replacingOccurrences(of: #"(^|[^a-z0-9])proper([^a-z0-9]|$)"#, with: ".", options: .regularExpression)
+            .replacingOccurrences(
+                of: #"(^|[^a-z0-9])(?:real[\s._-]*)?(?:proper|repack|rerip)(?:[\s._-]*v?[0-9]+)?(?=[^a-z0-9]|$)"#,
+                with: ".",
+                options: .regularExpression
+            )
             .replacingOccurrences(of: #"[^a-z0-9]+"#, with: ".", options: .regularExpression)
             .trimmingCharacters(in: CharacterSet(charactersIn: "."))
     }
 
     var isProperReleaseTokenPresent: Bool {
         range(of: #"(^|[^A-Z0-9])PROPER([^A-Z0-9]|$)"#, options: [.regularExpression, .caseInsensitive]) != nil
+    }
+
+    var correctionReleasePriority: Int {
+        let pattern = #"(^|[^a-z0-9])((?:real[\s._-]*)?(?:proper|repack|rerip))(?:[\s._-]*v?([0-9]+))?(?=[^a-z0-9]|$)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else { return 0 }
+        let range = NSRange(startIndex..<endIndex, in: self)
+        return regex.matches(in: self, range: range).reduce(0) { priority, match in
+            let version: Int
+            if match.numberOfRanges > 3,
+               let versionRange = Range(match.range(at: 3), in: self) {
+                version = Int(self[versionRange]) ?? 1
+            } else {
+                version = 1
+            }
+            let isReal: Bool
+            if match.numberOfRanges > 2,
+               let tokenRange = Range(match.range(at: 2), in: self) {
+                isReal = self[tokenRange].localizedCaseInsensitiveContains("real")
+            } else {
+                isReal = false
+            }
+            return max(priority, max(version, isReal ? 2 : 1))
+        }
     }
 
     var infoHashFromMagnet: String? {

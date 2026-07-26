@@ -45,7 +45,16 @@ struct ContentView: View {
     @State private var detailMetadataStatuses: [UUID: DetailMetadataFetchStatus] = [:]
 
     var sortedResults: [SearchResult] {
-        results.sorted { $0.score > $1.score }
+        var positions: [UUID: Int] = [:]
+        for (index, ranked) in TorrentRanker.rank(
+            results.map(\.raw),
+            hideExcluded: false
+        ).enumerated() {
+            positions[ranked.id] = index
+        }
+        return results.sorted {
+            (positions[$0.id] ?? .max) < (positions[$1.id] ?? .max)
+        }
     }
 
     private var transmissionButtonTitle: String {
@@ -528,11 +537,11 @@ struct ContentView: View {
             return match
         }
 
-        let incomingTitleKey = incoming.title.normalizedDedupeKey
+        let incomingTitleKey = incoming.title.normalizedCorrectionInsensitiveDedupeKey
         guard !incomingTitleKey.isEmpty else { return nil }
         return results.first {
             $0.provider == incoming.provider &&
-                $0.title.normalizedDedupeKey == incomingTitleKey
+                $0.title.normalizedCorrectionInsensitiveDedupeKey == incomingTitleKey
         }
     }
 
@@ -925,7 +934,7 @@ struct ContentView: View {
         indexByTitle.reserveCapacity(results.count)
 
         for result in results {
-            let key = result.title.normalizedDedupeKey
+            let key = result.title.normalizedCorrectionInsensitiveDedupeKey
             guard !key.isEmpty else {
                 output.append(result)
                 continue
@@ -943,6 +952,12 @@ struct ContentView: View {
     }
 
     private func preferredDuplicate(between lhs: SearchResult, and rhs: SearchResult) -> SearchResult {
+        let lhsCorrectionPriority = lhs.title.correctionReleasePriority
+        let rhsCorrectionPriority = rhs.title.correctionReleasePriority
+        if lhsCorrectionPriority != rhsCorrectionPriority {
+            return lhsCorrectionPriority > rhsCorrectionPriority ? lhs : rhs
+        }
+
         let lhsHasMagnet = lhs.magnet?.isEmpty == false
         let rhsHasMagnet = rhs.magnet?.isEmpty == false
 
@@ -1674,12 +1689,25 @@ private struct QualityEquationView: View {
                 Text("Bitrate source: \(qualityMathSourceLabel(breakdown.video.bitrateSourceLabel))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text("Curved compression health: \(formatDecimal(breakdown.video.densityRatio, places: 4)) density ratio -> \(formatDecimal(breakdown.video.compressionHealth, places: 4))")
+                Text("Resolution potential: \(formatDecimal(breakdown.video.resolutionPotentialScore, places: 1))")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Text("Curve: 1.12 x (1 - exp(-2.233592 x density ratio))")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if breakdown.video.densityRatio <= 0.20 {
+                    Text("Low-density collapse multiplier: \(formatDecimal(breakdown.video.compressionHealth, places: 4))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if breakdown.video.densityRatio < 0.32 {
+                    Text("Smooth transition adjustment: \(formatSignedDecimal(breakdown.video.densityAdjustmentScore, places: 2))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Shared density adjustment: \(formatSignedDecimal(breakdown.video.densityAdjustmentScore, places: 2))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("Adjustment: 50 x (1 - exp(-2.329403 x (density ratio - 1)))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Divider()
@@ -1783,7 +1811,7 @@ private struct ScoreNoteText: View {
         guard let colon = normalizedNote.firstIndex(of: ":") else { return nil }
         let label = String(normalizedNote[..<colon])
         let rest = normalizedNote[normalizedNote.index(after: colon)...].trimmingCharacters(in: .whitespaces)
-        guard let points = leadingSignedInteger(in: rest) else { return nil }
+        guard let points = leadingSignedNumber(in: rest) else { return nil }
         let detailStart = rest.index(rest.startIndex, offsetBy: points.count)
         return (label, points, String(rest[detailStart...]))
     }
@@ -1812,10 +1840,6 @@ private struct ScoreNoteText: View {
             normalizedDetail = DynamicRange(rawValue: parsed.detail).map(ParserRankerAdapter.displayName)
         case "Audio codec quality":
             normalizedDetail = AudioCodec(rawValue: parsed.detail).map { ParserRankerAdapter.displayName(for: $0, atmos: false) }
-        case "Source context":
-            normalizedDetail = SourceType(rawValue: parsed.detail).map(ParserRankerAdapter.displayName)
-        case "Video codec compatibility":
-            normalizedDetail = VideoCodec(rawValue: parsed.detail).map(ParserRankerAdapter.displayName)
         default:
             normalizedDetail = nil
         }
@@ -1828,7 +1852,7 @@ private struct ScoreNoteText: View {
         guard let colon = note.firstIndex(of: ":") else { return nil }
         let label = String(note[..<colon])
         let rest = note[note.index(after: colon)...].trimmingCharacters(in: .whitespaces)
-        guard let points = leadingSignedInteger(in: rest) else { return nil }
+        guard let points = leadingSignedNumber(in: rest) else { return nil }
         let detailStart = rest.index(rest.startIndex, offsetBy: points.count)
         let detail = rest[detailStart...]
             .trimmingCharacters(in: .whitespaces)
@@ -1848,23 +1872,27 @@ private struct ScoreNoteText: View {
         } else {
             source = "calculated"
         }
-        return "Picture quality: \(pictureQualityPoints) - \(result.resolution)@\(formatKbps(breakdown.video.bitrateKbps)) kbps (\(source)), density \(formatScoreMultiplier(breakdown.video.densityRatio)), health \(formatScoreMultiplier(breakdown.video.compressionHealth))"
+        return "Picture quality: \(pictureQualityPoints) - \(result.resolution)@\(formatKbps(breakdown.video.bitrateKbps)) kbps (\(source)), density \(formatScoreMultiplier(breakdown.video.densityRatio)), adjustment \(formatSignedScore(breakdown.video.densityAdjustmentScore))"
     }
 
     private var pictureQualityPoints: String {
         let prefix = "Picture quality:"
         guard note.hasPrefix(prefix) else { return "+0" }
         let rest = note.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
-        return leadingSignedInteger(in: rest) ?? "+0"
+        return leadingSignedNumber(in: rest) ?? "+0"
     }
 
-    private func leadingSignedInteger(in text: some StringProtocol) -> String? {
+    private func leadingSignedNumber(in text: some StringProtocol) -> String? {
         var result = ""
+        var hasDecimalPoint = false
         for (index, character) in text.enumerated() {
             if index == 0 && (character == "+" || character == "-") {
                 result.append(character)
             } else if character.isNumber {
                 result.append(character)
+            } else if character == "." && !hasDecimalPoint {
+                result.append(character)
+                hasDecimalPoint = true
             } else {
                 break
             }
@@ -1874,6 +1902,10 @@ private struct ScoreNoteText: View {
 
     private func formatScoreMultiplier(_ value: Double) -> String {
         String(format: "%.2fx", value)
+    }
+
+    private func formatSignedScore(_ value: Double) -> String {
+        String(format: "%+.1f", value)
     }
 }
 

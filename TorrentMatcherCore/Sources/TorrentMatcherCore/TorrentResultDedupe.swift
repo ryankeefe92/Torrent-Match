@@ -38,7 +38,7 @@ public enum TorrentResultDedupe {
         indexByTitle.reserveCapacity(results.count)
 
         for result in results {
-            let key = result.title.normalizedProperInsensitiveDedupeKey
+            let key = result.title.normalizedCorrectionInsensitiveDedupeKey
             guard !key.isEmpty else {
                 output.append(result)
                 continue
@@ -58,11 +58,13 @@ public enum TorrentResultDedupe {
     private static func preferredDuplicate(between lhs: TorrentSearchResult, and rhs: TorrentSearchResult) -> TorrentSearchResult {
         let lhsWithMergedMetadata = mergedWinner(lhs, withMetadataFrom: rhs)
         let rhsWithMergedMetadata = mergedWinner(rhs, withMetadataFrom: lhs)
-        let lhsProper = lhsWithMergedMetadata.title.isProperReleaseTokenPresent
-        let rhsProper = rhsWithMergedMetadata.title.isProperReleaseTokenPresent
+        let lhsCorrectionPriority = lhsWithMergedMetadata.title.correctionReleasePriority
+        let rhsCorrectionPriority = rhsWithMergedMetadata.title.correctionReleasePriority
 
-        if lhsProper != rhsProper {
-            return lhsProper ? lhsWithMergedMetadata : rhsWithMergedMetadata
+        if lhsCorrectionPriority != rhsCorrectionPriority {
+            return lhsCorrectionPriority > rhsCorrectionPriority
+                ? lhsWithMergedMetadata
+                : rhsWithMergedMetadata
         }
 
         let lhsHasMagnet = lhsWithMergedMetadata.magnet?.isEmpty == false

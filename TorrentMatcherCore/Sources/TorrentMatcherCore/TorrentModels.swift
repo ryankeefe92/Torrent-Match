@@ -433,6 +433,9 @@ public struct VideoQualityBreakdown: Hashable, Sendable {
     public let adjustedBPPPF: Double
     public let targetBPPPF: Double
     public let densityRatio: Double
+    public let resolutionPotentialScore: Double
+    public let densityAdjustmentScore: Double
+    public let score: Double
     public let compressionHealth: Double
 
     public init(
@@ -447,6 +450,9 @@ public struct VideoQualityBreakdown: Hashable, Sendable {
         adjustedBPPPF: Double,
         targetBPPPF: Double,
         densityRatio: Double,
+        resolutionPotentialScore: Double,
+        densityAdjustmentScore: Double,
+        score: Double,
         compressionHealth: Double
     ) {
         self.bitrateKbps = bitrateKbps
@@ -460,6 +466,9 @@ public struct VideoQualityBreakdown: Hashable, Sendable {
         self.adjustedBPPPF = adjustedBPPPF
         self.targetBPPPF = targetBPPPF
         self.densityRatio = densityRatio
+        self.resolutionPotentialScore = resolutionPotentialScore
+        self.densityAdjustmentScore = densityAdjustmentScore
+        self.score = score
         self.compressionHealth = compressionHealth
     }
 }
