@@ -2318,7 +2318,7 @@ struct Torrent_MatchTests {
 
         #expect(TorrentRanker.qualityBreakdown(for: estimated).video.bitrateIsEstimated == true)
         #expect(TorrentRanker.score(estimated).score == TorrentRanker.score(explicit).score)
-        #expect(TorrentRanker.score(explicit).notes.contains { $0.contains("Raw quality score:") && $0.contains("/ 1088") })
+        #expect(TorrentRanker.score(explicit).notes.contains { $0.contains("Raw quality score:") && $0.contains("/ 1109") })
     }
 
     @Test func seedersOnlyBreakExactScoreTies() {
@@ -2714,6 +2714,10 @@ struct Torrent_MatchTests {
         #expect(abs(p480.densityRatio - 1.0) < 0.001)
         #expect(abs(p2160.compressionHealth - 1.0) < 0.001)
         #expect(abs(p2160.densityAdjustmentScore) < 0.05)
+        #expect(abs(p2160.resolutionPotentialScore - 530.5821108088064) < 0.000001)
+        #expect(abs(p1080.resolutionPotentialScore - 438.2775504412965) < 0.000001)
+        #expect(abs(p720.resolutionPotentialScore - 373.1430180814573) < 0.000001)
+        #expect(p480.resolutionPotentialScore == 272)
     }
 
     @Test func videoDensityAdjustmentsAreSharedAcrossResolutionsInAdditiveRegion() {
@@ -2792,10 +2796,10 @@ struct Torrent_MatchTests {
         }
 
         let crossovers: [(higher: Int, lower: Int, bitrateMbps: Double)] = [
-            (0, 1, 21.512872876243147),
-            (0, 2, 14.515057564055411),
-            (1, 2, 5.821974951717251),
-            (2, 3, 2.382952829751343)
+            (0, 1, 18.0),
+            (0, 2, 12.575910300916842),
+            (1, 2, 5.8),
+            (2, 3, 2.8)
         ]
 
         for crossover in crossovers {

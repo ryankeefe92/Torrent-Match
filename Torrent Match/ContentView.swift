@@ -35,6 +35,9 @@ struct ContentView: View {
     @State private var alertMessage: String? = nil
     @State private var transmissionSendPhase: TransmissionSendPhase = .idle
     @State private var isPresentingTransmissionSettings: Bool = false
+    @State private var downloads: [TransmissionTorrent] = []
+    @State private var downloadsErrorMessage: String? = nil
+    @State private var isRefreshingDownloads: Bool = false
     @State private var magnetPrefetchQueue: [MagnetPrefetchCandidate] = []
     @State private var activeMagnetPrefetchTasks: [String: Task<Void, Never>] = [:]
     @State private var attemptedMagnetPrefetchKeys: Set<String> = []
@@ -89,6 +92,16 @@ struct ContentView: View {
 
                 Divider()
 
+                DownloadsPanel(
+                    downloads: downloads,
+                    errorMessage: downloadsErrorMessage,
+                    isRefreshing: isRefreshingDownloads,
+                    onRefresh: { refreshTransmissionDownloads() },
+                    onTogglePause: toggleTransmissionDownload,
+                    onDelete: deleteTransmissionDownload,
+                    onPriorityChange: updateTransmissionDownloadPriority
+                )
+
                 // Results / Loading / Error / Empty
                 Group {
                     if let message = errorMessage {
@@ -138,7 +151,9 @@ struct ContentView: View {
             .sheet(item: $presentedResult) { result in
                 ResultDetailView(
                     result: result,
-                    metadataStatus: detailMetadataStatuses[result.id] ?? .notStarted
+                    metadataStatus: detailMetadataStatuses[result.id] ?? .notStarted,
+                    onPrevious: showPreviousPresentedResult,
+                    onNext: showNextPresentedResult
                 )
             }
             .onChange(of: selected) { _, newValue in
@@ -149,6 +164,9 @@ struct ContentView: View {
             }
             .onChange(of: query) { _, newValue in
                 movieAutocomplete.updateQuery(newValue)
+            }
+            .task {
+                await monitorTransmissionDownloads()
             }
             .toolbar {
                 #if os(iOS)
@@ -294,6 +312,7 @@ struct ContentView: View {
                 let magnet = try await resolvedMagnet(for: selected)
                 transmissionSendPhase = .connecting
                 try await addMagnetToTransmission(magnet, using: endpoints)
+                await refreshTransmissionDownloads()
                 showAlert(title: "Download Started", message: "\(selected.title) has begun downloading.")
             } catch {
                 let presentation = transmissionErrorPresentation(for: error, phase: transmissionSendPhase)
@@ -660,6 +679,26 @@ struct ContentView: View {
         }
     }
 
+    private func showPreviousPresentedResult() {
+        guard let previous = adjacentPresentedResult(offset: -1) else { return }
+        selected = previous
+        presentedResult = previous
+    }
+
+    private func showNextPresentedResult() {
+        guard let next = adjacentPresentedResult(offset: 1) else { return }
+        selected = next
+        presentedResult = next
+    }
+
+    private func adjacentPresentedResult(offset: Int) -> SearchResult? {
+        guard let presentedResult,
+              let index = sortedResults.firstIndex(where: { $0.id == presentedResult.id }) else { return nil }
+        let adjacentIndex = index + offset
+        guard sortedResults.indices.contains(adjacentIndex) else { return nil }
+        return sortedResults[adjacentIndex]
+    }
+
     private func makeTransmissionEndpoints() throws -> [TransmissionEndpoint] {
         let username = transmissionUsername.trimmingCharacters(in: .whitespacesAndNewlines)
         let password = transmissionPassword.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -726,6 +765,102 @@ struct ContentView: View {
             do {
                 try await TransmissionClient(config: endpoint.config).add(magnet: magnet)
                 return
+            } catch {
+                failures.append(TransmissionEndpointFailure(endpointName: endpoint.name, error: error))
+            }
+        }
+
+        throw TransmissionSendError.allEndpointsFailed(failures)
+    }
+
+    private func monitorTransmissionDownloads() async {
+        await refreshTransmissionDownloads()
+        while !Task.isCancelled {
+            try? await Task.sleep(for: .seconds(2))
+            await refreshTransmissionDownloads()
+        }
+    }
+
+    private func refreshTransmissionDownloads() {
+        Task { @MainActor in
+            await refreshTransmissionDownloads()
+        }
+    }
+
+    private func refreshTransmissionDownloads() async {
+        guard !isRefreshingDownloads else { return }
+        let endpoints: [TransmissionEndpoint]
+        do {
+            endpoints = try makeTransmissionEndpoints()
+        } catch {
+            downloads = []
+            downloadsErrorMessage = nil
+            return
+        }
+
+        isRefreshingDownloads = true
+        defer { isRefreshingDownloads = false }
+
+        do {
+            downloads = try await performTransmissionRequest(using: endpoints) { client in
+                try await client.torrents()
+            }
+            downloadsErrorMessage = nil
+        } catch {
+            downloadsErrorMessage = transmissionConnectionErrorMessage(for: error)
+        }
+    }
+
+    private func toggleTransmissionDownload(_ torrent: TransmissionTorrent) {
+        Task { @MainActor in
+            await performTransmissionControl(title: torrent.isStopped ? "Resume Failed" : "Pause Failed") { client in
+                if torrent.isStopped {
+                    try await client.start(ids: [torrent.id])
+                } else {
+                    try await client.stop(ids: [torrent.id])
+                }
+            }
+        }
+    }
+
+    private func deleteTransmissionDownload(_ torrent: TransmissionTorrent) {
+        Task { @MainActor in
+            await performTransmissionControl(title: "Delete Failed") { client in
+                try await client.remove(ids: [torrent.id], deleteLocalData: true)
+            }
+        }
+    }
+
+    private func updateTransmissionDownloadPriority(_ priority: TransmissionTorrentPriority, for torrent: TransmissionTorrent) {
+        Task { @MainActor in
+            await performTransmissionControl(title: "Priority Failed") { client in
+                try await client.setPriority(priority, ids: [torrent.id])
+            }
+        }
+    }
+
+    private func performTransmissionControl(
+        title: String,
+        operation: @escaping (TransmissionClient) async throws -> Void
+    ) async {
+        do {
+            let endpoints = try makeTransmissionEndpoints()
+            try await performTransmissionRequest(using: endpoints, operation: operation)
+            await refreshTransmissionDownloads()
+        } catch {
+            showAlert(title: title, message: transmissionConnectionErrorMessage(for: error))
+        }
+    }
+
+    private func performTransmissionRequest<Value>(
+        using endpoints: [TransmissionEndpoint],
+        operation: (TransmissionClient) async throws -> Value
+    ) async throws -> Value {
+        var failures: [TransmissionEndpointFailure] = []
+
+        for endpoint in endpoints {
+            do {
+                return try await operation(TransmissionClient(config: endpoint.config))
             } catch {
                 failures.append(TransmissionEndpointFailure(endpointName: endpoint.name, error: error))
             }
@@ -1047,6 +1182,147 @@ private enum TransmissionSendError: LocalizedError {
     case allEndpointsFailed([TransmissionEndpointFailure])
 }
 
+private struct DownloadsPanel: View {
+    let downloads: [TransmissionTorrent]
+    let errorMessage: String?
+    let isRefreshing: Bool
+    var onRefresh: () -> Void
+    var onTogglePause: (TransmissionTorrent) -> Void
+    var onDelete: (TransmissionTorrent) -> Void
+    var onPriorityChange: (TransmissionTorrentPriority, TransmissionTorrent) -> Void
+
+    var body: some View {
+        if !downloads.isEmpty || errorMessage != nil {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Label("Downloads", systemImage: "arrow.down.circle")
+                        .font(.headline)
+                    Spacer(minLength: 0)
+                    if isRefreshing {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+                    Button(action: onRefresh) {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .accessibilityLabel("Refresh Downloads")
+#if os(macOS)
+                    .help("Refresh Downloads")
+#endif
+                }
+
+                if let errorMessage {
+                    Text(errorMessage)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                ForEach(downloads) { torrent in
+                    DownloadRow(
+                        torrent: torrent,
+                        onTogglePause: { onTogglePause(torrent) },
+                        onDelete: { onDelete(torrent) },
+                        onPriorityChange: { priority in onPriorityChange(priority, torrent) }
+                    )
+                    if torrent.id != downloads.last?.id {
+                        Divider()
+                    }
+                }
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 10)
+            .background(.regularMaterial)
+
+            Divider()
+        }
+    }
+}
+
+private struct DownloadRow: View {
+    let torrent: TransmissionTorrent
+    var onTogglePause: () -> Void
+    var onDelete: () -> Void
+    var onPriorityChange: (TransmissionTorrentPriority) -> Void
+
+    private var percent: Double {
+        min(max(torrent.percentDone, 0), 1)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(torrent.name.torrentNameWrappingText)
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Text(percent, format: .percent.precision(.fractionLength(0)))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            ProgressView(value: percent)
+                .progressViewStyle(.linear)
+
+            HStack(spacing: 10) {
+                Label(formatDownloadSpeed(torrent.rateDownload), systemImage: "speedometer")
+                Label("\(torrent.seeders)", systemImage: "arrow.up.circle")
+                Label("\(torrent.leechers)", systemImage: "arrow.down.circle")
+                Label("\(torrent.peersSendingToUs)", systemImage: "person.2")
+                Spacer(minLength: 0)
+                PriorityPicker(priority: torrent.priority, onChange: onPriorityChange)
+                Button(action: onTogglePause) {
+                    Image(systemName: torrent.isStopped ? "play.fill" : "pause.fill")
+                        .frame(width: 26, height: 26)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel(torrent.isStopped ? "Resume Download" : "Pause Download")
+#if os(macOS)
+                .help(torrent.isStopped ? "Resume Download" : "Pause Download")
+#endif
+                Button(role: .destructive, action: onDelete) {
+                    Image(systemName: "trash")
+                        .frame(width: 26, height: 26)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Delete Download")
+#if os(macOS)
+                .help("Delete Download and Data")
+#endif
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct PriorityPicker: View {
+    let priority: TransmissionTorrentPriority
+    var onChange: (TransmissionTorrentPriority) -> Void
+
+    var body: some View {
+        Menu {
+            ForEach(TransmissionTorrentPriority.allCases, id: \.rawValue) { option in
+                Button {
+                    onChange(option)
+                } label: {
+                    Label(option.label, systemImage: option == priority ? "checkmark" : option.systemImage)
+                }
+            }
+        } label: {
+            Label(priority.label, systemImage: priority.systemImage)
+                .labelStyle(.iconOnly)
+                .frame(width: 26, height: 26)
+        }
+        .accessibilityLabel("Set Priority")
+#if os(macOS)
+        .help("Set Priority: \(priority.label)")
+#endif
+    }
+}
+
 private struct SearchProgressView: View {
     let foundCount: Int
 
@@ -1130,7 +1406,11 @@ struct SearchResult: Identifiable, Hashable {
         raw = ranked.raw
         title = ranked.raw.preferredTitle
         provider = ranked.raw.provider
-        source = ParserRankerAdapter.displayName(for: ranked.parsed.sourceType)
+        source = ParserRankerAdapter.sourceSummary(
+            for: ranked.parsed,
+            title: ranked.raw.preferredTitle,
+            specs: ranked.raw.detailSpecs
+        )
         resolution = ParserRankerAdapter.displayName(for: ranked.parsed.resolution)
         dynamicRange = ParserRankerAdapter.displayName(for: ranked.parsed.dynamicRange)
         codec = ParserRankerAdapter.displayName(for: ranked.parsed.videoCodec)
@@ -1318,6 +1598,31 @@ enum ParserRankerAdapter {
         case .hdtv: return "HDTV"
         case .cam: return "CAM"
         case .unknown: return "Unknown"
+        }
+    }
+
+    static func sourceSummary(for parsed: ParsedRelease, title: String, specs: TorrentDetailSpecs?) -> String {
+        let isUHD = parsed.resolution == .p2160 ||
+            title.uppercased().contains("UHD") ||
+            specs?.fullTorrentName?.uppercased().contains("UHD") == true ||
+            specs?.releaseHintText?.uppercased().contains("UHD") == true
+        switch parsed.sourceType {
+        case .remux:
+            return isUHD ? "UHD Remux" : "Blu-ray Remux"
+        case .bluray:
+            return isUHD ? "UHD Blu-ray" : "Blu-ray"
+        case .webdl:
+            return "WEB-DL"
+        case .webrip:
+            return "WEBRip"
+        case .dvd:
+            return "DVD"
+        case .hdtv:
+            return "HDTV"
+        case .cam:
+            return "CAM"
+        case .unknown:
+            return "Unknown"
         }
     }
 
@@ -1564,6 +1869,8 @@ private struct ScoreBadge: View {
 private struct ResultDetailView: View {
     let result: SearchResult
     let metadataStatus: DetailMetadataFetchStatus
+    var onPrevious: () -> Void
+    var onNext: () -> Void
 
     var body: some View {
         ScrollView {
@@ -1636,6 +1943,18 @@ private struct ResultDetailView: View {
             .frame(maxWidth: .infinity, alignment: .leading)
         }
         .frame(minWidth: 420, minHeight: 420)
+        .gesture(
+            DragGesture(minimumDistance: 40)
+                .onEnded { value in
+                    guard abs(value.translation.width) > abs(value.translation.height),
+                          abs(value.translation.width) > 60 else { return }
+                    if value.translation.width < 0 {
+                        onPrevious()
+                    } else {
+                        onNext()
+                    }
+                }
+        )
     }
 
     @ViewBuilder
@@ -2172,8 +2491,15 @@ private struct ResultsListView: View {
 
     var body: some View {
         List(results) { result in
-            ResultRow(result: result) {
-                selected = result
+            ResultRow(
+                result: result,
+                isSelected: selected?.id == result.id
+            ) {
+                if selected?.id == result.id {
+                    presentedResult = result
+                } else {
+                    selected = result
+                }
             } onShowDetails: {
                 selected = result
                 presentedResult = result
@@ -2198,7 +2524,8 @@ private struct ContentMarginsZero: ViewModifier {
 
 private struct ResultRow: View {
     let result: SearchResult
-    var onSelect: () -> Void
+    let isSelected: Bool
+    var onPrimaryTap: () -> Void
     var onShowDetails: () -> Void
 
     var body: some View {
@@ -2213,15 +2540,6 @@ private struct ResultRow: View {
                         .truncationMode(.tail)
                         .allowsTightening(false)
                         .frame(maxWidth: .infinity, alignment: .leading)
-                    Button(action: onShowDetails) {
-                        Image(systemName: "info.circle")
-                            .imageScale(.large)
-                            .frame(width: 28, height: 28)
-                    }
-                    .buttonStyle(.borderless)
-#if os(macOS)
-                    .help("Show Details")
-#endif
                 }
                 FlowLayout(spacing: 8, lineSpacing: 4) {
                     MetaChip(text: result.source, systemImage: "film")
@@ -2250,7 +2568,8 @@ private struct ResultRow: View {
             }
         }
         .contentShape(Rectangle())
-        .onTapGesture { onSelect() }
+        .onTapGesture(count: 2) { onShowDetails() }
+        .onTapGesture { onPrimaryTap() }
         .padding(.vertical, 4)
     }
     
@@ -2290,6 +2609,40 @@ private extension String {
         let channelTrailingDigits = Set<Character>(["0", "1"])
         return channelLeadingDigits.contains(previous) && channelTrailingDigits.contains(next)
     }
+}
+
+private extension TransmissionTorrentPriority {
+    var label: String {
+        switch self {
+        case .low: return "Low"
+        case .normal: return "Normal"
+        case .high: return "High"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .low: return "arrow.down.to.line"
+        case .normal: return "equal"
+        case .high: return "arrow.up.to.line"
+        }
+    }
+}
+
+private func formatDownloadSpeed(_ bytesPerSecond: Int) -> String {
+    let rate = max(bytesPerSecond, 0)
+    let units = ["B/s", "KB/s", "MB/s", "GB/s"]
+    var value = Double(rate)
+    var unitIndex = 0
+    while value >= 1024, unitIndex < units.count - 1 {
+        value /= 1024
+        unitIndex += 1
+    }
+
+    if unitIndex == 0 {
+        return "\(rate) \(units[unitIndex])"
+    }
+    return String(format: "%.1f %@", value, units[unitIndex])
 }
 
 fileprivate struct NavigationViewWrapper<Content: View>: View {

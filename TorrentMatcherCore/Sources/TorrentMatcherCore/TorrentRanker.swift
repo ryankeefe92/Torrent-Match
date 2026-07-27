@@ -1,7 +1,7 @@
 import Foundation
 
 public enum TorrentRanker {
-    private static let maxRawScore = 1_088.0
+    private static let maxRawScore = 1_108.5821108088064
     private static let correctedReleaseScoreWindow = 5
 
     public static func qualityBreakdown(for result: TorrentSearchResult) -> QualityScoreBreakdown {
@@ -155,7 +155,7 @@ public enum TorrentRanker {
         }
 
         notes.append("Availability: \(result.seeders) seeders / \(result.leechers) leechers; seeders used only for exact score ties")
-        notes.append("Raw quality score: \(Int(rawScore.rounded())) / \(Int(maxRawScore))")
+        notes.append("Raw quality score: \(Int(rawScore.rounded())) / \(Int(maxRawScore.rounded()))")
 
         let displayScore = Int((rawScore / maxRawScore * 1_000).rounded())
         return RankedTorrentResult(raw: result, parsed: parsed, score: displayScore, notes: notes, excluded: false)
@@ -426,15 +426,15 @@ private extension TorrentRanker {
 
     static func resolutionPotential(parsed: ParsedRelease, specs: TorrentDetailSpecs?, width: Int, height: Int) -> Double {
         let hasExactDimensions = specs?.resolutionWidth != nil && specs?.resolutionHeight != nil
-        if width >= 3_000 || height >= 1_600 { return 510 }
-        if width >= 1_600 || height >= 900 { return 440 }
-        if width >= 1_200 || height >= 650 { return 375 }
+        if width >= 3_000 || height >= 1_600 { return 530.5821108088064 }
+        if width >= 1_600 || height >= 900 { return 438.2775504412965 }
+        if width >= 1_200 || height >= 650 { return 373.1430180814573 }
         if width >= 700 || height >= 430 { return 272 }
         if width <= 640 || height <= 360 { return 0 }
         if hasExactDimensions { return 35 }
-        if parsed.resolution == .p2160 { return 510 }
-        if parsed.resolution == .p1080 || parsed.resolution == .likely1080 { return 440 }
-        if parsed.resolution == .p720 { return 375 }
+        if parsed.resolution == .p2160 { return 530.5821108088064 }
+        if parsed.resolution == .p1080 || parsed.resolution == .likely1080 { return 438.2775504412965 }
+        if parsed.resolution == .p720 { return 373.1430180814573 }
         if parsed.resolution == .unknown { return 200 }
         return 35
     }

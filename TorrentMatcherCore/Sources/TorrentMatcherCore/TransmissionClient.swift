@@ -22,6 +22,90 @@ public final class TransmissionClient: @unchecked Sendable {
     }
 
     public func add(magnet: String) async throws {
+        let payload: [String: Any] = [
+            "method": "torrent-add",
+            "arguments": ["filename": magnet]
+        ]
+        let response = try await send(payload, decoding: TransmissionRPCResponse.self)
+        guard response.result == "success" else {
+            throw TransmissionError.rpcFailure(response.result)
+        }
+    }
+
+    public func torrents() async throws -> [TransmissionTorrent] {
+        let fields = [
+            "id",
+            "name",
+            "percentDone",
+            "status",
+            "rateDownload",
+            "peersSendingToUs",
+            "peersGettingFromUs",
+            "bandwidthPriority",
+            "trackerStats"
+        ]
+        let payload: [String: Any] = [
+            "method": "torrent-get",
+            "arguments": ["fields": fields]
+        ]
+        let response = try await send(payload, decoding: TransmissionTorrentGetResponse.self)
+        guard response.result == "success" else {
+            throw TransmissionError.rpcFailure(response.result)
+        }
+        return response.arguments.torrents
+    }
+
+    public func start(ids: [Int]) async throws {
+        try await perform(method: "torrent-start", ids: ids)
+    }
+
+    public func stop(ids: [Int]) async throws {
+        try await perform(method: "torrent-stop", ids: ids)
+    }
+
+    public func remove(ids: [Int], deleteLocalData: Bool = true) async throws {
+        let payload: [String: Any] = [
+            "method": "torrent-remove",
+            "arguments": [
+                "ids": ids,
+                "delete-local-data": deleteLocalData
+            ]
+        ]
+        let response = try await send(payload, decoding: TransmissionRPCResponse.self)
+        guard response.result == "success" else {
+            throw TransmissionError.rpcFailure(response.result)
+        }
+    }
+
+    public func setPriority(_ priority: TransmissionTorrentPriority, ids: [Int]) async throws {
+        let payload: [String: Any] = [
+            "method": "torrent-set",
+            "arguments": [
+                "ids": ids,
+                "bandwidthPriority": priority.rawValue
+            ]
+        ]
+        let response = try await send(payload, decoding: TransmissionRPCResponse.self)
+        guard response.result == "success" else {
+            throw TransmissionError.rpcFailure(response.result)
+        }
+    }
+
+    private func perform(method: String, ids: [Int]) async throws {
+        let payload: [String: Any] = [
+            "method": method,
+            "arguments": ["ids": ids]
+        ]
+        let response = try await send(payload, decoding: TransmissionRPCResponse.self)
+        guard response.result == "success" else {
+            throw TransmissionError.rpcFailure(response.result)
+        }
+    }
+
+    private func send<Response: Decodable>(
+        _ payload: [String: Any],
+        decoding responseType: Response.Type
+    ) async throws -> Response {
         let sessionID = try await fetchSessionID()
         var request = URLRequest(url: config.rpcURL)
         request.httpMethod = "POST"
@@ -29,19 +113,12 @@ public final class TransmissionClient: @unchecked Sendable {
         request.setValue(sessionID, forHTTPHeaderField: "X-Transmission-Session-Id")
         applyAuth(to: &request)
 
-        let payload: [String: Any] = [
-            "method": "torrent-add",
-            "arguments": ["filename": magnet]
-        ]
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
         let (data, response) = try await session.data(for: request)
         if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
             throw TransmissionError.badStatus(http.statusCode)
         }
-        let rpcResponse = try JSONDecoder().decode(TransmissionRPCResponse.self, from: data)
-        guard rpcResponse.result == "success" else {
-            throw TransmissionError.rpcFailure(rpcResponse.result)
-        }
+        return try JSONDecoder().decode(responseType, from: data)
     }
 
     private func fetchSessionID() async throws -> String {
@@ -82,4 +159,56 @@ public enum TransmissionError: Error, LocalizedError, Sendable {
 
 private struct TransmissionRPCResponse: Decodable {
     let result: String
+}
+
+public enum TransmissionTorrentPriority: Int, CaseIterable, Sendable {
+    case low = -1
+    case normal = 0
+    case high = 1
+}
+
+public struct TransmissionTorrent: Identifiable, Hashable, Sendable, Decodable {
+    public let id: Int
+    public let name: String
+    public let percentDone: Double
+    public let status: Int
+    public let rateDownload: Int
+    public let peersSendingToUs: Int
+    public let peersGettingFromUs: Int
+    public let bandwidthPriority: Int
+    public let trackerStats: [TransmissionTrackerStats]
+
+    public var seeders: Int {
+        trackerStats.reduce(0) { partial, stats in
+            partial + max(stats.seederCount ?? 0, 0)
+        }
+    }
+
+    public var leechers: Int {
+        trackerStats.reduce(0) { partial, stats in
+            partial + max(stats.leecherCount ?? 0, 0)
+        }
+    }
+
+    public var priority: TransmissionTorrentPriority {
+        TransmissionTorrentPriority(rawValue: bandwidthPriority) ?? .normal
+    }
+
+    public var isStopped: Bool {
+        status == 0
+    }
+}
+
+public struct TransmissionTrackerStats: Hashable, Sendable, Decodable {
+    public let seederCount: Int?
+    public let leecherCount: Int?
+}
+
+private struct TransmissionTorrentGetResponse: Decodable {
+    let result: String
+    let arguments: TransmissionTorrentGetArguments
+}
+
+private struct TransmissionTorrentGetArguments: Decodable {
+    let torrents: [TransmissionTorrent]
 }
