@@ -127,6 +127,108 @@ struct Torrent_MatchTests {
         #expect(results.allSatisfy { $0.title.contains("Inception 2010") })
     }
 
+    @Test func builtInProvidersIncludeMagnetzAndYTS() {
+        let ids = Set(BuiltInProviderConfigs.default.map(\.id))
+
+        #expect(ids.contains("magnetz"))
+        #expect(ids.contains("yts"))
+    }
+
+    @Test func magnetzAPIParsesPagesAndBatchesProgress() async throws {
+        let session = URLSession(configuration: MockURLProtocol.ephemeralConfiguration { request in
+            let page = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)?
+                .queryItems?
+                .first(where: { $0.name == "page" })?
+                .value ?? "1"
+            let response = """
+            {
+              "data": [{
+                "sqid": "page\(page)",
+                "name": "Oppenheimer 2023 \(page == "1" ? "2160p BluRay REMUX HEVC-GROUP" : "1080p WEB-DL H264-GROUP")",
+                "info_hash": "0123456789ABCDEF0123456789ABCDEF0123456\(page)",
+                "size": 89100999892,
+                "human_size": "\(page == "1" ? "82.98 GB" : "8.20 GB")",
+                "magnet_link": "magnet:?xt=urn:btih:0123456789ABCDEF0123456789ABCDEF0123456\(page)",
+                "seeders": \(page == "1" ? 44 : 22),
+                "leechers": \(page == "1" ? 14 : 7),
+                "web_url": "https://magnetz.eu/page\(page)"
+              }]
+            }
+            """
+            return .immediate(status: 200, body: response)
+        })
+        let recorder = ProgressBatchRecorder()
+        let provider = MagnetzAPIProvider(config: BuiltInProviderConfigs.magnetz, session: session)
+
+        let results = try await provider.search("Oppenheimer 2023") { batch in
+            await recorder.record(batch)
+        }
+        let batchSizes = await recorder.batchSizes
+
+        #expect(results.count == 2)
+        #expect(results.first?.title.contains("2160p BluRay REMUX") == true)
+        #expect(results.first?.size == "82.98 GB")
+        #expect(results.first?.seeders == 44)
+        #expect(results.first?.magnet?.hasPrefix("magnet:?xt=urn:btih:") == true)
+        #expect(batchSizes.sorted() == [1, 1])
+    }
+
+    @Test func ytsAPIBuildsReleaseTitlesAndMagnets() async throws {
+        let response = """
+        {
+          "status": "ok",
+          "status_message": "Query was successful",
+          "data": {
+            "movies": [{
+              "title": "Oppenheimer",
+              "year": 2023,
+              "url": "https://yts.gg/movies/oppenheimer-2023",
+              "torrents": [{
+                "hash": "BC49149F330485E036D69E68A0B0E0887E13965E",
+                "quality": "2160p",
+                "type": "bluray",
+                "is_repack": "0",
+                "video_codec": "x265",
+                "bit_depth": "10",
+                "audio_channels": "5.1",
+                "seeds": 25,
+                "peers": 18,
+                "size": "8.71 GB"
+              }]
+            }]
+          }
+        }
+        """
+        let session = URLSession(configuration: MockURLProtocol.ephemeralConfiguration { request in
+            #expect(request.url?.absoluteString.contains("query_term=Oppenheimer%202023") == true)
+            return .immediate(status: 200, body: response)
+        })
+        let provider = YTSAPIProvider(config: BuiltInProviderConfigs.yts, session: session)
+
+        let results = try await provider.search("Oppenheimer 2023")
+
+        #expect(results.count == 1)
+        #expect(results.first?.title == "Oppenheimer 2023 2160p BluRay x265 10-bit 5.1-YTS")
+        #expect(results.first?.size == "8.71 GB")
+        #expect(results.first?.seeders == 25)
+        #expect(results.first?.leechers == 18)
+        #expect(results.first?.magnet?.contains("xt=urn:btih:BC49149F330485E036D69E68A0B0E0887E13965E") == true)
+    }
+
+    @Test func completedTransmissionTorrentsAreNotActiveDownloads() throws {
+        let incomplete = try JSONDecoder().decode(
+            TransmissionTorrent.self,
+            from: Data(#"{"id":1,"name":"Downloading","percentDone":0.4,"status":4,"rateDownload":1000,"peersSendingToUs":2,"peersGettingFromUs":0,"bandwidthPriority":0,"trackerStats":[]}"#.utf8)
+        )
+        let complete = try JSONDecoder().decode(
+            TransmissionTorrent.self,
+            from: Data(#"{"id":2,"name":"Complete","percentDone":1.0,"status":6,"rateDownload":0,"peersSendingToUs":0,"peersGettingFromUs":2,"bandwidthPriority":0,"trackerStats":[]}"#.utf8)
+        )
+
+        #expect(incomplete.isIncompleteDownload)
+        #expect(!complete.isIncompleteDownload)
+    }
+
     @Test func x1337SearchUsesLeadingArticleStrippedVariant() async throws {
         let sampleHTML = """
         <table>

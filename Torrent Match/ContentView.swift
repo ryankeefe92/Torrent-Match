@@ -28,15 +28,16 @@ struct ContentView: View {
     @State private var latestSearchUpdateSequence: Int = 0
     @State private var activeSearchID: UUID? = nil
     @State private var results: [SearchResult] = []
+    @State private var displayedResults: [SearchResult] = []
     @State private var errorMessage: String? = nil
     @State private var selected: SearchResult? = nil
     @State private var presentedResult: SearchResult? = nil
+    @State private var detailNavigationDirection: Int = 1
     @State private var alertTitle: String = ""
     @State private var alertMessage: String? = nil
     @State private var transmissionSendPhase: TransmissionSendPhase = .idle
     @State private var isPresentingTransmissionSettings: Bool = false
     @State private var downloads: [TransmissionTorrent] = []
-    @State private var downloadsErrorMessage: String? = nil
     @State private var isRefreshingDownloads: Bool = false
     @State private var magnetPrefetchQueue: [MagnetPrefetchCandidate] = []
     @State private var activeMagnetPrefetchTasks: [String: Task<Void, Never>] = [:]
@@ -46,19 +47,6 @@ struct ContentView: View {
     @State private var activeDetailPrefetchTasks: [String: Task<Void, Never>] = [:]
     @State private var attemptedDetailPrefetchKeys: Set<String> = []
     @State private var detailMetadataStatuses: [UUID: DetailMetadataFetchStatus] = [:]
-
-    var sortedResults: [SearchResult] {
-        var positions: [UUID: Int] = [:]
-        for (index, ranked) in TorrentRanker.rank(
-            results.map(\.raw),
-            hideExcluded: false
-        ).enumerated() {
-            positions[ranked.id] = index
-        }
-        return results.sorted {
-            (positions[$0.id] ?? .max) < (positions[$1.id] ?? .max)
-        }
-    }
 
     private var transmissionButtonTitle: String {
         switch transmissionSendPhase {
@@ -94,7 +82,6 @@ struct ContentView: View {
 
                 DownloadsPanel(
                     downloads: downloads,
-                    errorMessage: downloadsErrorMessage,
                     isRefreshing: isRefreshingDownloads,
                     onRefresh: { refreshTransmissionDownloads() },
                     onTogglePause: toggleTransmissionDownload,
@@ -108,7 +95,7 @@ struct ContentView: View {
                         ErrorStateView(message: message, retry: performSearch)
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else if isSearching {
-                        if sortedResults.isEmpty {
+                        if displayedResults.isEmpty {
                             SearchProgressView(foundCount: foundSoFar)
                                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                         } else {
@@ -117,14 +104,14 @@ struct ContentView: View {
                                     .padding(.horizontal)
                                     .padding(.vertical, 8)
                                 Divider()
-                                ResultsListView(results: sortedResults, selected: $selected, presentedResult: $presentedResult)
+                                ResultsListView(results: displayedResults, selected: $selected, presentedResult: $presentedResult)
                             }
                         }
-                    } else if sortedResults.isEmpty {
+                    } else if displayedResults.isEmpty {
                         EmptyResultsView()
                             .frame(maxWidth: .infinity, maxHeight: .infinity)
                     } else {
-                        ResultsListView(results: sortedResults, selected: $selected, presentedResult: $presentedResult)
+                        ResultsListView(results: displayedResults, selected: $selected, presentedResult: $presentedResult)
                     }
                 }
             }
@@ -148,13 +135,16 @@ struct ContentView: View {
                     password: $transmissionPassword
                 )
             }
-            .sheet(item: $presentedResult) { result in
-                ResultDetailView(
-                    result: result,
-                    metadataStatus: detailMetadataStatuses[result.id] ?? .notStarted,
-                    onPrevious: showPreviousPresentedResult,
-                    onNext: showNextPresentedResult
-                )
+            .sheet(isPresented: detailSheetIsPresented) {
+                if let result = presentedResult {
+                    ResultDetailPagerView(
+                        result: result,
+                        metadataStatus: detailMetadataStatuses[result.id] ?? .notStarted,
+                        navigationDirection: detailNavigationDirection,
+                        onPrevious: showPreviousPresentedResult,
+                        onNext: showNextPresentedResult
+                    )
+                }
             }
             .onChange(of: selected) { _, newValue in
                 prefetchSelectedMagnet(for: newValue)
@@ -220,6 +210,17 @@ struct ContentView: View {
         )
     }
 
+    private var detailSheetIsPresented: Binding<Bool> {
+        Binding(
+            get: { presentedResult != nil },
+            set: { isPresented in
+                if !isPresented {
+                    presentedResult = nil
+                }
+            }
+        )
+    }
+
     private var transmissionSettingsButton: some View {
         Button {
             isPresentingTransmissionSettings = true
@@ -247,7 +248,7 @@ struct ContentView: View {
         isSearching = true
         foundSoFar = 0
         latestSearchUpdateSequence = 0
-        results = []
+        setSearchResults([])
         selected = nil
         presentedResult = nil
         cancelMagnetPrefetchPipeline()
@@ -262,14 +263,14 @@ struct ContentView: View {
                           update.sequence > latestSearchUpdateSequence else { return }
                     latestSearchUpdateSequence = update.sequence
                     foundSoFar = update.foundSoFar
-                    results = mergedSearchResultsPreservingResolvedData(update.results.map(SearchResult.init))
+                    setSearchResults(mergedSearchResultsPreservingResolvedData(update.results.map(SearchResult.init)))
                     reconcileSelectedResult()
                     prefetchDetailMetadataIfNeeded(from: results)
                     prefetchMagnetsIfNeeded(from: results)
                 }
             }
             guard activeSearchID == searchID else { return }
-            results = mergedSearchResultsPreservingResolvedData(report.results.map(SearchResult.init))
+            setSearchResults(mergedSearchResultsPreservingResolvedData(report.results.map(SearchResult.init)))
             foundSoFar = results.count
             if results.isEmpty, !report.failures.isEmpty {
                 let details = report.failures
@@ -325,6 +326,24 @@ struct ContentView: View {
         count == 1 ? "1 release" : "\(count) releases"
     }
 
+    private func setSearchResults(_ newResults: [SearchResult]) {
+        results = newResults
+        displayedResults = rankedDisplayOrder(for: newResults)
+    }
+
+    private func rankedDisplayOrder(for searchResults: [SearchResult]) -> [SearchResult] {
+        var positions: [UUID: Int] = [:]
+        for (index, ranked) in TorrentRanker.rank(
+            searchResults.map(\.raw),
+            hideExcluded: false
+        ).enumerated() {
+            positions[ranked.id] = index
+        }
+        return searchResults.sorted {
+            (positions[$0.id] ?? .max) < (positions[$1.id] ?? .max)
+        }
+    }
+
     private func resolvedMagnet(for selected: SearchResult) async throws -> String {
         if let magnet = selected.magnet, !magnet.isEmpty {
             return magnet
@@ -338,7 +357,7 @@ struct ContentView: View {
         if let index = results.firstIndex(where: { $0.id == selected.id }) {
             let updated = results[index].withMagnet(magnet)
             results[index] = updated
-            results = dedupedResults(results)
+            setSearchResults(dedupedResults(results))
             self.selected = results.first(where: { $0.id == updated.id }) ?? results.first(where: { $0.magnet?.infoHashFromMagnet == magnet.infoHashFromMagnet })
         }
 
@@ -522,7 +541,7 @@ struct ContentView: View {
               results[index].magnet?.isEmpty != false else { return }
         let updated = results[index].withMagnet(magnet)
         results[index] = updated
-        results = dedupedResults(results)
+        setSearchResults(dedupedResults(results))
         if selected?.id == resultID {
             selected = results.first(where: { $0.id == updated.id })
         }
@@ -571,7 +590,7 @@ struct ContentView: View {
         let resultID = results[index].id
         let updated = results[index].withDetailMetadata(metadata)
         results[index] = updated
-        results = dedupedResults(results)
+        setSearchResults(dedupedResults(results))
         if selected?.id == resultID {
             selected = results.first(where: { $0.id == updated.id })
         }
@@ -681,22 +700,28 @@ struct ContentView: View {
 
     private func showPreviousPresentedResult() {
         guard let previous = adjacentPresentedResult(offset: -1) else { return }
-        selected = previous
-        presentedResult = previous
+        detailNavigationDirection = -1
+        withAnimation(.easeInOut(duration: 0.2)) {
+            selected = previous
+            presentedResult = previous
+        }
     }
 
     private func showNextPresentedResult() {
         guard let next = adjacentPresentedResult(offset: 1) else { return }
-        selected = next
-        presentedResult = next
+        detailNavigationDirection = 1
+        withAnimation(.easeInOut(duration: 0.2)) {
+            selected = next
+            presentedResult = next
+        }
     }
 
     private func adjacentPresentedResult(offset: Int) -> SearchResult? {
         guard let presentedResult,
-              let index = sortedResults.firstIndex(where: { $0.id == presentedResult.id }) else { return nil }
+              let index = displayedResults.firstIndex(where: { $0.id == presentedResult.id }) else { return nil }
         let adjacentIndex = index + offset
-        guard sortedResults.indices.contains(adjacentIndex) else { return nil }
-        return sortedResults[adjacentIndex]
+        guard displayedResults.indices.contains(adjacentIndex) else { return nil }
+        return displayedResults[adjacentIndex]
     }
 
     private func makeTransmissionEndpoints() throws -> [TransmissionEndpoint] {
@@ -776,7 +801,7 @@ struct ContentView: View {
     private func monitorTransmissionDownloads() async {
         await refreshTransmissionDownloads()
         while !Task.isCancelled {
-            try? await Task.sleep(for: .seconds(2))
+            try? await Task.sleep(for: downloads.isEmpty ? .seconds(30) : .seconds(2))
             await refreshTransmissionDownloads()
         }
     }
@@ -794,7 +819,6 @@ struct ContentView: View {
             endpoints = try makeTransmissionEndpoints()
         } catch {
             downloads = []
-            downloadsErrorMessage = nil
             return
         }
 
@@ -804,10 +828,9 @@ struct ContentView: View {
         do {
             downloads = try await performTransmissionRequest(using: endpoints) { client in
                 try await client.torrents()
-            }
-            downloadsErrorMessage = nil
+            }.filter(\.isIncompleteDownload)
         } catch {
-            downloadsErrorMessage = transmissionConnectionErrorMessage(for: error)
+            downloads = []
         }
     }
 
@@ -1184,7 +1207,6 @@ private enum TransmissionSendError: LocalizedError {
 
 private struct DownloadsPanel: View {
     let downloads: [TransmissionTorrent]
-    let errorMessage: String?
     let isRefreshing: Bool
     var onRefresh: () -> Void
     var onTogglePause: (TransmissionTorrent) -> Void
@@ -1192,32 +1214,21 @@ private struct DownloadsPanel: View {
     var onPriorityChange: (TransmissionTorrentPriority, TransmissionTorrent) -> Void
 
     var body: some View {
-        if !downloads.isEmpty || errorMessage != nil {
+        if !downloads.isEmpty {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 8) {
                     Label("Downloads", systemImage: "arrow.down.circle")
                         .font(.headline)
                     Spacer(minLength: 0)
-                    if isRefreshing {
-                        ProgressView()
-                            .controlSize(.small)
-                    }
                     Button(action: onRefresh) {
                         Image(systemName: "arrow.clockwise")
                     }
                     .buttonStyle(.borderless)
+                    .disabled(isRefreshing)
                     .accessibilityLabel("Refresh Downloads")
 #if os(macOS)
                     .help("Refresh Downloads")
 #endif
-                }
-
-                if let errorMessage {
-                    Text(errorMessage)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(3)
-                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 ForEach(downloads) { torrent in
@@ -1866,6 +1877,41 @@ private struct ScoreBadge: View {
 
 // Removed ChipsFlow and HeightPreferenceKey structs as requested
 
+private struct ResultDetailPagerView: View {
+    let result: SearchResult
+    let metadataStatus: DetailMetadataFetchStatus
+    let navigationDirection: Int
+    var onPrevious: () -> Void
+    var onNext: () -> Void
+
+    private var insertionEdge: Edge {
+        navigationDirection < 0 ? .leading : .trailing
+    }
+
+    private var removalEdge: Edge {
+        navigationDirection < 0 ? .trailing : .leading
+    }
+
+    var body: some View {
+        ZStack {
+            ResultDetailView(
+                result: result,
+                metadataStatus: metadataStatus,
+                onPrevious: onPrevious,
+                onNext: onNext
+            )
+            .id(result.id)
+            .transition(
+                .asymmetric(
+                    insertion: .move(edge: insertionEdge).combined(with: .opacity),
+                    removal: .move(edge: removalEdge).combined(with: .opacity)
+                )
+            )
+        }
+        .animation(.easeInOut(duration: 0.2), value: result.id)
+    }
+}
+
 private struct ResultDetailView: View {
     let result: SearchResult
     let metadataStatus: DetailMetadataFetchStatus
@@ -1949,9 +1995,9 @@ private struct ResultDetailView: View {
                     guard abs(value.translation.width) > abs(value.translation.height),
                           abs(value.translation.width) > 60 else { return }
                     if value.translation.width < 0 {
-                        onPrevious()
-                    } else {
                         onNext()
+                    } else {
+                        onPrevious()
                     }
                 }
         )
@@ -2505,6 +2551,9 @@ private struct ResultsListView: View {
                 presentedResult = result
             }
             .listRowBackground(selected?.id == result.id ? Color.accentColor.opacity(0.1) : Color.clear)
+            .transaction { transaction in
+                transaction.animation = nil
+            }
         }
         .listStyle(.plain)
         .listRowInsets(EdgeInsets(top: 6, leading: 8, bottom: 6, trailing: 8))

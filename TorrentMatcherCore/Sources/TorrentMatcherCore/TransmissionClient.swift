@@ -197,6 +197,10 @@ public struct TransmissionTorrent: Identifiable, Hashable, Sendable, Decodable {
     public var isStopped: Bool {
         status == 0
     }
+
+    public var isIncompleteDownload: Bool {
+        percentDone < 1
+    }
 }
 
 public struct TransmissionTrackerStats: Hashable, Sendable, Decodable {

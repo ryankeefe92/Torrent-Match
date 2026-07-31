@@ -71,9 +71,47 @@ public enum BuiltInProviderConfigs {
         searchPageCount: 3
     )
 
+    public static let magnetz = ProviderConfig(
+        id: "magnetz",
+        name: "Magnetz",
+        enabled: true,
+        searchURLTemplate: "https://magnetz.eu/api/magnets/search?query={{query}}&page={{page}}",
+        resultBlockPattern: "",
+        titlePattern: "",
+        detailURLPattern: nil,
+        magnetPattern: nil,
+        fetchMagnetFromDetailDuringSearch: false,
+        seedersPattern: "",
+        leechersPattern: "",
+        detailBaseURL: "https://magnetz.eu",
+        timeoutSeconds: 20,
+        searchPageCount: 2
+    )
+
+    public static let yts = ProviderConfig(
+        id: "yts",
+        name: "YTS",
+        enabled: true,
+        searchURLTemplate: "https://movies-api.accel.li/api/v2/list_movies.json?query_term={{query}}&limit=50&sort_by=seeds&order_by=desc",
+        alternateSearchURLTemplates: [
+            "https://yts.gg/api/v2/list_movies.json?query_term={{query}}&limit=50&sort_by=seeds&order_by=desc"
+        ],
+        resultBlockPattern: "",
+        titlePattern: "",
+        detailURLPattern: nil,
+        magnetPattern: nil,
+        fetchMagnetFromDetailDuringSearch: false,
+        seedersPattern: "",
+        leechersPattern: "",
+        detailBaseURL: "https://yts.gg",
+        timeoutSeconds: 20
+    )
+
     public static let `default`: [ProviderConfig] = [
         x1337,
         pirateBay,
-        torrentGalaxy
+        torrentGalaxy,
+        magnetz,
+        yts
     ]
 }

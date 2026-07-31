@@ -324,6 +324,10 @@ public final class TorrentSearchService: @unchecked Sendable {
         switch config.id {
         case "pirate-bay":
             return PirateBayAPIProvider(config: config)
+        case "magnetz":
+            return MagnetzAPIProvider(config: config)
+        case "yts":
+            return YTSAPIProvider(config: config)
         default:
             return RegexHTMLProvider(config: config)
         }
