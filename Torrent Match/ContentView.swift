@@ -10,10 +10,11 @@ import SwiftData
 import Foundation
 import TorrentMatcherCore
 
-struct ContentView: View {
+struct MovieSearchView: View {
     private let searchService = TorrentSearchService(configs: BuiltInProviderConfigs.default)
     private let maxConcurrentMagnetPrefetches = 8
     private let maxConcurrentDetailPrefetches = 16
+    @EnvironmentObject private var transmissionStore: TransmissionStore
 
     // MARK: - Search / Results State
     @AppStorage("transmission.rpcURL") private var transmissionRPCURL: String = ""
@@ -81,12 +82,12 @@ struct ContentView: View {
                 Divider()
 
                 DownloadsPanel(
-                    downloads: downloads,
-                    isRefreshing: isRefreshingDownloads,
-                    onRefresh: { refreshTransmissionDownloads() },
-                    onTogglePause: toggleTransmissionDownload,
-                    onDelete: deleteTransmissionDownload,
-                    onPriorityChange: updateTransmissionDownloadPriority
+                    downloads: transmissionStore.downloads,
+                    isRefreshing: transmissionStore.isRefreshing,
+                    onRefresh: refreshSharedTransmissionDownloads,
+                    onTogglePause: toggleSharedTransmissionDownload,
+                    onDelete: deleteSharedTransmissionDownload,
+                    onPriorityChange: updateSharedTransmissionDownloadPriority
                 )
 
                 // Results / Loading / Error / Empty
@@ -154,9 +155,6 @@ struct ContentView: View {
             }
             .onChange(of: query) { _, newValue in
                 movieAutocomplete.updateQuery(newValue)
-            }
-            .task {
-                await monitorTransmissionDownloads()
             }
             .toolbar {
                 #if os(iOS)
@@ -313,7 +311,7 @@ struct ContentView: View {
                 let magnet = try await resolvedMagnet(for: selected)
                 transmissionSendPhase = .connecting
                 try await addMagnetToTransmission(magnet, using: endpoints)
-                await refreshTransmissionDownloads()
+                await transmissionStore.refreshDownloads()
                 showAlert(title: "Download Started", message: "\(selected.title) has begun downloading.")
             } catch {
                 let presentation = transmissionErrorPresentation(for: error, phase: transmissionSendPhase)
@@ -806,6 +804,54 @@ struct ContentView: View {
         }
     }
 
+    private func refreshSharedTransmissionDownloads() {
+        Task { @MainActor in
+            await transmissionStore.refreshDownloads()
+        }
+    }
+
+    private func toggleSharedTransmissionDownload(_ torrent: TransmissionTorrent) {
+        Task { @MainActor in
+            do {
+                try await transmissionStore.togglePause(for: torrent)
+            } catch {
+                showAlert(
+                    title: torrent.isStopped ? "Resume Failed" : "Pause Failed",
+                    message: transmissionConnectionErrorMessage(for: error)
+                )
+            }
+        }
+    }
+
+    private func deleteSharedTransmissionDownload(_ torrent: TransmissionTorrent) {
+        Task { @MainActor in
+            do {
+                try await transmissionStore.remove(torrentIDs: [torrent.id], deleteLocalData: true)
+            } catch {
+                showAlert(
+                    title: "Delete Failed",
+                    message: transmissionConnectionErrorMessage(for: error)
+                )
+            }
+        }
+    }
+
+    private func updateSharedTransmissionDownloadPriority(
+        _ priority: TransmissionTorrentPriority,
+        for torrent: TransmissionTorrent
+    ) {
+        Task { @MainActor in
+            do {
+                try await transmissionStore.setPriority(priority, torrentIDs: [torrent.id])
+            } catch {
+                showAlert(
+                    title: "Priority Failed",
+                    message: transmissionConnectionErrorMessage(for: error)
+                )
+            }
+        }
+    }
+
     private func refreshTransmissionDownloads() {
         Task { @MainActor in
             await refreshTransmissionDownloads()
@@ -1205,7 +1251,7 @@ private enum TransmissionSendError: LocalizedError {
     case allEndpointsFailed([TransmissionEndpointFailure])
 }
 
-private struct DownloadsPanel: View {
+struct DownloadsPanel: View {
     let downloads: [TransmissionTorrent]
     let isRefreshing: Bool
     var onRefresh: () -> Void
@@ -2704,7 +2750,7 @@ fileprivate struct NavigationViewWrapper<Content: View>: View {
     }
 }
 
-private struct TransmissionSettingsView: View {
+struct TransmissionSettingsView: View {
     @Binding var rpcURL: String
     @Binding var tailscaleRPCURL: String
     @Binding var preferTailscale: Bool
@@ -2774,19 +2820,24 @@ private extension UIApplication {
     ContentView_PreviewWrapper()
         .frame(width: 900, height: 600)
 #else
-    ContentView()
+    ContentView_PreviewWrapper()
 #endif
 }
 // Helper to preview ContentView with seeded results on macOS
 private struct ContentView_PreviewWrapper: View {
+    @StateObject private var transmissionStore = TransmissionStore()
+    @StateObject private var tvAutomation = TVAutomationCoordinator()
+
     var body: some View {
         ContentView()
+            .environmentObject(transmissionStore)
+            .environmentObject(tvAutomation)
             .onAppear { /* no-op; ContentView drives its own state */ }
     }
 }
 
 #Preview("iOS Preview") {
 #if os(iOS)
-    ContentView()
+    ContentView_PreviewWrapper()
 #endif
 }

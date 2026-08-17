@@ -2,11 +2,21 @@ import Foundation
 
 public enum TorrentResultDedupe {
     public static func dedupe(_ results: [TorrentSearchResult]) -> [TorrentSearchResult] {
-        let byHash = dedupeByInfoHash(results)
-        return dedupeByNormalizedTitle(byHash)
+        dedupe(results, profile: .movie)
     }
 
-    private static func dedupeByInfoHash(_ results: [TorrentSearchResult]) -> [TorrentSearchResult] {
+    public static func dedupe(
+        _ results: [TorrentSearchResult],
+        profile: TorrentRankingProfile
+    ) -> [TorrentSearchResult] {
+        let byHash = dedupeByInfoHash(results, profile: profile)
+        return dedupeByNormalizedTitle(byHash, profile: profile)
+    }
+
+    private static func dedupeByInfoHash(
+        _ results: [TorrentSearchResult],
+        profile: TorrentRankingProfile
+    ) -> [TorrentSearchResult] {
         var output: [TorrentSearchResult] = []
         output.reserveCapacity(results.count)
 
@@ -20,7 +30,11 @@ public enum TorrentResultDedupe {
             }
 
             if let existingIndex = indexByHash[hash] {
-                output[existingIndex] = preferredDuplicate(between: output[existingIndex], and: result)
+                output[existingIndex] = preferredDuplicate(
+                    between: output[existingIndex],
+                    and: result,
+                    profile: profile
+                )
             } else {
                 indexByHash[hash] = output.count
                 output.append(result)
@@ -30,7 +44,10 @@ public enum TorrentResultDedupe {
         return output
     }
 
-    private static func dedupeByNormalizedTitle(_ results: [TorrentSearchResult]) -> [TorrentSearchResult] {
+    private static func dedupeByNormalizedTitle(
+        _ results: [TorrentSearchResult],
+        profile: TorrentRankingProfile
+    ) -> [TorrentSearchResult] {
         var output: [TorrentSearchResult] = []
         output.reserveCapacity(results.count)
 
@@ -45,7 +62,11 @@ public enum TorrentResultDedupe {
             }
 
             if let existingIndex = indexByTitle[key] {
-                output[existingIndex] = preferredDuplicate(between: output[existingIndex], and: result)
+                output[existingIndex] = preferredDuplicate(
+                    between: output[existingIndex],
+                    and: result,
+                    profile: profile
+                )
             } else {
                 indexByTitle[key] = output.count
                 output.append(result)
@@ -55,7 +76,11 @@ public enum TorrentResultDedupe {
         return output
     }
 
-    private static func preferredDuplicate(between lhs: TorrentSearchResult, and rhs: TorrentSearchResult) -> TorrentSearchResult {
+    private static func preferredDuplicate(
+        between lhs: TorrentSearchResult,
+        and rhs: TorrentSearchResult,
+        profile: TorrentRankingProfile
+    ) -> TorrentSearchResult {
         let lhsWithMergedMetadata = mergedWinner(lhs, withMetadataFrom: rhs)
         let rhsWithMergedMetadata = mergedWinner(rhs, withMetadataFrom: lhs)
         let lhsCorrectionPriority = lhsWithMergedMetadata.title.correctionReleasePriority
@@ -74,8 +99,8 @@ public enum TorrentResultDedupe {
             return lhsHasMagnet ? lhsWithMergedMetadata : rhsWithMergedMetadata
         }
 
-        let lhsRanked = TorrentRanker.score(lhsWithMergedMetadata)
-        let rhsRanked = TorrentRanker.score(rhsWithMergedMetadata)
+        let lhsRanked = TorrentRanker.score(lhsWithMergedMetadata, profile: profile)
+        let rhsRanked = TorrentRanker.score(rhsWithMergedMetadata, profile: profile)
 
         if lhsRanked.excluded != rhsRanked.excluded {
             return lhsRanked.excluded ? rhsWithMergedMetadata : lhsWithMergedMetadata

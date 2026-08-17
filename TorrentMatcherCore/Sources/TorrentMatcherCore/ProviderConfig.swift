@@ -105,6 +105,10 @@ public protocol TorrentProvider: Sendable {
         _ query: String,
         onProgress: (@Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)?
     ) async throws -> [TorrentSearchResult]
+    func search(
+        _ request: TorrentProviderSearchRequest,
+        onProgress: (@Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)?
+    ) async throws -> [TorrentSearchResult]
     func resolveMagnet(for result: TorrentSearchResult) async throws -> String?
     func fetchDetailMetadata(for result: TorrentSearchResult) async throws -> TorrentDetailMetadata?
 }
@@ -114,12 +118,82 @@ public extension TorrentProvider {
         try await search(query, onProgress: nil)
     }
 
+    func search(
+        _ request: TorrentProviderSearchRequest,
+        onProgress: (@Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)?
+    ) async throws -> [TorrentSearchResult] {
+        guard request.target.rankingProfile == .television else {
+            return try await search(request.query, onProgress: onProgress)
+        }
+
+        let collector = ContextualTVProviderResultCollector(target: request.target)
+        var firstError: Error?
+
+        for query in request.queryVariants {
+            do {
+                let results = try await search(query) { addedResults in
+                    let matching = await collector.append(addedResults)
+                    if !matching.isEmpty, let onProgress {
+                        await onProgress(matching)
+                    }
+                }
+                let matching = await collector.append(results)
+                if !matching.isEmpty, let onProgress {
+                    await onProgress(matching)
+                }
+                let collected = await collector.snapshot()
+                if !collected.isEmpty {
+                    return collected
+                }
+            } catch {
+                if firstError == nil {
+                    firstError = error
+                }
+                if !(await collector.snapshot()).isEmpty {
+                    throw error
+                }
+            }
+        }
+
+        if let firstError {
+            throw firstError
+        }
+        return []
+    }
+
     func resolveMagnet(for result: TorrentSearchResult) async throws -> String? {
         result.magnet
     }
 
     func fetchDetailMetadata(for result: TorrentSearchResult) async throws -> TorrentDetailMetadata? {
         nil
+    }
+}
+
+private actor ContextualTVProviderResultCollector {
+    private let target: TorrentSearchTarget
+    private var results: [TorrentSearchResult] = []
+
+    init(target: TorrentSearchTarget) {
+        self.target = target
+    }
+
+    func append(_ candidates: [TorrentSearchResult]) -> [TorrentSearchResult] {
+        let matching = candidates.filter {
+            TVReleaseParser.matches($0.title, target: target)
+        }
+        guard !matching.isEmpty else { return [] }
+
+        let previous = Set(results)
+        results = TorrentResultDedupe.dedupe(
+            results + matching,
+            profile: .television
+        )
+        return matching.filter { !previous.contains($0) }
+    }
+
+    func snapshot() -> [TorrentSearchResult] {
+        results
     }
 }
 

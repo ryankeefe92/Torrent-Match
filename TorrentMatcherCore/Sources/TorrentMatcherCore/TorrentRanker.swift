@@ -2,16 +2,31 @@ import Foundation
 
 public enum TorrentRanker {
     private static let maxRawScore = 1_108.5821108088064
+    private static let expandedAspectRatioMaximum = 15.0
     private static let correctedReleaseScoreWindow = 5
 
     public static func qualityBreakdown(for result: TorrentSearchResult) -> QualityScoreBreakdown {
+        qualityBreakdown(for: result, profile: .movie)
+    }
+
+    public static func qualityBreakdown(
+        for result: TorrentSearchResult,
+        profile: TorrentRankingProfile
+    ) -> QualityScoreBreakdown {
         let titleParsed = ReleaseParser.parse(result.title)
         let detailParsed = result.detailSpecs?.releaseHintText.map { ReleaseParser.parse($0) }
         let parsed = titleParsed.mergedWithDetail(parsed: detailParsed, specs: result.detailSpecs)
-        return qualityBreakdown(for: result, parsed: parsed)
+        return qualityBreakdown(for: result, parsed: parsed, profile: profile)
     }
 
     public static func score(_ result: TorrentSearchResult) -> RankedTorrentResult {
+        score(result, profile: .movie)
+    }
+
+    public static func score(
+        _ result: TorrentSearchResult,
+        profile: TorrentRankingProfile
+    ) -> RankedTorrentResult {
         let titleParsed = ReleaseParser.parse(result.title)
         let detailParsed = result.detailSpecs?.releaseHintText.map { ReleaseParser.parse($0) }
         let parsed = titleParsed.mergedWithDetail(parsed: detailParsed, specs: result.detailSpecs)
@@ -29,8 +44,10 @@ public enum TorrentRanker {
             )
         }
 
-        if upperTitle.range(of: #"(^|[^A-Z0-9])RIFF[\s._-]*TRAX([^A-Z0-9]|$)"#, options: .regularExpression) != nil ||
-            upperTitle.range(of: #"(^|[^A-Z0-9])RIFFTRAX([^A-Z0-9]|$)"#, options: .regularExpression) != nil {
+        if profile == .movie && (
+            upperTitle.range(of: #"(^|[^A-Z0-9])RIFF[\s._-]*TRAX([^A-Z0-9]|$)"#, options: .regularExpression) != nil ||
+            upperTitle.range(of: #"(^|[^A-Z0-9])RIFFTRAX([^A-Z0-9]|$)"#, options: .regularExpression) != nil
+        ) {
             return RankedTorrentResult(
                 raw: result,
                 parsed: parsed,
@@ -80,7 +97,7 @@ public enum TorrentRanker {
             notes.append("\(label): \(formatSignedPoints(points))\(suffix)")
         }
 
-        let breakdown = qualityBreakdown(for: result, parsed: parsed)
+        let breakdown = qualityBreakdown(for: result, parsed: parsed, profile: profile)
         let video = breakdown.video
         let audio = breakdown.audio
         add(
@@ -110,12 +127,14 @@ public enum TorrentRanker {
         let colorGamut = colorGamutScore(result: result, parsed: parsed)
         add("Color gamut", colorGamut.points * gate, detail: colorGamut.detail)
 
-        let expandedAspectRatio = hasExpandedAspectRatioSignal(result: result, parsed: parsed)
-        add(
-            "Expanded aspect ratio",
-            (expandedAspectRatio ? 15.0 : 0) * gate,
-            detail: expandedAspectRatio ? "explicit IMAX/open matte/expanded aspect ratio" : nil
-        )
+        if profile == .movie {
+            let expandedAspectRatio = hasExpandedAspectRatioSignal(result: result, parsed: parsed)
+            add(
+                "Expanded aspect ratio",
+                (expandedAspectRatio ? expandedAspectRatioMaximum : 0) * gate,
+                detail: expandedAspectRatio ? "explicit IMAX/open matte/expanded aspect ratio" : nil
+            )
+        }
 
         add(
             "Encoding",
@@ -148,21 +167,36 @@ public enum TorrentRanker {
             Double(sourceScore(parsed, specs: result.detailSpecs)),
             detail: sourceScoreDetail(parsed, specs: result.detailSpecs)
         )
-        add("Weak source penalty", Double(lowQualitySourcePenalty(in: upperTitle)), detail: lowQualitySourceLabel(in: upperTitle))
+        if profile == .movie {
+            add(
+                "Weak source penalty",
+                Double(lowQualitySourcePenalty(in: upperTitle)),
+                detail: lowQualitySourceLabel(in: upperTitle)
+            )
+        }
         let codecPenalty = videoCodecCompatibilityPenalty(codec)
         if codecPenalty != 0 {
             add("Video codec compatibility", Double(codecPenalty), detail: codec.rawValue)
         }
 
         notes.append("Availability: \(result.seeders) seeders / \(result.leechers) leechers; seeders used only for exact score ties")
-        notes.append("Raw quality score: \(Int(rawScore.rounded())) / \(Int(maxRawScore.rounded()))")
+        let scoreMaximum = maxRawScore(for: profile)
+        notes.append("Raw quality score: \(Int(rawScore.rounded())) / \(Int(scoreMaximum.rounded()))")
 
-        let displayScore = Int((rawScore / maxRawScore * 1_000).rounded())
+        let displayScore = Int((rawScore / scoreMaximum * 1_000).rounded())
         return RankedTorrentResult(raw: result, parsed: parsed, score: displayScore, notes: notes, excluded: false)
     }
 
     public static func rank(_ results: [TorrentSearchResult], hideExcluded: Bool = true) -> [RankedTorrentResult] {
-        var ranked = results.map { score($0) }
+        rank(results, hideExcluded: hideExcluded, profile: .movie)
+    }
+
+    public static func rank(
+        _ results: [TorrentSearchResult],
+        hideExcluded: Bool = true,
+        profile: TorrentRankingProfile
+    ) -> [RankedTorrentResult] {
+        var ranked = results.map { score($0, profile: profile) }
         if hideExcluded {
             ranked.removeAll { $0.excluded }
         }
@@ -176,6 +210,15 @@ public enum TorrentRanker {
             return $0.raw.title < $1.raw.title
         }
         return promoteCorrectedReleases(in: ranked)
+    }
+
+    private static func maxRawScore(for profile: TorrentRankingProfile) -> Double {
+        switch profile {
+        case .movie:
+            return maxRawScore
+        case .television:
+            return maxRawScore - expandedAspectRatioMaximum
+        }
     }
 }
 
@@ -273,10 +316,18 @@ private extension TorrentRanker {
         parsed.videoCodec
     }
 
-    static func qualityBreakdown(for result: TorrentSearchResult, parsed: ParsedRelease) -> QualityScoreBreakdown {
+    static func qualityBreakdown(
+        for result: TorrentSearchResult,
+        parsed: ParsedRelease,
+        profile: TorrentRankingProfile
+    ) -> QualityScoreBreakdown {
         let dimensions = videoDimensions(parsed: parsed, specs: result.detailSpecs)
         let frameRate = frameRate(from: result.detailSpecs) ?? 24
-        let bitrateSource = videoBitrateKbps(result: result, parsed: parsed)
+        let bitrateSource = videoBitrateKbps(
+            result: result,
+            parsed: parsed,
+            profile: profile
+        )
         let codecFactor = videoCodecFactor(parsed.videoCodec, width: dimensions.width, height: dimensions.height)
         let adjustedBPPPF = Double(bitrateSource.kbps) * 1_000 * codecFactor / Double(max(dimensions.width, 1)) / Double(max(dimensions.height, 1)) / frameRate
         let targetBPPPF = videoTargetBPPPF(width: dimensions.width, height: dimensions.height)
@@ -293,7 +344,12 @@ private extension TorrentRanker {
         )
         let compressionHealth = pictureBase > 0 ? pictureScore / pictureBase : 0
 
-        let audioBitrateSource = audioBitrateKbps(result: result, parsed: parsed, videoBitrate: bitrateSource)
+        let audioBitrateSource = audioBitrateKbps(
+            result: result,
+            parsed: parsed,
+            videoBitrate: bitrateSource,
+            profile: profile
+        )
         let audioBitrate = audioBitrateSource.kbps
         let effectiveChannels = effectiveChannelCount(parsed.channels)
         let audioCodecFactor = audioCodecDensityFactor(
@@ -356,7 +412,11 @@ private extension TorrentRanker {
         }
     }
 
-    static func videoBitrateKbps(result: TorrentSearchResult, parsed: ParsedRelease) -> VideoBitrateSource {
+    static func videoBitrateKbps(
+        result: TorrentSearchResult,
+        parsed: ParsedRelease,
+        profile: TorrentRankingProfile
+    ) -> VideoBitrateSource {
         if let videoBitrate = bitrateKbps(result.detailSpecs?.videoBitrate) {
             let isCalculated = result.detailSpecs?.isCalculated("videoBitrate") == true
             return VideoBitrateSource(kbps: videoBitrate, estimated: false, label: isCalculated ? "derived" : "explicit", usedEstimatedAudio: false)
@@ -364,22 +424,38 @@ private extension TorrentRanker {
         if let calculated = bitrateKbps(result.detailSpecs?.calculatedVideoBitrate) {
             return VideoBitrateSource(kbps: calculated, estimated: false, label: "derived", usedEstimatedAudio: false)
         }
-        if let derived = derivedVideoBitrateFromSizeRuntimeAndAudio(result: result, parsed: parsed) {
+        if let derived = derivedVideoBitrateFromSizeRuntimeAndAudio(
+            result: result,
+            parsed: parsed,
+            profile: profile
+        ) {
             return VideoBitrateSource(kbps: derived.kbps, estimated: false, label: "calculated from size ÷ runtime - audio", usedEstimatedAudio: derived.usedEstimatedAudio)
         }
-        let estimated = estimatedVideoBitrateKbps(result: result, parsed: parsed)
+        let estimated = estimatedVideoBitrateKbps(
+            result: result,
+            parsed: parsed,
+            profile: profile
+        )
         return VideoBitrateSource(kbps: estimated.kbps, estimated: true, label: estimated.label, usedEstimatedAudio: false)
     }
 
-    static func derivedVideoBitrateFromSizeRuntimeAndAudio(result: TorrentSearchResult, parsed: ParsedRelease) -> (kbps: Int, usedEstimatedAudio: Bool)? {
-        guard let overall = overallBitrateKbps(result: result),
+    static func derivedVideoBitrateFromSizeRuntimeAndAudio(
+        result: TorrentSearchResult,
+        parsed: ParsedRelease,
+        profile: TorrentRankingProfile
+    ) -> (kbps: Int, usedEstimatedAudio: Bool)? {
+        guard let overall = overallBitrateKbps(result: result, profile: profile),
               let audio = audioBitrateForVideoDerivation(result: result, parsed: parsed),
               audio.kbps > 0,
               overall > audio.kbps else { return nil }
         return (overall - audio.kbps, audio.estimated)
     }
 
-    static func estimatedVideoBitrateKbps(result: TorrentSearchResult, parsed: ParsedRelease) -> (kbps: Int, label: String) {
+    static func estimatedVideoBitrateKbps(
+        result: TorrentSearchResult,
+        parsed: ParsedRelease,
+        profile: TorrentRankingProfile
+    ) -> (kbps: Int, label: String) {
         let sourceEstimate: Int
         switch (parsed.resolution, parsed.sourceType) {
         case (.p2160, .remux): sourceEstimate = 55_000
@@ -400,7 +476,7 @@ private extension TorrentRanker {
         case (.sd, _): sourceEstimate = 2_000
         case (.unknown, _): sourceEstimate = 5_000
         }
-        guard let overall = overallBitrateKbps(result: result) else {
+        guard let overall = overallBitrateKbps(result: result, profile: profile) else {
             return (sourceEstimate, "estimated")
         }
         let share = result.title.containsStandaloneMultiToken ? 0.80 : 0.90
@@ -749,7 +825,12 @@ private extension TorrentRanker {
             .joined(separator: " ")
     }
 
-    static func audioBitrateKbps(result: TorrentSearchResult, parsed: ParsedRelease, videoBitrate: VideoBitrateSource) -> AudioBitrateSource {
+    static func audioBitrateKbps(
+        result: TorrentSearchResult,
+        parsed: ParsedRelease,
+        videoBitrate: VideoBitrateSource,
+        profile: TorrentRankingProfile
+    ) -> AudioBitrateSource {
         if let bitrate = bitrateKbps(result.detailSpecs?.bestEnglishAudioBitrate) {
             let isCalculated = result.detailSpecs?.isCalculated("bestEnglishAudioBitrate") == true
             return AudioBitrateSource(kbps: bitrate, estimated: false, label: isCalculated ? "derived" : "explicit")
@@ -759,7 +840,7 @@ private extension TorrentRanker {
             return AudioBitrateSource(kbps: estimated, estimated: true, label: "estimated")
         }
         if !videoBitrate.estimated,
-           let overall = overallBitrateKbps(result: result),
+           let overall = overallBitrateKbps(result: result, profile: profile),
            overall > videoBitrate.kbps {
             return AudioBitrateSource(kbps: overall - videoBitrate.kbps, estimated: false, label: "derived from overall-video")
         }
@@ -1282,9 +1363,16 @@ private extension TorrentRanker {
         return ratio <= 3.0
     }
 
-    static func overallBitrateKbps(result: TorrentSearchResult) -> Int? {
+    static func overallBitrateKbps(
+        result: TorrentSearchResult,
+        profile: TorrentRankingProfile
+    ) -> Int? {
         if let explicit = bitrateKbps(result.detailSpecs?.overallBitrate) {
             return explicit
+        }
+        if profile == .television,
+           TVReleaseParser.parse(result.title)?.coverage.isAggregate == true {
+            return nil
         }
         guard let sizeBytes = fileSizeBytes(result.size),
               let runtimeSeconds = runtimeSeconds(from: result.detailSpecs?.runtime),

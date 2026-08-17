@@ -10,11 +10,21 @@ import SwiftData
 
 @main
 struct Torrent_MatchApp: App {
+    @StateObject private var transmissionStore = TransmissionStore()
+    @StateObject private var tvAutomation = TVAutomationCoordinator()
+
     var sharedModelContainer: ModelContainer = {
         let schema = Schema([
             Item.self,
+            TVSubscription.self,
+            TVAcquisitionPlan.self,
+            TVAcquisitionJob.self,
+            TVAcquisitionHistoryEntry.self,
         ])
-        let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
+        let modelConfiguration = ModelConfiguration(
+            schema: schema,
+            isStoredInMemoryOnly: false
+        )
 
         do {
             return try ModelContainer(for: schema, configurations: [modelConfiguration])
@@ -26,6 +36,8 @@ struct Torrent_MatchApp: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environmentObject(transmissionStore)
+                .environmentObject(tvAutomation)
         }
         .modelContainer(sharedModelContainer)
     }

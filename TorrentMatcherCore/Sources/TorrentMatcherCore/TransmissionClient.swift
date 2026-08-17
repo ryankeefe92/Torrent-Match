@@ -22,14 +22,35 @@ public final class TransmissionClient: @unchecked Sendable {
     }
 
     public func add(magnet: String) async throws {
+        _ = try await addReturningResult(magnet: magnet)
+    }
+
+    public func addReturningResult(magnet: String) async throws -> TransmissionAddResult {
         let payload: [String: Any] = [
             "method": "torrent-add",
             "arguments": ["filename": magnet]
         ]
-        let response = try await send(payload, decoding: TransmissionRPCResponse.self)
+        let response = try await send(payload, decoding: TransmissionTorrentAddResponse.self)
         guard response.result == "success" else {
             throw TransmissionError.rpcFailure(response.result)
         }
+        if let added = response.arguments?.torrentAdded {
+            return TransmissionAddResult(
+                disposition: .added,
+                torrentID: added.id,
+                torrentName: added.name,
+                infoHash: added.hashString
+            )
+        }
+        if let duplicate = response.arguments?.torrentDuplicate {
+            return TransmissionAddResult(
+                disposition: .duplicate,
+                torrentID: duplicate.id,
+                torrentName: duplicate.name,
+                infoHash: duplicate.hashString
+            )
+        }
+        throw TransmissionError.rpcFailure("torrent-add returned no added or duplicate torrent")
     }
 
     public func torrents() async throws -> [TransmissionTorrent] {
@@ -167,6 +188,38 @@ public enum TransmissionTorrentPriority: Int, CaseIterable, Sendable {
     case high = 1
 }
 
+public struct TransmissionAddResult: Hashable, Sendable {
+    public enum Disposition: String, Hashable, Sendable {
+        case added
+        case duplicate
+    }
+
+    public let disposition: Disposition
+    public let torrentID: Int
+    public let torrentName: String
+    public let infoHash: String
+
+    public init(
+        disposition: Disposition,
+        torrentID: Int,
+        torrentName: String,
+        infoHash: String
+    ) {
+        self.disposition = disposition
+        self.torrentID = torrentID
+        self.torrentName = torrentName
+        self.infoHash = infoHash
+    }
+
+    public var wasAdded: Bool {
+        disposition == .added
+    }
+
+    public var wasDuplicate: Bool {
+        disposition == .duplicate
+    }
+}
+
 public struct TransmissionTorrent: Identifiable, Hashable, Sendable, Decodable {
     public let id: Int
     public let name: String
@@ -215,4 +268,25 @@ private struct TransmissionTorrentGetResponse: Decodable {
 
 private struct TransmissionTorrentGetArguments: Decodable {
     let torrents: [TransmissionTorrent]
+}
+
+private struct TransmissionTorrentAddResponse: Decodable {
+    let result: String
+    let arguments: TransmissionTorrentAddArguments?
+}
+
+private struct TransmissionTorrentAddArguments: Decodable {
+    let torrentAdded: TransmissionTorrentAddSummary?
+    let torrentDuplicate: TransmissionTorrentAddSummary?
+
+    private enum CodingKeys: String, CodingKey {
+        case torrentAdded = "torrent-added"
+        case torrentDuplicate = "torrent-duplicate"
+    }
+}
+
+private struct TransmissionTorrentAddSummary: Decodable {
+    let id: Int
+    let name: String
+    let hashString: String
 }
