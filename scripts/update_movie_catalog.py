@@ -160,7 +160,7 @@ def download(url: str, destination: Path) -> None:
 
 def main() -> int:
     repo_root = Path(__file__).resolve().parents[1]
-    output_path = repo_root / "TorrentMatcherCore" / "Sources" / "TorrentMatcherCore" / "Resources" / "MovieCatalog.sqlite"
+    output_path = repo_root / "Torrent Match" / "Core" / "Resources" / "MovieCatalog.sqlite"
     basics_path = output_path.with_name("title.basics.tsv.gz")
     ratings_path = output_path.with_name("title.ratings.tsv.gz")
 

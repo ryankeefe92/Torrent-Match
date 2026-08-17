@@ -1,0 +1,2842 @@
+//
+//  ContentView.swift
+//  Torrent Match
+//
+//  Created by Ryan Keefe on 5/17/26.
+//
+
+import SwiftUI
+import SwiftData
+import Foundation
+
+struct MovieSearchView: View {
+    private let searchService = TorrentSearchService(configs: BuiltInProviderConfigs.default)
+    private let maxConcurrentMagnetPrefetches = 8
+    private let maxConcurrentDetailPrefetches = 16
+    @EnvironmentObject private var transmissionStore: TransmissionStore
+
+    // MARK: - Search / Results State
+    @AppStorage("transmission.rpcURL") private var transmissionRPCURL: String = ""
+    @AppStorage("transmission.tailscaleRPCURL") private var transmissionTailscaleRPCURL: String = ""
+    @AppStorage("transmission.preferTailscale") private var transmissionPreferTailscale: Bool = false
+    @AppStorage("transmission.username") private var transmissionUsername: String = ""
+    @AppStorage("transmission.password") private var transmissionPassword: String = ""
+    @StateObject private var movieAutocomplete = MovieAutocompleteViewModel()
+    @State private var query: String = ""
+    @State private var isSearching: Bool = false
+    @State private var foundSoFar: Int = 0
+    @State private var latestSearchUpdateSequence: Int = 0
+    @State private var activeSearchID: UUID? = nil
+    @State private var results: [SearchResult] = []
+    @State private var displayedResults: [SearchResult] = []
+    @State private var errorMessage: String? = nil
+    @State private var selected: SearchResult? = nil
+    @State private var presentedResult: SearchResult? = nil
+    @State private var detailNavigationDirection: Int = 1
+    @State private var alertTitle: String = ""
+    @State private var alertMessage: String? = nil
+    @State private var transmissionSendPhase: TransmissionSendPhase = .idle
+    @State private var isPresentingTransmissionSettings: Bool = false
+    @State private var downloads: [TransmissionTorrent] = []
+    @State private var isRefreshingDownloads: Bool = false
+    @State private var magnetPrefetchQueue: [MagnetPrefetchCandidate] = []
+    @State private var activeMagnetPrefetchTasks: [String: Task<Void, Never>] = [:]
+    @State private var attemptedMagnetPrefetchKeys: Set<String> = []
+    @State private var selectedMagnetPrefetchTask: Task<Void, Never>? = nil
+    @State private var detailPrefetchQueue: [DetailPrefetchCandidate] = []
+    @State private var activeDetailPrefetchTasks: [String: Task<Void, Never>] = [:]
+    @State private var attemptedDetailPrefetchKeys: Set<String> = []
+    @State private var detailMetadataStatuses: [UUID: DetailMetadataFetchStatus] = [:]
+
+    private var transmissionButtonTitle: String {
+        switch transmissionSendPhase {
+        case .idle:
+            return "Download"
+        case .fetchingMagnet:
+            return "Fetching Magnet…"
+        case .connecting:
+            return "Connecting to Transmission…"
+        }
+    }
+
+    private var isSendingToTransmission: Bool {
+        transmissionSendPhase != .idle
+    }
+
+    var body: some View {
+        NavigationViewWrapper {
+            VStack(spacing: 0) {
+                // Search Bar + Action
+                SearchBar(
+                    query: $query,
+                    suggestions: movieAutocomplete.suggestions,
+                    onSuggestionSelected: applyMovieSuggestion,
+                    onSubmit: performSearch,
+                    onSettings: { isPresentingTransmissionSettings = true }
+                )
+                    .padding(.horizontal)
+                    .padding(.top, 6)
+                    .padding(.bottom, 6)
+
+                Divider()
+
+                DownloadsPanel(
+                    downloads: transmissionStore.downloads,
+                    isRefreshing: transmissionStore.isRefreshing,
+                    onRefresh: refreshSharedTransmissionDownloads,
+                    onTogglePause: toggleSharedTransmissionDownload,
+                    onDelete: deleteSharedTransmissionDownload,
+                    onPriorityChange: updateSharedTransmissionDownloadPriority
+                )
+
+                // Results / Loading / Error / Empty
+                Group {
+                    if let message = errorMessage {
+                        ErrorStateView(message: message, retry: performSearch)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else if isSearching {
+                        if displayedResults.isEmpty {
+                            SearchProgressView(foundCount: foundSoFar)
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        } else {
+                            VStack(spacing: 0) {
+                                SearchProgressHeader(foundCount: foundSoFar)
+                                    .padding(.horizontal)
+                                    .padding(.vertical, 8)
+                                Divider()
+                                ResultsListView(results: displayedResults, selected: $selected, presentedResult: $presentedResult)
+                            }
+                        }
+                    } else if displayedResults.isEmpty {
+                        EmptyResultsView()
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
+                        ResultsListView(results: displayedResults, selected: $selected, presentedResult: $presentedResult)
+                    }
+                }
+            }
+            .navigationTitle("")
+#if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+#endif
+            .alert(alertTitle, isPresented: alertIsPresented) {
+                Button("OK") {
+                    alertMessage = nil
+                }
+            } message: {
+                Text(alertMessage ?? "")
+            }
+            .sheet(isPresented: $isPresentingTransmissionSettings) {
+                TransmissionSettingsView(
+                    rpcURL: $transmissionRPCURL,
+                    tailscaleRPCURL: $transmissionTailscaleRPCURL,
+                    preferTailscale: $transmissionPreferTailscale,
+                    username: $transmissionUsername,
+                    password: $transmissionPassword
+                )
+            }
+            .sheet(isPresented: detailSheetIsPresented) {
+                if let result = presentedResult {
+                    ResultDetailPagerView(
+                        result: result,
+                        metadataStatus: detailMetadataStatuses[result.id] ?? .notStarted,
+                        navigationDirection: detailNavigationDirection,
+                        onPrevious: showPreviousPresentedResult,
+                        onNext: showNextPresentedResult
+                    )
+                }
+            }
+            .onChange(of: selected) { _, newValue in
+                prefetchSelectedMagnet(for: newValue)
+            }
+            .onChange(of: presentedResult) { _, newValue in
+                fetchPresentedDetailMetadataIfNeeded(for: newValue)
+            }
+            .onChange(of: query) { _, newValue in
+                movieAutocomplete.updateQuery(newValue)
+            }
+            .toolbar {
+                #if os(iOS)
+                ToolbarItem(placement: .bottomBar) {
+                    HStack {
+                        Button {
+                            sendSelectedToTransmission()
+                        } label: {
+                            Text(transmissionButtonTitle)
+                        }
+                        .labelStyle(.titleOnly)
+                        .disabled(selected == nil || isSendingToTransmission)
+                    }
+                }
+                #elseif os(macOS)
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        sendSelectedToTransmission()
+                    } label: {
+                        Text(transmissionButtonTitle)
+                    }
+                    .labelStyle(.titleOnly)
+                    .disabled(selected == nil || isSendingToTransmission)
+                }
+                #else
+                ToolbarItem(placement: .automatic) {
+                    Button {
+                        sendSelectedToTransmission()
+                    } label: {
+                        Text(transmissionButtonTitle)
+                    }
+                    .labelStyle(.titleOnly)
+                    .disabled(selected == nil || isSendingToTransmission)
+                }
+                #endif
+            }
+#if os(macOS)
+            .navigationSplitViewColumnWidth(min: 260, ideal: 320)
+#endif
+        }
+    }
+
+    private var alertIsPresented: Binding<Bool> {
+        Binding(
+            get: { alertMessage != nil },
+            set: { isPresented in
+                if !isPresented {
+                    alertMessage = nil
+                }
+            }
+        )
+    }
+
+    private var detailSheetIsPresented: Binding<Bool> {
+        Binding(
+            get: { presentedResult != nil },
+            set: { isPresented in
+                if !isPresented {
+                    presentedResult = nil
+                }
+            }
+        )
+    }
+
+    private var transmissionSettingsButton: some View {
+        Button {
+            isPresentingTransmissionSettings = true
+        } label: {
+            Label("Transmission Settings", systemImage: "gearshape")
+        }
+        .labelStyle(.iconOnly)
+#if os(macOS)
+        .help("Transmission Settings")
+#endif
+    }
+
+    // MARK: - Actions
+    private func performSearch() {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !isSearching else { return }
+        let searchQuery = movieAutocomplete.resolvedSuggestion(for: trimmed)?.providerQuery ?? trimmed
+#if os(iOS)
+        UIApplication.shared.endEditing()
+#endif
+        movieAutocomplete.clearSuggestions()
+        let searchID = UUID()
+        activeSearchID = searchID
+        errorMessage = nil
+        isSearching = true
+        foundSoFar = 0
+        latestSearchUpdateSequence = 0
+        setSearchResults([])
+        selected = nil
+        presentedResult = nil
+        cancelMagnetPrefetchPipeline()
+        cancelDetailPrefetchPipeline()
+        detailMetadataStatuses.removeAll()
+        selectedMagnetPrefetchTask?.cancel()
+
+        Task { @MainActor in
+            let report = await searchService.searchAndRankReport(searchQuery) { update in
+                Task { @MainActor in
+                    guard activeSearchID == searchID,
+                          update.sequence > latestSearchUpdateSequence else { return }
+                    latestSearchUpdateSequence = update.sequence
+                    foundSoFar = update.foundSoFar
+                    setSearchResults(mergedSearchResultsPreservingResolvedData(update.results.map(SearchResult.init)))
+                    reconcileSelectedResult()
+                    prefetchDetailMetadataIfNeeded(from: results)
+                    prefetchMagnetsIfNeeded(from: results)
+                }
+            }
+            guard activeSearchID == searchID else { return }
+            setSearchResults(mergedSearchResultsPreservingResolvedData(report.results.map(SearchResult.init)))
+            foundSoFar = results.count
+            if results.isEmpty, !report.failures.isEmpty {
+                let details = report.failures
+                    .map { "\($0.providerName): \($0.message)" }
+                    .joined(separator: "\n")
+                errorMessage = "No results. Providers reported errors:\n\(details)\n\nThis often means the site is blocked on your current network/DNS."
+            }
+            isSearching = false
+            reconcileSelectedResult()
+            prefetchDetailMetadataIfNeeded(from: results)
+            prefetchMagnetsIfNeeded(from: results)
+        }
+    }
+
+    private func applyMovieSuggestion(_ suggestion: MovieCatalogSuggestion) {
+        query = suggestion.displayTitle
+        movieAutocomplete.selectSuggestion(suggestion)
+        performSearch()
+    }
+
+    private func sendSelectedToTransmission() {
+        guard let selected else { return }
+        let endpoints: [TransmissionEndpoint]
+        do {
+            endpoints = try makeTransmissionEndpoints()
+        } catch {
+            showAlert(
+                title: "Transmission Not Configured",
+                message: (error as? LocalizedError)?.errorDescription ?? "Enter your Transmission RPC settings first."
+            )
+            isPresentingTransmissionSettings = true
+            return
+        }
+
+        Task { @MainActor in
+            defer { transmissionSendPhase = .idle }
+
+            do {
+                transmissionSendPhase = .fetchingMagnet
+                let magnet = try await resolvedMagnet(for: selected)
+                transmissionSendPhase = .connecting
+                try await addMagnetToTransmission(magnet, using: endpoints)
+                await transmissionStore.refreshDownloads()
+                showAlert(title: "Download Started", message: "\(selected.title) has begun downloading.")
+            } catch {
+                let presentation = transmissionErrorPresentation(for: error, phase: transmissionSendPhase)
+                showAlert(title: presentation.title, message: presentation.message)
+            }
+        }
+    }
+
+    private func releaseCountText(_ count: Int) -> String {
+        count == 1 ? "1 release" : "\(count) releases"
+    }
+
+    private func setSearchResults(_ newResults: [SearchResult]) {
+        results = newResults
+        displayedResults = rankedDisplayOrder(for: newResults)
+    }
+
+    private func rankedDisplayOrder(for searchResults: [SearchResult]) -> [SearchResult] {
+        var positions: [UUID: Int] = [:]
+        for (index, ranked) in TorrentRanker.rank(
+            searchResults.map(\.raw),
+            hideExcluded: false
+        ).enumerated() {
+            positions[ranked.id] = index
+        }
+        return searchResults.sorted {
+            (positions[$0.id] ?? .max) < (positions[$1.id] ?? .max)
+        }
+    }
+
+    private func resolvedMagnet(for selected: SearchResult) async throws -> String {
+        if let magnet = selected.magnet, !magnet.isEmpty {
+            return magnet
+        }
+
+        let magnet = try await searchService.resolveMagnet(for: selected.raw)
+        guard let magnet, !magnet.isEmpty else {
+            throw TransmissionConfigurationError.missingMagnet
+        }
+
+        if let index = results.firstIndex(where: { $0.id == selected.id }) {
+            let updated = results[index].withMagnet(magnet)
+            results[index] = updated
+            setSearchResults(dedupedResults(results))
+            self.selected = results.first(where: { $0.id == updated.id }) ?? results.first(where: { $0.magnet?.infoHashFromMagnet == magnet.infoHashFromMagnet })
+        }
+
+        return magnet
+    }
+
+    private func prefetchMagnetsIfNeeded(from searchResults: [SearchResult]) {
+        let candidates = magnetPrefetchCandidates(from: searchResults)
+        guard !candidates.isEmpty else { return }
+
+        for candidate in candidates {
+            let key = magnetPrefetchDedupKey(for: candidate)
+            guard activeMagnetPrefetchTasks[key] == nil else { continue }
+            guard !attemptedMagnetPrefetchKeys.contains(key) else { continue }
+
+            if let existingIndex = magnetPrefetchQueue.firstIndex(where: { $0.key == key }) {
+                magnetPrefetchQueue[existingIndex] = MagnetPrefetchCandidate(key: key, result: candidate)
+            } else {
+                magnetPrefetchQueue.append(MagnetPrefetchCandidate(key: key, result: candidate))
+            }
+        }
+
+        magnetPrefetchQueue.sort { lhs, rhs in
+            if lhs.result.score != rhs.result.score {
+                return lhs.result.score > rhs.result.score
+            }
+            return lhs.result.title < rhs.result.title
+        }
+
+        startQueuedMagnetPrefetchesIfNeeded()
+    }
+
+    private func prefetchDetailMetadataIfNeeded(from searchResults: [SearchResult]) {
+        let candidates = detailPrefetchCandidates(from: searchResults)
+        guard !candidates.isEmpty else { return }
+
+        for candidate in candidates {
+            let key = detailPrefetchDedupKey(for: candidate)
+            guard activeDetailPrefetchTasks[key] == nil else { continue }
+            guard !attemptedDetailPrefetchKeys.contains(key) else { continue }
+
+            if let existingIndex = detailPrefetchQueue.firstIndex(where: { $0.key == key }) {
+                detailPrefetchQueue[existingIndex] = DetailPrefetchCandidate(key: key, result: candidate)
+            } else {
+                detailPrefetchQueue.append(DetailPrefetchCandidate(key: key, result: candidate))
+            }
+        }
+
+        detailPrefetchQueue.sort { lhs, rhs in
+            if lhs.result.score != rhs.result.score {
+                return lhs.result.score > rhs.result.score
+            }
+            return lhs.result.title < rhs.result.title
+        }
+
+        startQueuedDetailPrefetchesIfNeeded()
+    }
+
+    private func prefetchSelectedMagnet(for searchResult: SearchResult?) {
+        selectedMagnetPrefetchTask?.cancel()
+        guard let searchResult, shouldPrefetchMagnet(for: searchResult) else { return }
+
+        selectedMagnetPrefetchTask = Task { @MainActor in
+            await warmMagnet(for: searchResult)
+        }
+    }
+
+    private func fetchPresentedDetailMetadataIfNeeded(for searchResult: SearchResult?) {
+        guard let searchResult, shouldPrefetchDetailMetadata(for: searchResult) else { return }
+        let key = detailPrefetchDedupKey(for: searchResult)
+        guard activeDetailPrefetchTasks[key] == nil else { return }
+        attemptedDetailPrefetchKeys.insert(key)
+
+        activeDetailPrefetchTasks[key] = Task {
+            defer {
+                Task { @MainActor in
+                    activeDetailPrefetchTasks[key] = nil
+                    startQueuedDetailPrefetchesIfNeeded()
+                }
+            }
+            await warmDetailMetadata(for: searchResult)
+        }
+    }
+
+    private func magnetPrefetchCandidates(from searchResults: [SearchResult]) -> [SearchResult] {
+        var seenResolutionKeys = Set<String>()
+        return searchResults
+            .sorted { $0.score > $1.score }
+            .filter(shouldPrefetchMagnet)
+            .filter { result in
+                let key = magnetPrefetchDedupKey(for: result)
+                return seenResolutionKeys.insert(key).inserted
+            }
+    }
+
+    private func magnetPrefetchDedupKey(for result: SearchResult) -> String {
+        let normalizedTitle = result.title.normalizedDedupeKey
+        if !normalizedTitle.isEmpty {
+            return normalizedTitle
+        }
+        if let detailURL = result.detailURL?.absoluteString, !detailURL.isEmpty {
+            return detailURL
+        }
+        return result.id.uuidString
+    }
+
+    private func shouldPrefetchMagnet(for searchResult: SearchResult) -> Bool {
+        searchResult.magnet?.isEmpty != false
+    }
+
+    private func detailPrefetchCandidates(from searchResults: [SearchResult]) -> [SearchResult] {
+        var seenResolutionKeys = Set<String>()
+        return searchResults
+            .sorted { $0.score > $1.score }
+            .filter(shouldPrefetchDetailMetadata)
+            .filter { result in
+                let key = detailPrefetchDedupKey(for: result)
+                return seenResolutionKeys.insert(key).inserted
+            }
+    }
+
+    private func detailPrefetchDedupKey(for result: SearchResult) -> String {
+        if let detailURL = result.detailURL?.absoluteString, !detailURL.isEmpty {
+            return "\(result.provider)|\(detailURL)"
+        }
+        return result.id.uuidString
+    }
+
+    private func shouldPrefetchDetailMetadata(for searchResult: SearchResult) -> Bool {
+        guard searchResult.detailURL != nil,
+              searchResult.raw.detailSpecs?.hasDetailPageMetadataFields != true else { return false }
+
+        switch detailMetadataStatuses[searchResult.id] {
+        case .fetching, .checkedNoMetadata, .failed(_):
+            return false
+        case .notStarted, .fetched, .none:
+            return true
+        }
+    }
+
+    private func warmMagnet(for searchResult: SearchResult) async {
+        do {
+            guard let magnet = try await searchService.resolveMagnet(for: searchResult.raw),
+                  !magnet.isEmpty,
+                  !Task.isCancelled else { return }
+            await MainActor.run {
+                applyResolvedMagnet(magnet, to: searchResult.id)
+            }
+        } catch {
+            return
+        }
+    }
+
+    private func warmDetailMetadata(for searchResult: SearchResult) async {
+        await MainActor.run {
+            detailMetadataStatuses[searchResult.id] = .fetching
+        }
+        do {
+            guard let metadata = try await searchService.fetchDetailMetadata(for: searchResult.raw),
+                  !Task.isCancelled else {
+                await MainActor.run {
+                    detailMetadataStatuses[searchResult.id] = .checkedNoMetadata
+                }
+                return
+            }
+            await MainActor.run {
+                detailMetadataStatuses[searchResult.id] = metadata.specs?.hasDisplayableFields == true ? .fetched : .checkedNoMetadata
+                applyResolvedDetailMetadata(metadata, to: searchResult)
+            }
+        } catch {
+            let message = (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+            await MainActor.run {
+                detailMetadataStatuses[searchResult.id] = .failed(message)
+            }
+            return
+        }
+    }
+
+    private func applyResolvedMagnet(_ magnet: String, to resultID: UUID) {
+        guard let index = results.firstIndex(where: { $0.id == resultID }),
+              results[index].magnet?.isEmpty != false else { return }
+        let updated = results[index].withMagnet(magnet)
+        results[index] = updated
+        setSearchResults(dedupedResults(results))
+        if selected?.id == resultID {
+            selected = results.first(where: { $0.id == updated.id })
+        }
+        if presentedResult?.id == resultID {
+            presentedResult = results.first(where: { $0.id == updated.id })
+        }
+    }
+
+    private func mergedSearchResultsPreservingResolvedData(_ incomingResults: [SearchResult]) -> [SearchResult] {
+        let enriched = incomingResults.map { incoming in
+            guard let existing = existingResolvedResult(for: incoming) else { return incoming }
+            return incoming.withResolvedData(from: existing)
+        }
+        return dedupedResults(enriched)
+    }
+
+    private func existingResolvedResult(for incoming: SearchResult) -> SearchResult? {
+        if let match = results.first(where: { $0.id == incoming.id }) {
+            return match
+        }
+
+        if incoming.detailURL != nil {
+            let incomingKey = detailPrefetchDedupKey(for: incoming)
+            if let match = results.first(where: { detailPrefetchDedupKey(for: $0) == incomingKey }) {
+                return match
+            }
+        }
+
+        if let incomingHash = incoming.magnet?.infoHashFromMagnet?.lowercased(),
+           let match = results.first(where: { $0.magnet?.infoHashFromMagnet?.lowercased() == incomingHash }) {
+            return match
+        }
+
+        let incomingTitleKey = incoming.title.normalizedCorrectionInsensitiveDedupeKey
+        guard !incomingTitleKey.isEmpty else { return nil }
+        return results.first {
+            $0.provider == incoming.provider &&
+                $0.title.normalizedCorrectionInsensitiveDedupeKey == incomingTitleKey
+        }
+    }
+
+    private func applyResolvedDetailMetadata(_ metadata: TorrentDetailMetadata, to searchResult: SearchResult) {
+        let fallbackKey = detailPrefetchDedupKey(for: searchResult)
+        guard let index = results.firstIndex(where: { $0.id == searchResult.id }) ??
+            results.firstIndex(where: { detailPrefetchDedupKey(for: $0) == fallbackKey }) else { return }
+        let resultID = results[index].id
+        let updated = results[index].withDetailMetadata(metadata)
+        results[index] = updated
+        setSearchResults(dedupedResults(results))
+        if selected?.id == resultID {
+            selected = results.first(where: { $0.id == updated.id })
+        }
+        if presentedResult?.id == resultID {
+            presentedResult = results.first(where: { $0.id == updated.id })
+        }
+        prefetchMagnetsIfNeeded(from: results)
+        prefetchDetailMetadataIfNeeded(from: results)
+    }
+
+    private func cancelMagnetPrefetchPipeline() {
+        activeMagnetPrefetchTasks.values.forEach { $0.cancel() }
+        activeMagnetPrefetchTasks.removeAll()
+        magnetPrefetchQueue.removeAll()
+        attemptedMagnetPrefetchKeys.removeAll()
+    }
+
+    private func cancelDetailPrefetchPipeline() {
+        activeDetailPrefetchTasks.values.forEach { $0.cancel() }
+        activeDetailPrefetchTasks.removeAll()
+        detailPrefetchQueue.removeAll()
+        attemptedDetailPrefetchKeys.removeAll()
+    }
+
+    private func startQueuedMagnetPrefetchesIfNeeded() {
+        while activeMagnetPrefetchTasks.count < maxConcurrentMagnetPrefetches {
+            guard let nextCandidate = nextMagnetPrefetchCandidate() else { return }
+
+            let key = nextCandidate.key
+            attemptedMagnetPrefetchKeys.insert(key)
+            activeMagnetPrefetchTasks[key] = Task {
+                defer {
+                    Task { @MainActor in
+                        activeMagnetPrefetchTasks[key] = nil
+                        startQueuedMagnetPrefetchesIfNeeded()
+                    }
+                }
+                guard !Task.isCancelled else { return }
+                await warmMagnet(for: nextCandidate.result)
+            }
+        }
+    }
+
+    private func nextMagnetPrefetchCandidate() -> MagnetPrefetchCandidate? {
+        while !magnetPrefetchQueue.isEmpty {
+            let candidate = magnetPrefetchQueue.removeFirst()
+            let latestCandidate = latestMagnetPrefetchCandidate(forKey: candidate.key)
+            if let latestCandidate {
+                return MagnetPrefetchCandidate(key: candidate.key, result: latestCandidate)
+            }
+        }
+        return nil
+    }
+
+    private func latestMagnetPrefetchCandidate(forKey key: String) -> SearchResult? {
+        magnetPrefetchCandidates(from: results).first { magnetPrefetchDedupKey(for: $0) == key }
+    }
+
+    private func startQueuedDetailPrefetchesIfNeeded() {
+        while activeDetailPrefetchTasks.count < maxConcurrentDetailPrefetches {
+            guard let nextCandidate = nextDetailPrefetchCandidate() else { return }
+
+            let key = nextCandidate.key
+            attemptedDetailPrefetchKeys.insert(key)
+            activeDetailPrefetchTasks[key] = Task {
+                defer {
+                    Task { @MainActor in
+                        activeDetailPrefetchTasks[key] = nil
+                        startQueuedDetailPrefetchesIfNeeded()
+                    }
+                }
+                guard !Task.isCancelled else { return }
+                await warmDetailMetadata(for: nextCandidate.result)
+            }
+        }
+    }
+
+    private func nextDetailPrefetchCandidate() -> DetailPrefetchCandidate? {
+        while !detailPrefetchQueue.isEmpty {
+            let candidate = detailPrefetchQueue.removeFirst()
+            let latestCandidate = latestDetailPrefetchCandidate(forKey: candidate.key)
+            if let latestCandidate {
+                return DetailPrefetchCandidate(key: candidate.key, result: latestCandidate)
+            }
+        }
+        return nil
+    }
+
+    private func latestDetailPrefetchCandidate(forKey key: String) -> SearchResult? {
+        detailPrefetchCandidates(from: results).first { detailPrefetchDedupKey(for: $0) == key }
+    }
+
+    private func reconcileSelectedResult() {
+        guard let selected else { return }
+        if let refreshed = results.first(where: { $0.id == selected.id }) {
+            self.selected = refreshed
+        } else if let magnetHash = selected.magnet?.infoHashFromMagnet,
+                  let refreshed = results.first(where: { $0.magnet?.infoHashFromMagnet == magnetHash }) {
+            self.selected = refreshed
+        }
+
+        if let presentedResult,
+           let refreshed = results.first(where: { $0.id == presentedResult.id }) {
+            self.presentedResult = refreshed
+        }
+    }
+
+    private func showPreviousPresentedResult() {
+        guard let previous = adjacentPresentedResult(offset: -1) else { return }
+        detailNavigationDirection = -1
+        withAnimation(.easeInOut(duration: 0.2)) {
+            selected = previous
+            presentedResult = previous
+        }
+    }
+
+    private func showNextPresentedResult() {
+        guard let next = adjacentPresentedResult(offset: 1) else { return }
+        detailNavigationDirection = 1
+        withAnimation(.easeInOut(duration: 0.2)) {
+            selected = next
+            presentedResult = next
+        }
+    }
+
+    private func adjacentPresentedResult(offset: Int) -> SearchResult? {
+        guard let presentedResult,
+              let index = displayedResults.firstIndex(where: { $0.id == presentedResult.id }) else { return nil }
+        let adjacentIndex = index + offset
+        guard displayedResults.indices.contains(adjacentIndex) else { return nil }
+        return displayedResults[adjacentIndex]
+    }
+
+    private func makeTransmissionEndpoints() throws -> [TransmissionEndpoint] {
+        let username = transmissionUsername.trimmingCharacters(in: .whitespacesAndNewlines)
+        let password = transmissionPassword.trimmingCharacters(in: .whitespacesAndNewlines)
+        if (username.isEmpty && !password.isEmpty) || (!username.isEmpty && password.isEmpty) {
+            throw TransmissionConfigurationError.incompleteCredentials
+        }
+
+        var endpoints: [TransmissionEndpoint] = []
+
+        let homeRPCURLText = transmissionRPCURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !homeRPCURLText.isEmpty {
+            guard let rpcURL = normalizedTransmissionRPCURL(from: homeRPCURLText) else {
+                throw TransmissionConfigurationError.invalidHomeRPCURL
+            }
+
+            endpoints.append(
+                TransmissionEndpoint(
+                    name: "Home RPC",
+                    config: transmissionConfig(for: rpcURL, username: username, password: password)
+                )
+            )
+        }
+
+        let tailscaleRPCURLText = transmissionTailscaleRPCURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tailscaleRPCURLText.isEmpty {
+            guard let rpcURL = normalizedTransmissionRPCURL(from: tailscaleRPCURLText) else {
+                throw TransmissionConfigurationError.invalidTailscaleRPCURL
+            }
+
+            endpoints.append(
+                TransmissionEndpoint(
+                    name: "Tailscale RPC",
+                    config: transmissionConfig(for: rpcURL, username: username, password: password)
+                )
+            )
+        }
+
+        guard !endpoints.isEmpty else {
+            throw TransmissionConfigurationError.missingRPCURL
+        }
+
+        let orderedEndpoints = endpoints.sorted { lhs, rhs in
+            lhs.priority(preferTailscale: transmissionPreferTailscale) < rhs.priority(preferTailscale: transmissionPreferTailscale)
+        }
+
+        var seenURLs: Set<URL> = []
+        return orderedEndpoints.filter { endpoint in
+            seenURLs.insert(endpoint.config.rpcURL).inserted
+        }
+    }
+
+    private func transmissionConfig(for rpcURL: URL, username: String, password: String) -> TransmissionConfig {
+        TransmissionConfig(
+            rpcURL: rpcURL,
+            username: username.isEmpty ? nil : username,
+            password: password.isEmpty ? nil : password
+        )
+    }
+
+    private func addMagnetToTransmission(_ magnet: String, using endpoints: [TransmissionEndpoint]) async throws {
+        var failures: [TransmissionEndpointFailure] = []
+
+        for endpoint in endpoints {
+            do {
+                try await TransmissionClient(config: endpoint.config).add(magnet: magnet)
+                return
+            } catch {
+                failures.append(TransmissionEndpointFailure(endpointName: endpoint.name, error: error))
+            }
+        }
+
+        throw TransmissionSendError.allEndpointsFailed(failures)
+    }
+
+    private func monitorTransmissionDownloads() async {
+        await refreshTransmissionDownloads()
+        while !Task.isCancelled {
+            try? await Task.sleep(for: downloads.isEmpty ? .seconds(30) : .seconds(2))
+            await refreshTransmissionDownloads()
+        }
+    }
+
+    private func refreshSharedTransmissionDownloads() {
+        Task { @MainActor in
+            await transmissionStore.refreshDownloads()
+        }
+    }
+
+    private func toggleSharedTransmissionDownload(_ torrent: TransmissionTorrent) {
+        Task { @MainActor in
+            do {
+                try await transmissionStore.togglePause(for: torrent)
+            } catch {
+                showAlert(
+                    title: torrent.isStopped ? "Resume Failed" : "Pause Failed",
+                    message: transmissionConnectionErrorMessage(for: error)
+                )
+            }
+        }
+    }
+
+    private func deleteSharedTransmissionDownload(_ torrent: TransmissionTorrent) {
+        Task { @MainActor in
+            do {
+                try await transmissionStore.remove(torrentIDs: [torrent.id], deleteLocalData: true)
+            } catch {
+                showAlert(
+                    title: "Delete Failed",
+                    message: transmissionConnectionErrorMessage(for: error)
+                )
+            }
+        }
+    }
+
+    private func updateSharedTransmissionDownloadPriority(
+        _ priority: TransmissionTorrentPriority,
+        for torrent: TransmissionTorrent
+    ) {
+        Task { @MainActor in
+            do {
+                try await transmissionStore.setPriority(priority, torrentIDs: [torrent.id])
+            } catch {
+                showAlert(
+                    title: "Priority Failed",
+                    message: transmissionConnectionErrorMessage(for: error)
+                )
+            }
+        }
+    }
+
+    private func refreshTransmissionDownloads() {
+        Task { @MainActor in
+            await refreshTransmissionDownloads()
+        }
+    }
+
+    private func refreshTransmissionDownloads() async {
+        guard !isRefreshingDownloads else { return }
+        let endpoints: [TransmissionEndpoint]
+        do {
+            endpoints = try makeTransmissionEndpoints()
+        } catch {
+            downloads = []
+            return
+        }
+
+        isRefreshingDownloads = true
+        defer { isRefreshingDownloads = false }
+
+        do {
+            downloads = try await performTransmissionRequest(using: endpoints) { client in
+                try await client.torrents()
+            }.filter(\.isIncompleteDownload)
+        } catch {
+            downloads = []
+        }
+    }
+
+    private func toggleTransmissionDownload(_ torrent: TransmissionTorrent) {
+        Task { @MainActor in
+            await performTransmissionControl(title: torrent.isStopped ? "Resume Failed" : "Pause Failed") { client in
+                if torrent.isStopped {
+                    try await client.start(ids: [torrent.id])
+                } else {
+                    try await client.stop(ids: [torrent.id])
+                }
+            }
+        }
+    }
+
+    private func deleteTransmissionDownload(_ torrent: TransmissionTorrent) {
+        Task { @MainActor in
+            await performTransmissionControl(title: "Delete Failed") { client in
+                try await client.remove(ids: [torrent.id], deleteLocalData: true)
+            }
+        }
+    }
+
+    private func updateTransmissionDownloadPriority(_ priority: TransmissionTorrentPriority, for torrent: TransmissionTorrent) {
+        Task { @MainActor in
+            await performTransmissionControl(title: "Priority Failed") { client in
+                try await client.setPriority(priority, ids: [torrent.id])
+            }
+        }
+    }
+
+    private func performTransmissionControl(
+        title: String,
+        operation: @escaping (TransmissionClient) async throws -> Void
+    ) async {
+        do {
+            let endpoints = try makeTransmissionEndpoints()
+            try await performTransmissionRequest(using: endpoints, operation: operation)
+            await refreshTransmissionDownloads()
+        } catch {
+            showAlert(title: title, message: transmissionConnectionErrorMessage(for: error))
+        }
+    }
+
+    private func performTransmissionRequest<Value>(
+        using endpoints: [TransmissionEndpoint],
+        operation: (TransmissionClient) async throws -> Value
+    ) async throws -> Value {
+        var failures: [TransmissionEndpointFailure] = []
+
+        for endpoint in endpoints {
+            do {
+                return try await operation(TransmissionClient(config: endpoint.config))
+            } catch {
+                failures.append(TransmissionEndpointFailure(endpointName: endpoint.name, error: error))
+            }
+        }
+
+        throw TransmissionSendError.allEndpointsFailed(failures)
+    }
+
+    private func normalizedTransmissionRPCURL(from rawValue: String) -> URL? {
+        let withScheme: String
+        if rawValue.contains("://") {
+            withScheme = rawValue
+        } else {
+            withScheme = "http://" + rawValue
+        }
+
+        guard var components = URLComponents(string: withScheme),
+              let scheme = components.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              components.host != nil else {
+            return nil
+        }
+
+        let path = components.path.trimmingCharacters(in: .whitespacesAndNewlines)
+        if path.isEmpty || path == "/" {
+            components.path = "/transmission/rpc"
+        }
+
+        return components.url
+    }
+
+    private func showAlert(title: String, message: String) {
+        alertTitle = title
+        alertMessage = message
+    }
+
+    private func transmissionErrorPresentation(
+        for error: Error,
+        phase: TransmissionSendPhase
+    ) -> (title: String, message: String) {
+        switch phase {
+        case .fetchingMagnet:
+            return ("Magnet Error", magnetFetchErrorMessage(for: error))
+        case .connecting:
+            return ("Transmission Error", transmissionConnectionErrorMessage(for: error))
+        case .idle:
+            if error is TransmissionError || error is URLError {
+                return ("Transmission Error", transmissionConnectionErrorMessage(for: error))
+            }
+            return ("Magnet Error", magnetFetchErrorMessage(for: error))
+        }
+    }
+
+    private func magnetFetchErrorMessage(for error: Error) -> String {
+        if let providerError = error as? ProviderError {
+            switch providerError {
+            case .timedOut(let provider, let seconds):
+                return "Can't fetch magnet from \(provider): the request timed out after \(seconds)s."
+            case .badStatus(let provider, let status):
+                return "Can't fetch magnet from \(provider): the detail page returned HTTP \(status)."
+            case .accessBlocked(let provider, let reason):
+                return "Can't fetch magnet from \(provider): \(reason)."
+            case .missingURLTemplate(let provider):
+                return "Can't fetch magnet from \(provider): the provider is missing a search URL."
+            case .invalidURL(let url):
+                return "Can't fetch magnet: invalid URL \(url)."
+            }
+        }
+
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .timedOut:
+                return "Can't fetch magnet: the request timed out."
+            case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed, .notConnectedToInternet, .networkConnectionLost:
+                return "Can't fetch magnet: network connection failed."
+            default:
+                return "Can't fetch magnet: \(urlError.localizedDescription)"
+            }
+        }
+
+        if let localizedError = error as? LocalizedError, let message = localizedError.errorDescription {
+            return "Can't fetch magnet: \(message)"
+        }
+
+        return "Can't fetch magnet for the selected result."
+    }
+
+    private func transmissionConnectionErrorMessage(for error: Error) -> String {
+        if let sendError = error as? TransmissionSendError {
+            switch sendError {
+            case .allEndpointsFailed(let failures):
+                let details = failures
+                    .map { "\($0.endpointName): \(transmissionConnectionFailureSummary(for: $0.error))." }
+                    .joined(separator: "\n")
+                let suggestion = failures.contains { $0.endpointName == "Tailscale RPC" }
+                    ? "\n\nCheck that Tailscale is connected on both devices, your Mac is awake, and Transmission remote access is enabled."
+                    : ""
+                return "Tried all configured Transmission endpoints:\n\(details)\(suggestion)"
+            }
+        }
+
+        if let transmissionError = error as? TransmissionError {
+            switch transmissionError {
+            case .missingSessionID:
+                return "Can't connect to Transmission: no session ID was returned."
+            case .badStatus(let status):
+                if status == 401 || status == 403 {
+                    return "Can't connect to Transmission: authentication failed."
+                }
+                return "Can't connect to Transmission: the RPC endpoint returned HTTP \(status)."
+            case .rpcFailure(let message):
+                return "Transmission rejected the torrent: \(message)."
+            }
+        }
+
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .userAuthenticationRequired:
+                return "Can't connect to Transmission: authentication is required."
+            case .timedOut:
+                return "Can't connect to Transmission: the connection timed out."
+            case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed, .notConnectedToInternet, .networkConnectionLost:
+                return "Can't connect to Transmission: the server could not be reached."
+            default:
+                return "Can't connect to Transmission: \(urlError.localizedDescription)"
+            }
+        }
+
+        if let localizedError = error as? LocalizedError, let message = localizedError.errorDescription {
+            return "Can't connect to Transmission: \(message)"
+        }
+
+        return "Can't connect to Transmission."
+    }
+
+    private func transmissionConnectionFailureSummary(for error: Error) -> String {
+        if let transmissionError = error as? TransmissionError {
+            switch transmissionError {
+            case .missingSessionID:
+                return "no session ID was returned"
+            case .badStatus(let status):
+                if status == 401 || status == 403 {
+                    return "authentication failed"
+                }
+                return "the RPC endpoint returned HTTP \(status)"
+            case .rpcFailure(let message):
+                return "Transmission rejected the torrent: \(message)"
+            }
+        }
+
+        if let urlError = error as? URLError {
+            switch urlError.code {
+            case .userAuthenticationRequired:
+                return "authentication is required"
+            case .timedOut:
+                return "the connection timed out"
+            case .cannotFindHost, .cannotConnectToHost, .dnsLookupFailed, .notConnectedToInternet, .networkConnectionLost:
+                return "the server could not be reached"
+            default:
+                return urlError.localizedDescription
+            }
+        }
+
+        if let localizedError = error as? LocalizedError, let message = localizedError.errorDescription {
+            return message
+        }
+
+        return "unknown connection error"
+    }
+
+    private func dedupedResults(_ results: [SearchResult]) -> [SearchResult] {
+        let visibleResults = results.filter { !$0.excluded }
+        let byHash = dedupeByInfoHash(visibleResults)
+        return dedupeByNormalizedTitle(byHash)
+    }
+
+    private func dedupeByInfoHash(_ results: [SearchResult]) -> [SearchResult] {
+        var output: [SearchResult] = []
+        output.reserveCapacity(results.count)
+
+        var indexByHash: [String: Int] = [:]
+        indexByHash.reserveCapacity(results.count)
+
+        for result in results {
+            guard let hash = result.magnet?.infoHashFromMagnet?.lowercased(), !hash.isEmpty else {
+                output.append(result)
+                continue
+            }
+
+            if let existingIndex = indexByHash[hash] {
+                output[existingIndex] = preferredDuplicate(between: output[existingIndex], and: result)
+            } else {
+                indexByHash[hash] = output.count
+                output.append(result)
+            }
+        }
+
+        return output
+    }
+
+    private func dedupeByNormalizedTitle(_ results: [SearchResult]) -> [SearchResult] {
+        var output: [SearchResult] = []
+        output.reserveCapacity(results.count)
+
+        var indexByTitle: [String: Int] = [:]
+        indexByTitle.reserveCapacity(results.count)
+
+        for result in results {
+            let key = result.title.normalizedCorrectionInsensitiveDedupeKey
+            guard !key.isEmpty else {
+                output.append(result)
+                continue
+            }
+
+            if let existingIndex = indexByTitle[key] {
+                output[existingIndex] = preferredDuplicate(between: output[existingIndex], and: result)
+            } else {
+                indexByTitle[key] = output.count
+                output.append(result)
+            }
+        }
+
+        return output
+    }
+
+    private func preferredDuplicate(between lhs: SearchResult, and rhs: SearchResult) -> SearchResult {
+        let lhsCorrectionPriority = lhs.title.correctionReleasePriority
+        let rhsCorrectionPriority = rhs.title.correctionReleasePriority
+        if lhsCorrectionPriority != rhsCorrectionPriority {
+            return lhsCorrectionPriority > rhsCorrectionPriority ? lhs : rhs
+        }
+
+        let lhsHasMagnet = lhs.magnet?.isEmpty == false
+        let rhsHasMagnet = rhs.magnet?.isEmpty == false
+
+        if lhsHasMagnet != rhsHasMagnet {
+            return lhsHasMagnet ? lhs : rhs
+        }
+
+        if lhs.score != rhs.score {
+            return lhs.score >= rhs.score ? lhs : rhs
+        }
+
+        let lhsSeeders = lhs.seeders ?? 0
+        let rhsSeeders = rhs.seeders ?? 0
+        if lhsSeeders != rhsSeeders {
+            return lhsSeeders >= rhsSeeders ? lhs : rhs
+        }
+
+        return lhs
+    }
+}
+
+private struct MagnetPrefetchCandidate {
+    let key: String
+    let result: SearchResult
+}
+
+private struct DetailPrefetchCandidate {
+    let key: String
+    let result: SearchResult
+}
+
+private enum DetailMetadataFetchStatus: Hashable {
+    case notStarted
+    case fetching
+    case fetched
+    case checkedNoMetadata
+    case failed(String)
+}
+
+private enum TransmissionConfigurationError: LocalizedError {
+    case missingRPCURL
+    case invalidHomeRPCURL
+    case invalidTailscaleRPCURL
+    case incompleteCredentials
+    case missingMagnet
+
+    var errorDescription: String? {
+        switch self {
+        case .missingRPCURL:
+            return "Enter a home RPC URL, a Tailscale RPC URL, or both."
+        case .invalidHomeRPCURL:
+            return "The home Transmission RPC URL is invalid."
+        case .invalidTailscaleRPCURL:
+            return "The Tailscale Transmission RPC URL is invalid."
+        case .incompleteCredentials:
+            return "Enter both a username and password, or leave both blank."
+        case .missingMagnet:
+            return "No magnet is available for the selected result."
+        }
+    }
+}
+
+private enum TransmissionSendPhase {
+    case idle
+    case fetchingMagnet
+    case connecting
+}
+
+private struct TransmissionEndpoint {
+    let name: String
+    let config: TransmissionConfig
+
+    func priority(preferTailscale: Bool) -> Int {
+        if preferTailscale {
+            return name == "Tailscale RPC" ? 0 : 1
+        }
+        return name == "Home RPC" ? 0 : 1
+    }
+}
+
+private struct TransmissionEndpointFailure {
+    let endpointName: String
+    let error: Error
+}
+
+private enum TransmissionSendError: LocalizedError {
+    case allEndpointsFailed([TransmissionEndpointFailure])
+}
+
+struct DownloadsPanel: View {
+    let downloads: [TransmissionTorrent]
+    let isRefreshing: Bool
+    var onRefresh: () -> Void
+    var onTogglePause: (TransmissionTorrent) -> Void
+    var onDelete: (TransmissionTorrent) -> Void
+    var onPriorityChange: (TransmissionTorrentPriority, TransmissionTorrent) -> Void
+
+    var body: some View {
+        if !downloads.isEmpty {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Label("Downloads", systemImage: "arrow.down.circle")
+                        .font(.headline)
+                    Spacer(minLength: 0)
+                    Button(action: onRefresh) {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(isRefreshing)
+                    .accessibilityLabel("Refresh Downloads")
+#if os(macOS)
+                    .help("Refresh Downloads")
+#endif
+                }
+
+                ForEach(downloads) { torrent in
+                    DownloadRow(
+                        torrent: torrent,
+                        onTogglePause: { onTogglePause(torrent) },
+                        onDelete: { onDelete(torrent) },
+                        onPriorityChange: { priority in onPriorityChange(priority, torrent) }
+                    )
+                    if torrent.id != downloads.last?.id {
+                        Divider()
+                    }
+                }
+            }
+            .padding(.horizontal)
+            .padding(.vertical, 10)
+            .background(.regularMaterial)
+
+            Divider()
+        }
+    }
+}
+
+private struct DownloadRow: View {
+    let torrent: TransmissionTorrent
+    var onTogglePause: () -> Void
+    var onDelete: () -> Void
+    var onPriorityChange: (TransmissionTorrentPriority) -> Void
+
+    private var percent: Double {
+        min(max(torrent.percentDone, 0), 1)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text(torrent.name.torrentNameWrappingText)
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Text(percent, format: .percent.precision(.fractionLength(0)))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+
+            ProgressView(value: percent)
+                .progressViewStyle(.linear)
+
+            HStack(spacing: 10) {
+                Label(formatDownloadSpeed(torrent.rateDownload), systemImage: "speedometer")
+                Label("\(torrent.seeders)", systemImage: "arrow.up.circle")
+                Label("\(torrent.leechers)", systemImage: "arrow.down.circle")
+                Label("\(torrent.peersSendingToUs)", systemImage: "person.2")
+                Spacer(minLength: 0)
+                PriorityPicker(priority: torrent.priority, onChange: onPriorityChange)
+                Button(action: onTogglePause) {
+                    Image(systemName: torrent.isStopped ? "play.fill" : "pause.fill")
+                        .frame(width: 26, height: 26)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel(torrent.isStopped ? "Resume Download" : "Pause Download")
+#if os(macOS)
+                .help(torrent.isStopped ? "Resume Download" : "Pause Download")
+#endif
+                Button(role: .destructive, action: onDelete) {
+                    Image(systemName: "trash")
+                        .frame(width: 26, height: 26)
+                }
+                .buttonStyle(.borderless)
+                .accessibilityLabel("Delete Download")
+#if os(macOS)
+                .help("Delete Download and Data")
+#endif
+            }
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct PriorityPicker: View {
+    let priority: TransmissionTorrentPriority
+    var onChange: (TransmissionTorrentPriority) -> Void
+
+    var body: some View {
+        Menu {
+            ForEach(TransmissionTorrentPriority.allCases, id: \.rawValue) { option in
+                Button {
+                    onChange(option)
+                } label: {
+                    Label(option.label, systemImage: option == priority ? "checkmark" : option.systemImage)
+                }
+            }
+        } label: {
+            Label(priority.label, systemImage: priority.systemImage)
+                .labelStyle(.iconOnly)
+                .frame(width: 26, height: 26)
+        }
+        .accessibilityLabel("Set Priority")
+#if os(macOS)
+        .help("Set Priority: \(priority.label)")
+#endif
+    }
+}
+
+private struct SearchProgressView: View {
+    let foundCount: Int
+
+    var body: some View {
+        TimelineView(.periodic(from: .now, by: 0.5)) { context in
+            let dots = animatedDots(for: context.date)
+            VStack(spacing: 8) {
+                ProgressView("Searching providers\(dots)")
+                Text(releaseCountText(foundCount))
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func animatedDots(for date: Date) -> String {
+        let phase = Int(date.timeIntervalSinceReferenceDate * 2).quotientAndRemainder(dividingBy: 3).remainder + 1
+        return String(repeating: ".", count: phase)
+    }
+
+    private func releaseCountText(_ count: Int) -> String {
+        count == 1 ? "1 result found" : "\(count) results found"
+    }
+}
+
+private struct SearchProgressHeader: View {
+    let foundCount: Int
+
+    var body: some View {
+        HStack(spacing: 12) {
+            ProgressView()
+                .controlSize(.small)
+            VStack(alignment: .leading, spacing: 2) {
+                TimelineView(.periodic(from: .now, by: 0.5)) { context in
+                    Text("Searching providers\(animatedDots(for: context.date))")
+                }
+                .font(.callout.weight(.medium))
+                Text(releaseCountText(foundCount))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private func animatedDots(for date: Date) -> String {
+        let phase = Int(date.timeIntervalSinceReferenceDate * 2).quotientAndRemainder(dividingBy: 3).remainder + 1
+        return String(repeating: ".", count: phase)
+    }
+
+    private func releaseCountText(_ count: Int) -> String {
+        count == 1 ? "1 result found" : "\(count) results found"
+    }
+}
+
+// MARK: - Models
+struct SearchResult: Identifiable, Hashable {
+    let id: UUID
+    let raw: TorrentSearchResult
+    let title: String
+    let provider: String
+    let source: String
+    let resolution: String
+    let dynamicRange: String
+    let codec: String
+    let audio: String
+    let imax: Bool
+    let size: String?
+    let seeders: Int?
+    let leechers: Int?
+    let magnet: String?
+    let detailURL: URL?
+    let score: Int
+    let scoreNotes: [String]
+    let detailMetadata: String?
+    let detailSpecs: TorrentDetailSpecs?
+    let excluded: Bool
+
+    init(ranked: RankedTorrentResult) {
+        id = ranked.id
+        raw = ranked.raw
+        title = ranked.raw.preferredTitle
+        provider = ranked.raw.provider
+        source = ParserRankerAdapter.sourceSummary(
+            for: ranked.parsed,
+            title: ranked.raw.preferredTitle,
+            specs: ranked.raw.detailSpecs
+        )
+        resolution = ParserRankerAdapter.displayName(for: ranked.parsed.resolution)
+        dynamicRange = ParserRankerAdapter.displayName(for: ranked.parsed.dynamicRange)
+        codec = ParserRankerAdapter.displayName(for: ranked.parsed.videoCodec)
+        audio = ParserRankerAdapter.audioSummary(codec: ranked.parsed.audioCodec, channels: ranked.parsed.channels, atmos: ranked.parsed.atmos)
+        imax = ranked.parsed.imax
+        size = ranked.raw.size
+        seeders = ranked.raw.seeders
+        leechers = ranked.raw.leechers
+        magnet = ranked.raw.magnet
+        detailURL = ranked.raw.detailURL
+        score = ranked.score
+        scoreNotes = ranked.notes
+        detailMetadata = ranked.raw.detailMetadata
+        detailSpecs = ranked.raw.detailSpecs
+        excluded = ranked.excluded
+    }
+
+    func withMagnet(_ magnet: String) -> SearchResult {
+        SearchResult(
+            id: id,
+            raw: TorrentSearchResult(
+                id: raw.id,
+                title: raw.title,
+                detailMetadata: raw.detailMetadata,
+                detailSpecs: raw.detailSpecs,
+                magnet: magnet,
+                detailURL: raw.detailURL,
+                seeders: raw.seeders,
+                leechers: raw.leechers,
+                provider: raw.provider,
+                size: raw.size
+            ),
+            title: title,
+            provider: provider,
+            source: source,
+            resolution: resolution,
+            dynamicRange: dynamicRange,
+            codec: codec,
+            audio: audio,
+            imax: imax,
+            size: size,
+            seeders: seeders,
+            leechers: leechers,
+            magnet: magnet,
+            detailURL: detailURL,
+            score: score,
+            scoreNotes: scoreNotes,
+            detailMetadata: detailMetadata,
+            detailSpecs: detailSpecs,
+            excluded: excluded
+        )
+    }
+
+    func withDetailMetadata(_ metadata: TorrentDetailMetadata) -> SearchResult {
+        let mergedSpecs = metadata.specs?.mergedMissingFields(from: raw.detailSpecs) ?? raw.detailSpecs
+        let updatedRaw = TorrentSearchResult(
+            id: raw.id,
+            title: mergedSpecs?.fullTorrentName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? raw.title,
+            detailMetadata: metadata.text ?? raw.detailMetadata,
+            detailSpecs: mergedSpecs,
+            magnet: metadata.magnet ?? raw.magnet,
+            detailURL: raw.detailURL,
+            seeders: raw.seeders,
+            leechers: raw.leechers,
+            provider: raw.provider,
+            size: raw.size
+        )
+        return SearchResult(ranked: TorrentRanker.score(updatedRaw))
+    }
+
+    func withResolvedData(from existing: SearchResult) -> SearchResult {
+        let mergedSpecs = existing.raw.detailSpecs?.mergedMissingFields(from: raw.detailSpecs) ?? raw.detailSpecs
+        let updatedRaw = TorrentSearchResult(
+            id: raw.id,
+            title: mergedSpecs?.fullTorrentName?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? raw.title,
+            detailMetadata: existing.raw.detailMetadata ?? raw.detailMetadata,
+            detailSpecs: mergedSpecs,
+            magnet: existing.raw.magnet ?? raw.magnet,
+            detailURL: raw.detailURL ?? existing.raw.detailURL,
+            seeders: raw.seeders,
+            leechers: raw.leechers,
+            provider: raw.provider,
+            size: raw.size ?? existing.raw.size
+        )
+        return SearchResult(ranked: TorrentRanker.score(updatedRaw))
+    }
+
+    private init(
+        id: UUID,
+        raw: TorrentSearchResult,
+        title: String,
+        provider: String,
+        source: String,
+        resolution: String,
+        dynamicRange: String,
+        codec: String,
+        audio: String,
+        imax: Bool,
+        size: String?,
+        seeders: Int?,
+        leechers: Int?,
+        magnet: String?,
+        detailURL: URL?,
+        score: Int,
+        scoreNotes: [String],
+        detailMetadata: String?,
+        detailSpecs: TorrentDetailSpecs?,
+        excluded: Bool
+    ) {
+        self.id = id
+        self.raw = raw
+        self.title = title
+        self.provider = provider
+        self.source = source
+        self.resolution = resolution
+        self.dynamicRange = dynamicRange
+        self.codec = codec
+        self.audio = audio
+        self.imax = imax
+        self.size = size
+        self.seeders = seeders
+        self.leechers = leechers
+        self.magnet = magnet
+        self.detailURL = detailURL
+        self.score = score
+        self.scoreNotes = scoreNotes
+        self.detailMetadata = detailMetadata
+        self.detailSpecs = detailSpecs
+        self.excluded = excluded
+    }
+}
+
+// MARK: - Parser + Ranker adapter (uses core)
+enum ParserRankerAdapter {
+    struct ParsedMeta {
+        var source: String
+        var resolution: String
+        var dynamicRange: String
+        var audio: String
+        var channels: String?
+        var atmos: Bool
+    }
+
+    static func parseAndScore(releaseName: String) -> (ParsedMeta, Int) {
+        // Use the real core
+        let parsed = ReleaseParser.parse(releaseName)
+        let mockRaw = TorrentSearchResult(
+            title: releaseName,
+            magnet: nil,
+            detailURL: nil,
+            seeders: 10, // tie-break only, not used in score
+            leechers: 5,
+            provider: "Sample"
+        )
+        let ranked = TorrentRanker.score(mockRaw)
+
+        let meta = ParsedMeta(
+            source: displayName(for: parsed.sourceType),
+            resolution: displayName(for: parsed.resolution),
+            dynamicRange: displayName(for: parsed.dynamicRange),
+            audio: displayName(for: parsed.audioCodec, atmos: parsed.atmos),
+            channels: channelsString(parsed.channels),
+            atmos: parsed.atmos
+        )
+        return (meta, ranked.score)
+    }
+
+    static func channelsString(_ c: ChannelLayout) -> String? {
+        switch c {
+        case .sevenOne: return "7.1"
+        case .fiveOne: return "5.1"
+        case .twoZero: return "2.0"
+        case .mono: return "Mono"
+        case .unknown: return nil
+        }
+    }
+
+    static func displayName(for source: SourceType) -> String {
+        switch source {
+        case .remux: return "Remux"
+        case .bluray: return "BluRay"
+        case .webdl: return "WEB-DL"
+        case .webrip: return "WEBRip"
+        case .dvd: return "DVD"
+        case .hdtv: return "HDTV"
+        case .cam: return "CAM"
+        case .unknown: return "Unknown"
+        }
+    }
+
+    static func sourceSummary(for parsed: ParsedRelease, title: String, specs: TorrentDetailSpecs?) -> String {
+        let isUHD = parsed.resolution == .p2160 ||
+            title.uppercased().contains("UHD") ||
+            specs?.fullTorrentName?.uppercased().contains("UHD") == true ||
+            specs?.releaseHintText?.uppercased().contains("UHD") == true
+        switch parsed.sourceType {
+        case .remux:
+            return isUHD ? "UHD Remux" : "Blu-ray Remux"
+        case .bluray:
+            return isUHD ? "UHD Blu-ray" : "Blu-ray"
+        case .webdl:
+            return "WEB-DL"
+        case .webrip:
+            return "WEBRip"
+        case .dvd:
+            return "DVD"
+        case .hdtv:
+            return "HDTV"
+        case .cam:
+            return "CAM"
+        case .unknown:
+            return "Unknown"
+        }
+    }
+
+    static func displayName(for resolution: Resolution) -> String {
+        switch resolution {
+        case .p2160: return "4K"
+        case .p1080: return "1080p"
+        case .likely1080: return "Likely 1080p"
+        case .p720: return "720p"
+        case .sd: return "SD"
+        case .unknown: return "Unknown"
+        }
+    }
+
+    static func displayName(for dr: DynamicRange) -> String {
+        switch dr {
+        case .dolbyVision: return "Dolby Vision"
+        case .hdr10plus: return "HDR10+"
+        case .hdr10: return "HDR10"
+        case .hdr: return "HDR"
+        case .likelyHDR: return "Likely HDR"
+        case .sdr: return "SDR"
+        case .unknown: return "Unknown"
+        }
+    }
+
+    static func displayName(for videoCodec: VideoCodec) -> String {
+        switch videoCodec {
+        case .hevc: return "HEVC"
+        case .avc: return "H.264"
+        case .vc1: return "VC-1"
+        case .mpeg2: return "MPEG-2"
+        case .av1: return "AV1"
+        case .unknown: return "Unknown"
+        }
+    }
+
+    static func displayName(for ac: AudioCodec, atmos: Bool) -> String {
+        let base: String
+        switch ac {
+        case .truehd: base = "TrueHD"
+        case .dtsHDMA: base = "DTS MA"
+        case .dtsHDHRA: base = "DTS HRA"
+        case .pcm: base = "PCM"
+        case .ddp: base = "DDP"
+        case .dts: base = "DTS"
+        case .dd: base = "DD"
+        case .aac: base = "AAC-LC"
+        case .heAAC: base = "HE-AAC"
+        case .opus: base = "Opus"
+        case .mp3: base = "MP3"
+        case .unknown: base = "Unknown"
+        }
+        return base
+    }
+
+    static func audioSummary(codec: AudioCodec, channels: ChannelLayout, atmos: Bool) -> String {
+        var parts: [String] = [displayName(for: codec, atmos: false)]
+        if let channelText = channelsString(channels) {
+            parts.append(channelText)
+        }
+        if atmos {
+            parts.append("Atmos")
+        }
+        return parts.joined(separator: " ")
+    }
+}
+
+// MARK: - Views
+private struct SearchBar: View {
+    @Binding var query: String
+    let suggestions: [MovieCatalogSuggestion]
+    var onSuggestionSelected: (MovieCatalogSuggestion) -> Void
+    var onSubmit: () -> Void
+    var onSettings: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                HStack(spacing: 6) {
+                    TextField("Search movies", text: $query)
+                        .textFieldStyle(.plain)
+                        .submitLabel(.search)
+                        .onSubmit(onSubmit)
+
+                    if !query.isEmpty {
+                        Button {
+                            query = ""
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Clear search")
+                    }
+                }
+                .padding(.horizontal, 10)
+                .frame(minHeight: 34)
+                .background(.background, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .strokeBorder(.quaternary, lineWidth: 1)
+                )
+
+                Button(action: onSubmit) {
+                    Image(systemName: "magnifyingglass")
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .accessibilityLabel("Search")
+
+                Button(action: onSettings) {
+                    Image(systemName: "gearshape")
+                }
+                .accessibilityLabel("Transmission Settings")
+#if os(macOS)
+                .help("Transmission Settings")
+#endif
+            }
+
+            if !suggestions.isEmpty {
+                ScrollView {
+                    VStack(spacing: 0) {
+                        ForEach(suggestions) { suggestion in
+                            HStack {
+                                Text(suggestion.displayTitle)
+                                    .lineLimit(1)
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 8)
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                onSuggestionSelected(suggestion)
+                            }
+
+                            if suggestion.id != suggestions.last?.id {
+                                Divider()
+                            }
+                        }
+                    }
+                }
+                .frame(maxHeight: 320)
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(.quaternary, lineWidth: 1)
+                )
+                .zIndex(20)
+            }
+        }
+        .zIndex(20)
+    }
+}
+
+private struct MetaChip: View {
+    let text: String
+    let systemImage: String
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Image(systemName: systemImage)
+            Text(text)
+        }
+        .lineLimit(1)
+        .font(.callout)
+        .foregroundStyle(.secondary)
+    }
+}
+
+private struct FlowLayout: Layout {
+    var spacing: CGFloat = 8
+    var lineSpacing: CGFloat = 4
+
+    init(spacing: CGFloat = 8, lineSpacing: CGFloat = 4) {
+        self.spacing = spacing
+        self.lineSpacing = lineSpacing
+    }
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        for sub in subviews {
+            let size = sub.sizeThatFits(.unspecified)
+            if x > 0 && x + size.width > maxWidth {
+                x = 0
+                y += rowHeight + lineSpacing
+                rowHeight = 0
+            }
+            rowHeight = max(rowHeight, size.height)
+            x += size.width + spacing
+        }
+        y += rowHeight
+        return CGSize(width: maxWidth.isFinite ? maxWidth : x, height: y)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        let maxWidth = bounds.width
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        for sub in subviews {
+            let size = sub.sizeThatFits(.unspecified)
+            if x > 0 && x + size.width > maxWidth {
+                x = 0
+                y += rowHeight + lineSpacing
+                rowHeight = 0
+            }
+            sub.place(at: CGPoint(x: bounds.minX + x, y: bounds.minY + y), proposal: ProposedViewSize(width: size.width, height: size.height))
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
+    }
+}
+
+private struct ScoreBadge: View {
+    let score: Int
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .fill(scoreColor)
+                .frame(width: 44, height: 44)
+            Text("\(score)")
+                .font(.headline.weight(.semibold))
+                .foregroundStyle(.white)
+        }
+        .accessibilityLabel("Score \(score)")
+    }
+
+    private var scoreColor: Color {
+        switch score {
+        case 80...: return .green
+        case 60..<80: return .orange
+        default: return .red
+        }
+    }
+}
+
+// Removed ChipsFlow and HeightPreferenceKey structs as requested
+
+private struct ResultDetailPagerView: View {
+    let result: SearchResult
+    let metadataStatus: DetailMetadataFetchStatus
+    let navigationDirection: Int
+    var onPrevious: () -> Void
+    var onNext: () -> Void
+
+    private var insertionEdge: Edge {
+        navigationDirection < 0 ? .leading : .trailing
+    }
+
+    private var removalEdge: Edge {
+        navigationDirection < 0 ? .trailing : .leading
+    }
+
+    var body: some View {
+        ZStack {
+            ResultDetailView(
+                result: result,
+                metadataStatus: metadataStatus,
+                onPrevious: onPrevious,
+                onNext: onNext
+            )
+            .id(result.id)
+            .transition(
+                .asymmetric(
+                    insertion: .move(edge: insertionEdge).combined(with: .opacity),
+                    removal: .move(edge: removalEdge).combined(with: .opacity)
+                )
+            )
+        }
+        .animation(.easeInOut(duration: 0.2), value: result.id)
+    }
+}
+
+private struct ResultDetailView: View {
+    let result: SearchResult
+    let metadataStatus: DetailMetadataFetchStatus
+    var onPrevious: () -> Void
+    var onNext: () -> Void
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(result.title.torrentNameWrappingText)
+                        .font(.title2.weight(.semibold))
+                        .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 10) {
+                        ScoreBadge(score: result.score)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(result.provider)
+                                .font(.headline)
+                            if let detailURL = result.detailURL {
+                                Link(detailURL.host ?? detailURL.absoluteString, destination: detailURL)
+                                    .font(.callout)
+                            }
+                        }
+                    }
+                }
+
+                FlowLayout(spacing: 8, lineSpacing: 6) {
+                    Tag("Source", value: result.source)
+                    Tag("Resolution", value: result.resolution)
+                    Tag("Range", value: result.dynamicRange)
+                    Tag("Codec", value: result.codec)
+                    Tag("Audio", value: result.audio)
+                    if result.imax {
+                        Tag("Format", value: "IMAX")
+                    }
+                    if let size = result.size, !size.isEmpty {
+                        Tag("Size", value: size)
+                    }
+                    if let seeders = result.seeders {
+                        Tag("Seeders", value: "\(seeders)")
+                    }
+                    if let leechers = result.leechers {
+                        Tag("Leechers", value: "\(leechers)")
+                    }
+                }
+
+                if !result.scoreNotes.isEmpty {
+                    DetailSection(title: "Score") {
+                        VStack(alignment: .leading, spacing: 6) {
+                            ForEach(result.scoreNotes, id: \.self) { note in
+                                ScoreNoteText(note: note, result: result)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                    }
+                }
+
+                DetailSection(title: "Codec-Adjusted Quality Math") {
+                    QualityEquationView(result: result)
+                }
+
+                DetailSection(title: "Detail Page Specs") {
+                    if let specs = result.detailSpecs, specs.hasDisplayableFields {
+                        DetailSpecList(specs: specs, result: result.raw)
+                    } else if result.detailURL != nil {
+                        metadataStatusView
+                    } else {
+                        Text("This result does not include a detail page URL.")
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding(20)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .frame(minWidth: 420, minHeight: 420)
+        .gesture(
+            DragGesture(minimumDistance: 40)
+                .onEnded { value in
+                    guard abs(value.translation.width) > abs(value.translation.height),
+                          abs(value.translation.width) > 60 else { return }
+                    if value.translation.width < 0 {
+                        onNext()
+                    } else {
+                        onPrevious()
+                    }
+                }
+        )
+    }
+
+    @ViewBuilder
+    private var metadataStatusView: some View {
+        switch metadataStatus {
+        case .notStarted:
+            Text("Metadata fetch is queued for this result.")
+                .foregroundStyle(.secondary)
+        case .fetching:
+            HStack(spacing: 8) {
+                ProgressView()
+                    .controlSize(.small)
+                Text("Fetching and parsing the detail page...")
+                    .foregroundStyle(.secondary)
+            }
+        case .fetched:
+            Text("Checked the detail page, but no requested specs were found.")
+                .foregroundStyle(.secondary)
+        case .checkedNoMetadata:
+            Text("Checked the detail page, but no requested specs were found.")
+                .foregroundStyle(.secondary)
+        case .failed(let message):
+            Text("Detail page fetch failed: \(message)")
+                .foregroundStyle(.secondary)
+        }
+    }
+}
+
+private struct QualityEquationView: View {
+    let result: SearchResult
+
+    private var breakdown: QualityScoreBreakdown {
+        TorrentRanker.qualityBreakdown(for: result.raw)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Video H.264-equivalent BPPPF")
+                    .font(.callout.weight(.semibold))
+                FractionEquation(
+                    value: formatDecimal(breakdown.video.adjustedBPPPF, places: 6),
+                    numerator: "\(formatInteger(breakdown.video.bitrateKbps)) kbps x 1000 x \(formatDecimal(breakdown.video.codecFactor, places: 2)) (codec)",
+                    denominator: "\(breakdown.video.width) x \(breakdown.video.height) (pixels) x \(formatDecimal(breakdown.video.frameRate, places: 3)) (fps)"
+                )
+                FractionEquation(
+                    value: formatDecimal(breakdown.video.densityRatio, places: 4),
+                    numerator: "\(formatDecimal(breakdown.video.adjustedBPPPF, places: 6)) BPPPF",
+                    denominator: "\(formatDecimal(breakdown.video.targetBPPPF, places: 2)) target BPPPF"
+                )
+                Text("Bitrate source: \(qualityMathSourceLabel(breakdown.video.bitrateSourceLabel))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Text("Resolution potential: \(formatDecimal(breakdown.video.resolutionPotentialScore, places: 1))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if breakdown.video.densityRatio <= 0.20 {
+                    Text("Low-density collapse multiplier: \(formatDecimal(breakdown.video.compressionHealth, places: 4))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else if breakdown.video.densityRatio < 0.32 {
+                    Text("Smooth transition adjustment: \(formatSignedDecimal(breakdown.video.densityAdjustmentScore, places: 2))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Shared density adjustment: \(formatSignedDecimal(breakdown.video.densityAdjustmentScore, places: 2))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("Adjustment: 50 x (1 - exp(-2.329403 x (density ratio - 1)))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Divider()
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Audio codec-adjusted density")
+                    .font(.callout.weight(.semibold))
+                if let audioBitrate = breakdown.audio.bitrateKbps,
+                   let density = breakdown.audio.density {
+                    FractionEquation(
+                        value: formatDecimal(density, places: 3),
+                        numerator: "\(formatInteger(audioBitrate)) kbps x \(formatDecimal(breakdown.audio.codecFactor, places: 2)) (codec)",
+                        denominator: "\(formatDecimal(breakdown.audio.effectiveChannelCount, places: 2)) (effective channels)"
+                    )
+                } else if breakdown.audio.bitrateKbps != nil {
+                    Text("Bit density is bypassed for lossless audio.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else {
+                    Text("No explicit or inferred bitrate was available for the selected English audio track.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                Text("Selected track: \(ParserRankerAdapter.audioSummary(codec: breakdown.parsed.audioCodec, channels: breakdown.parsed.channels, atmos: breakdown.parsed.atmos))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if let source = breakdown.audio.bitrateSourceLabel {
+                    Text("Bitrate source: \(qualityMathSourceLabel(source))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if let density = breakdown.audio.density {
+                    Text("Curved density health: \(formatDecimal(density, places: 3)) kbps/channel -> \(formatDecimal(breakdown.audio.compressionHealth, places: 4))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Text("Curve anchors: 32=0.09, 64=0.62, 96≈0.82, 160=1.00")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } else {
+                    Text("Density health: \(formatDecimal(breakdown.audio.compressionHealth, places: 4))")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Text("Audio score: \(formatDecimal(breakdown.audio.score, places: 2)) = \(formatDecimal(breakdown.audio.channelBaseScore, places: 0)) layout \(formatSignedDecimal(breakdown.audio.densityAdjustmentScore, places: 2)) density \(formatSignedDecimal(breakdown.audio.atmosBonusScore, places: 2)) Atmos \(formatSignedDecimal(breakdown.audio.atmosReliefScore, places: 2)) relief")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .textSelection(.enabled)
+    }
+
+    private func formatInteger(_ value: Int) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
+    }
+
+    private func formatDecimal(_ value: Double, places: Int) -> String {
+        String(format: "%.\(places)f", value)
+    }
+
+    private func formatSignedDecimal(_ value: Double, places: Int) -> String {
+        String(format: "%+.\(places)f", value)
+    }
+
+    private func qualityMathSourceLabel(_ source: String) -> String {
+        switch source {
+        case "explicit": return "parsed"
+        case "derived": return "calculated"
+        default: return source
+        }
+    }
+}
+
+private struct ScoreNoteText: View {
+    let note: String
+    let result: SearchResult
+
+    var body: some View {
+        if let text = attributedScoreNote {
+            Text(text)
+                .font(.callout)
+        } else {
+            Text(normalizedNote)
+                .font(.callout)
+        }
+    }
+
+    private var attributedScoreNote: AttributedString? {
+        guard let parsed = parsedNote else { return nil }
+        var text = AttributedString("\(parsed.label): \(parsed.points)\(parsed.detail)")
+        if let range = text.range(of: parsed.points) {
+            text[range].font = .callout.bold()
+        }
+        return text
+    }
+
+    private var parsedNote: (label: String, points: String, detail: String)? {
+        guard let colon = normalizedNote.firstIndex(of: ":") else { return nil }
+        let label = String(normalizedNote[..<colon])
+        let rest = normalizedNote[normalizedNote.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+        guard let points = leadingSignedNumber(in: rest) else { return nil }
+        let detailStart = rest.index(rest.startIndex, offsetBy: points.count)
+        return (label, points, String(rest[detailStart...]))
+    }
+
+    private var normalizedNote: String {
+        if note.hasPrefix("Picture quality:") {
+            return pictureQualityNote
+        }
+
+        var display = displayBitratesAsKbps(note)
+        display = normalizeScoreDetail(display)
+        display = display.replacingOccurrences(of: "kb/s", with: "kbps")
+        display = display.replacingOccurrences(of: "kHz", with: "KHz")
+        display = display.replacingOccurrences(of: "khz", with: "KHz", options: .caseInsensitive)
+        display = display.replacingOccurrences(of: "explicit", with: "parsed")
+        display = display.replacingOccurrences(of: "derived", with: "calculated")
+        display = display.replacingOccurrences(of: "calculated from size ÷ runtime - audio", with: "calculated")
+        return display
+    }
+
+    private func normalizeScoreDetail(_ note: String) -> String {
+        guard let parsed = scoreNoteParts(in: note) else { return note }
+        let normalizedDetail: String?
+        switch parsed.label {
+        case "Dynamic range":
+            normalizedDetail = DynamicRange(rawValue: parsed.detail).map(ParserRankerAdapter.displayName)
+        case "Audio codec quality":
+            normalizedDetail = AudioCodec(rawValue: parsed.detail).map { ParserRankerAdapter.displayName(for: $0, atmos: false) }
+        default:
+            normalizedDetail = nil
+        }
+
+        guard let normalizedDetail else { return note }
+        return "\(parsed.label): \(parsed.points) - \(normalizedDetail)"
+    }
+
+    private func scoreNoteParts(in note: String) -> (label: String, points: String, detail: String)? {
+        guard let colon = note.firstIndex(of: ":") else { return nil }
+        let label = String(note[..<colon])
+        let rest = note[note.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+        guard let points = leadingSignedNumber(in: rest) else { return nil }
+        let detailStart = rest.index(rest.startIndex, offsetBy: points.count)
+        let detail = rest[detailStart...]
+            .trimmingCharacters(in: .whitespaces)
+            .trimmingPrefix("-")
+            .trimmingCharacters(in: .whitespaces)
+        guard !detail.isEmpty else { return nil }
+        return (label, points, detail)
+    }
+
+    private var pictureQualityNote: String {
+        let breakdown = TorrentRanker.qualityBreakdown(for: result.raw)
+        let source: String
+        if breakdown.video.bitrateIsEstimated {
+            source = "estimated"
+        } else if breakdown.video.bitrateSourceLabel == "explicit" {
+            source = "parsed"
+        } else {
+            source = "calculated"
+        }
+        return "Picture quality: \(pictureQualityPoints) - \(result.resolution)@\(formatKbps(breakdown.video.bitrateKbps)) kbps (\(source)), density \(formatScoreMultiplier(breakdown.video.densityRatio)), adjustment \(formatSignedScore(breakdown.video.densityAdjustmentScore))"
+    }
+
+    private var pictureQualityPoints: String {
+        let prefix = "Picture quality:"
+        guard note.hasPrefix(prefix) else { return "+0" }
+        let rest = note.dropFirst(prefix.count).trimmingCharacters(in: .whitespaces)
+        return leadingSignedNumber(in: rest) ?? "+0"
+    }
+
+    private func leadingSignedNumber(in text: some StringProtocol) -> String? {
+        var result = ""
+        var hasDecimalPoint = false
+        for (index, character) in text.enumerated() {
+            if index == 0 && (character == "+" || character == "-") {
+                result.append(character)
+            } else if character.isNumber {
+                result.append(character)
+            } else if character == "." && !hasDecimalPoint {
+                result.append(character)
+                hasDecimalPoint = true
+            } else {
+                break
+            }
+        }
+        return result.contains(where: { $0.isNumber }) ? result : nil
+    }
+
+    private func formatScoreMultiplier(_ value: Double) -> String {
+        String(format: "%.2fx", value)
+    }
+
+    private func formatSignedScore(_ value: Double) -> String {
+        String(format: "%+.1f", value)
+    }
+}
+
+private struct FractionEquation: View {
+    let value: String
+    let numerator: String
+    let denominator: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(value)
+                .font(.system(.body, design: .monospaced).weight(.semibold))
+            VStack(alignment: .leading, spacing: 3) {
+                Text(numerator)
+                Rectangle()
+                    .fill(.secondary.opacity(0.55))
+                    .frame(maxWidth: .infinity, minHeight: 1, maxHeight: 1)
+                Text(denominator)
+            }
+            .font(.system(.callout, design: .monospaced))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
+private func displayBitratesAsKbps(_ text: String) -> String {
+    text
+        .split(separator: "\n", omittingEmptySubsequences: false)
+        .map { displayBitratesAsKbpsLine(String($0)) }
+        .joined(separator: "\n")
+}
+
+private func displayBitratesAsKbpsLine(_ line: String) -> String {
+    let bitratePattern = #"(?i)(?:VBR|CBR|ABR)?\s*(?<![0-9.])([0-9]+(?:[\s,][0-9]{3})*(?:\.[0-9]+)?)\s*([kmgt]i?b/s|[kmgt]bps|b/s)"#
+    guard let regex = try? NSRegularExpression(pattern: bitratePattern) else { return line }
+    let fullRange = NSRange(line.startIndex..<line.endIndex, in: line)
+    let matches = regex.matches(in: line, range: fullRange)
+    guard !matches.isEmpty else { return line }
+
+    if let parentheticalKbps = parentheticalKbpsValue(in: line),
+       let firstMatch = matches.first,
+       let firstRange = Range(firstMatch.range, in: line),
+       line[firstRange].localizedCaseInsensitiveContains("mb/s") || line[firstRange].localizedCaseInsensitiveContains("mbps") {
+        return String(line[..<firstRange.lowerBound]) + "\(formatKbps(parentheticalKbps)) kbps"
+    }
+
+    var output = line
+    for match in matches.reversed() {
+        guard let matchRange = Range(match.range, in: output),
+              let valueRange = Range(match.range(at: 1), in: output),
+              let unitRange = Range(match.range(at: 2), in: output),
+              let kbps = bitrateKbps(value: String(output[valueRange]), unit: String(output[unitRange])) else { continue }
+        output.replaceSubrange(matchRange, with: "\(formatKbps(kbps)) kbps")
+    }
+    return output
+}
+
+private func parentheticalKbpsValue(in text: String) -> Int? {
+    let pattern = #"(?i)\(([0-9]+(?:[\s,][0-9]{3})*(?:\.[0-9]+)?)\s*(?:k(?:i)?b/s|kbps)\)"#
+    guard let regex = try? NSRegularExpression(pattern: pattern),
+          let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..<text.endIndex, in: text)),
+          let valueRange = Range(match.range(at: 1), in: text) else { return nil }
+    return bitrateKbps(value: String(text[valueRange]), unit: "kb/s")
+}
+
+private func bitrateKbps(value rawValue: String, unit rawUnit: String) -> Int? {
+    guard let value = Double(rawValue.replacingOccurrences(of: " ", with: "").replacingOccurrences(of: ",", with: "")) else { return nil }
+    let unit = rawUnit.lowercased()
+    if unit.contains("gb/s") || unit.contains("gbps") { return Int(value * 1_000_000) }
+    if unit.contains("mb/s") || unit.contains("mbps") { return Int(value * 1_000) }
+    if unit == "b/s" { return Int(value / 1_000) }
+    return Int(value)
+}
+
+private func formatKbps(_ value: Int) -> String {
+    let formatter = NumberFormatter()
+    formatter.numberStyle = .decimal
+    formatter.groupingSeparator = ","
+    return formatter.string(from: NSNumber(value: value)) ?? "\(value)"
+}
+
+private struct DetailSpecList: View {
+    let specs: TorrentDetailSpecs
+    let result: TorrentSearchResult
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            ForEach(rows, id: \.label) { row in
+                DetailSpecRow(label: row.label, value: row.value, isCalculated: row.isCalculated, isExternalMetadata: row.isExternalMetadata)
+            }
+        }
+        .textSelection(.enabled)
+    }
+
+    private var rows: [(label: String, value: String, isCalculated: Bool, isExternalMetadata: Bool)] {
+        var rows: [(String, String, Bool, Bool)] = []
+        append("Video bitrate", specs.videoBitrate ?? derivedVideoBitrate, field: "videoBitrate", to: &rows, forceCalculated: specs.videoBitrate == nil && derivedVideoBitrate != nil)
+        append("Resolution width", specs.resolutionWidth, field: "resolutionWidth", to: &rows)
+        append("Resolution height", specs.resolutionHeight, field: "resolutionHeight", to: &rows)
+        append("Frame rate", specs.frameRate ?? "23.976 FPS", field: "frameRate", to: &rows)
+        append("Bit depth", specs.bitDepth, field: "bitDepth", to: &rows)
+        append("CRF", specs.crf, field: "crf", to: &rows)
+        append("Preset", specs.preset, field: "preset", to: &rows)
+        append("Encoding passes", specs.encodingPasses, field: "encodingPasses", to: &rows)
+        append("Color gamut", specs.colorGamut, field: "colorGamut", to: &rows)
+        append("Dolby Vision profile", specs.dolbyVisionProfile, field: "dolbyVisionProfile", to: &rows)
+        append("Aspect ratio", specs.aspectRatio, field: "aspectRatio", to: &rows)
+        append("Best English audio bitrate", specs.bestEnglishAudioBitrate, field: "bestEnglishAudioBitrate", to: &rows)
+        append("Best English audio sample rate", specs.bestEnglishAudioSampleRate, field: "bestEnglishAudioSampleRate", to: &rows)
+        if !specs.allAudioTrackBitrates.isEmpty {
+            rows.append(("All audio track bitrates", displayAllAudioTrackBitrates(specs.allAudioTrackBitrates), specs.isCalculated("allAudioTrackBitrates"), specs.isExternalMetadata("allAudioTrackBitrates")))
+        }
+        append("Total audio bitrate", specs.totalAudioTrackBitrate, field: "totalAudioTrackBitrate", to: &rows)
+        append("Overall bitrate", specs.overallBitrate, field: "overallBitrate", to: &rows)
+        if specs.videoBitrate == nil && derivedVideoBitrate == nil {
+            append("Calculated video bitrate", specs.calculatedVideoBitrate, field: "calculatedVideoBitrate", to: &rows)
+        }
+        append("Runtime", specs.runtime, field: "runtime", to: &rows)
+        return rows
+    }
+
+    private var derivedVideoBitrate: String? {
+        let breakdown = TorrentRanker.qualityBreakdown(for: result)
+        guard !breakdown.video.bitrateIsEstimated else { return nil }
+        guard breakdown.video.bitrateSourceLabel != "explicit" else { return nil }
+        return "\(formatKbps(breakdown.video.bitrateKbps)) kbps"
+    }
+
+    private func append(_ label: String, _ value: String?, field: String, to rows: inout [(String, String, Bool, Bool)], forceCalculated: Bool = false) {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty else { return }
+        var displayValue = bitrateFields.contains(field) ? displayBitratesAsKbps(value) : value
+        if field == "bestEnglishAudioSampleRate" {
+            displayValue = displayValue
+                .replacingOccurrences(of: "kHz", with: "KHz")
+                .replacingOccurrences(of: "khz", with: "KHz", options: .caseInsensitive)
+        }
+        rows.append((label, displayValue, forceCalculated || specs.isCalculated(field), specs.isExternalMetadata(field)))
+    }
+
+    private var bitrateFields: Set<String> {
+        [
+            "videoBitrate",
+            "bestEnglishAudioBitrate",
+            "allAudioTrackBitrates",
+            "totalAudioTrackBitrate",
+            "overallBitrate",
+            "calculatedVideoBitrate"
+        ]
+    }
+
+    private func displayAllAudioTrackBitrates(_ values: [String]) -> String {
+        displayBitratesAsKbps(values.joined(separator: "\n"))
+            .replacingOccurrences(
+                of: #":\s*(?=(?:VBR|CBR|ABR)?\s*[0-9])"#,
+                with: ": ",
+                options: [.regularExpression, .caseInsensitive]
+            )
+    }
+}
+
+private struct DetailSpecRow: View {
+    let label: String
+    let value: String
+    let isCalculated: Bool
+    let isExternalMetadata: Bool
+
+    var body: some View {
+        Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
+            GridRow(alignment: .firstTextBaseline) {
+                Text(label)
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(foregroundStyle(isPrimary: false))
+                    .frame(width: 190, alignment: .leading)
+                Text(value)
+                    .font(.callout)
+                    .foregroundStyle(foregroundStyle(isPrimary: true))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+
+    private func foregroundStyle(isPrimary: Bool) -> Color {
+        if isExternalMetadata { return .teal }
+        if isCalculated { return .orange }
+        return isPrimary ? .primary : .secondary
+    }
+}
+
+private struct DetailSection<Content: View>: View {
+    let title: String
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title)
+                .font(.headline)
+            content
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.secondary.opacity(0.08), in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+    }
+}
+
+private struct Tag: View {
+    let label: String
+    let value: String
+
+    init(_ label: String, value: String) {
+        self.label = label
+        self.value = value
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            Text(label + ":")
+                .foregroundStyle(.secondary)
+            Text(value)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(.thinMaterial, in: Capsule())
+    }
+}
+
+private struct ErrorStateView: View {
+    let message: String
+    var retry: () -> Void
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "exclamationmark.triangle")
+                .font(.system(size: 48))
+                .foregroundStyle(.orange)
+            Text(message)
+                .multilineTextAlignment(.center)
+            Button("Try Again", action: retry)
+        }
+        .padding()
+    }
+}
+
+private struct EmptyResultsView: View {
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 48))
+                .symbolRenderingMode(.hierarchical)
+                .foregroundStyle(.secondary)
+            Text("Search for a movie or show to see ranked results")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+        }
+        .padding()
+    }
+}
+
+private struct ResultsListView: View {
+    let results: [SearchResult]
+    @Binding var selected: SearchResult?
+    @Binding var presentedResult: SearchResult?
+
+    var body: some View {
+        List(results) { result in
+            ResultRow(
+                result: result,
+                isSelected: selected?.id == result.id
+            ) {
+                if selected?.id == result.id {
+                    presentedResult = result
+                } else {
+                    selected = result
+                }
+            } onShowDetails: {
+                selected = result
+                presentedResult = result
+            }
+            .listRowBackground(selected?.id == result.id ? Color.accentColor.opacity(0.1) : Color.clear)
+            .transaction { transaction in
+                transaction.animation = nil
+            }
+        }
+        .listStyle(.plain)
+        .listRowInsets(EdgeInsets(top: 6, leading: 8, bottom: 6, trailing: 8))
+        .modifier(ContentMarginsZero())
+    }
+}
+
+private struct ContentMarginsZero: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(iOS 17.0, macOS 14.0, *) {
+            content.contentMargins(.all, 0)
+        } else {
+            content
+        }
+    }
+}
+
+private struct ResultRow: View {
+    let result: SearchResult
+    let isSelected: Bool
+    var onPrimaryTap: () -> Void
+    var onShowDetails: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            ScoreBadge(score: result.score)
+                .padding(.top, 2)
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .top, spacing: 8) {
+                    Text(result.title.torrentNameWrappingText)
+                        .font(.headline)
+                        .lineLimit(3)
+                        .truncationMode(.tail)
+                        .allowsTightening(false)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                FlowLayout(spacing: 8, lineSpacing: 4) {
+                    MetaChip(text: result.source, systemImage: "film")
+                    MetaChip(text: result.resolution, systemImage: "rectangle.3.group")
+                    MetaChip(text: result.dynamicRange, systemImage: "circle.lefthalf.filled")
+                    MetaChip(text: result.codec, systemImage: "play.rectangle")
+                    MetaChip(text: result.audio, systemImage: "speaker.wave.2")
+                    if result.imax {
+                        MetaChip(text: "IMAX", systemImage: "rectangle.expand.vertical")
+                    }
+                }
+                if result.seeders != nil || result.leechers != nil || (result.size?.isEmpty == false) {
+                    FlowLayout(spacing: 8, lineSpacing: 4) {
+                        MetaChip(text: result.provider, systemImage: "network")
+                        if let size = result.size, !size.isEmpty {
+                            MetaChip(text: size, systemImage: "externaldrive")
+                        }
+                        if let seeders = result.seeders {
+                            MetaChip(text: "\(seeders)", systemImage: "arrow.up.circle")
+                        }
+                        if let leechers = result.leechers {
+                            MetaChip(text: "\(leechers)", systemImage: "arrow.down.circle")
+                        }
+                    }
+                }
+            }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) { onShowDetails() }
+        .onTapGesture { onPrimaryTap() }
+        .padding(.vertical, 4)
+    }
+    
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        isEmpty ? nil : self
+    }
+
+    var torrentNameWrappingText: String {
+        var output = ""
+        let characters = Array(self)
+        output.reserveCapacity(count)
+
+        for index in characters.indices {
+            let character = characters[index]
+            if character == ".",
+               !isChannelLayoutDot(in: characters, at: index) {
+                output.append(" ")
+            } else {
+                output.append(character)
+            }
+        }
+
+        return output
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func isChannelLayoutDot(in characters: [Character], at index: Int) -> Bool {
+        guard index > characters.startIndex,
+              index < characters.index(before: characters.endIndex) else { return false }
+        let previous = characters[characters.index(before: index)]
+        let next = characters[characters.index(after: index)]
+        let channelLeadingDigits = Set<Character>(["1", "2", "5", "7"])
+        let channelTrailingDigits = Set<Character>(["0", "1"])
+        return channelLeadingDigits.contains(previous) && channelTrailingDigits.contains(next)
+    }
+}
+
+private extension TransmissionTorrentPriority {
+    var label: String {
+        switch self {
+        case .low: return "Low"
+        case .normal: return "Normal"
+        case .high: return "High"
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .low: return "arrow.down.to.line"
+        case .normal: return "equal"
+        case .high: return "arrow.up.to.line"
+        }
+    }
+}
+
+private func formatDownloadSpeed(_ bytesPerSecond: Int) -> String {
+    let rate = max(bytesPerSecond, 0)
+    let units = ["B/s", "KB/s", "MB/s", "GB/s"]
+    var value = Double(rate)
+    var unitIndex = 0
+    while value >= 1024, unitIndex < units.count - 1 {
+        value /= 1024
+        unitIndex += 1
+    }
+
+    if unitIndex == 0 {
+        return "\(rate) \(units[unitIndex])"
+    }
+    return String(format: "%.1f %@", value, units[unitIndex])
+}
+
+fileprivate struct NavigationViewWrapper<Content: View>: View {
+    let content: () -> Content
+
+    var body: some View {
+        NavigationStack {
+            content()
+        }
+    }
+}
+
+struct TransmissionSettingsView: View {
+    @Binding var rpcURL: String
+    @Binding var tailscaleRPCURL: String
+    @Binding var preferTailscale: Bool
+    @Binding var username: String
+    @Binding var password: String
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Endpoints") {
+                    TextField("Home RPC URL (Optional)", text: $rpcURL)
+#if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+#endif
+                    TextField("Tailscale RPC URL (Optional)", text: $tailscaleRPCURL)
+#if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+#endif
+                    Toggle("Prefer Tailscale First", isOn: $preferTailscale)
+                }
+
+                Section("Authentication") {
+                    TextField("Username (Optional)", text: $username)
+#if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+#endif
+                    SecureField("Password (Optional)", text: $password)
+                }
+
+                Section("Tip") {
+                    Text("Use your LAN address in Home RPC URL and your Tailscale IP or MagicDNS name in Tailscale RPC URL. If you enter only a host like 100.64.0.10:9091, the app will use http and append /transmission/rpc automatically.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Transmission")
+#if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+#endif
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                }
+            }
+        }
+        .frame(minWidth: 420, minHeight: 240)
+    }
+}
+
+#if os(iOS)
+private extension UIApplication {
+    func endEditing() {
+        sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+    }
+}
+#endif
+
+#Preview("macOS Wide Preview") {
+#if os(macOS)
+    // Seeded preview with a wider frame so rows don't truncate vertically
+    ContentView_PreviewWrapper()
+        .frame(width: 900, height: 600)
+#else
+    ContentView_PreviewWrapper()
+#endif
+}
+// Helper to preview ContentView with seeded results on macOS
+private struct ContentView_PreviewWrapper: View {
+    @StateObject private var transmissionStore = TransmissionStore()
+    @StateObject private var tvAutomation = TVAutomationCoordinator()
+
+    var body: some View {
+        ContentView()
+            .environmentObject(transmissionStore)
+            .environmentObject(tvAutomation)
+            .onAppear { /* no-op; ContentView drives its own state */ }
+    }
+}
+
+#Preview("iOS Preview") {
+#if os(iOS)
+    ContentView_PreviewWrapper()
+#endif
+}

@@ -1,0 +1,590 @@
+import Foundation
+
+public final class RegexHTMLProvider: TorrentProvider, @unchecked Sendable {
+    public let config: ProviderConfig
+    private let session: URLSession
+
+    public init(config: ProviderConfig, session: URLSession = .shared) {
+        self.config = config
+        self.session = session
+    }
+
+    public func search(
+        _ query: String,
+        onProgress: (@concurrent @Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)?
+    ) async throws -> [TorrentSearchResult] {
+        guard config.enabled else { return [] }
+        guard !config.searchURLTemplate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw ProviderError.missingURLTemplate(provider: config.name)
+        }
+
+        let encodedQueries = encodedSearchQueries(query)
+        let searchResult = await withTaskGroup(of: SearchTemplateResult.self) { group in
+            for hostTemplates in searchTemplateGroups() {
+                group.addTask {
+                    await self.searchTemplateGroup(
+                        hostTemplates,
+                        encodedQueries: encodedQueries,
+                        onProgress: onProgress
+                    )
+                }
+            }
+
+            var collectedResults: [TorrentSearchResult] = []
+            var lastError: Error?
+            for await result in group {
+                if !result.results.isEmpty {
+                    if self.prefersFirstUsableTemplateGroup {
+                        group.cancelAll()
+                        return result
+                    }
+                    collectedResults.append(contentsOf: result.results)
+                }
+                if let error = result.error {
+                    lastError = error
+                }
+            }
+
+            if !collectedResults.isEmpty {
+                return SearchTemplateResult(results: collectedResults, error: nil)
+            }
+
+            return SearchTemplateResult(results: [], error: lastError)
+        }
+
+        if let error = searchResult.error {
+            throw error
+        }
+        return searchResult.results
+    }
+
+    public func resolveMagnet(for result: TorrentSearchResult) async throws -> String? {
+        if let magnet = result.magnet, !magnet.isEmpty {
+            return magnet
+        }
+        guard let detailURL = result.detailURL,
+              let magnetPattern = config.magnetPattern else {
+            return nil
+        }
+        let html = try await fetchText(
+            detailURL,
+            referer: sameSiteHomeURL(for: detailURL),
+            timeoutSeconds: 35
+        )
+        return RegexTools.firstCapture(pattern: magnetPattern, in: html)?.htmlDecoded
+    }
+
+    public func fetchDetailMetadata(for result: TorrentSearchResult) async throws -> TorrentDetailMetadata? {
+        guard let detailURL = result.detailURL else { return nil }
+        guard config.detailMetadataPattern != nil || config.magnetPattern != nil else { return nil }
+
+        let html = try await fetchText(
+            detailURL,
+            referer: sameSiteHomeURL(for: detailURL),
+            timeoutSeconds: 35
+        )
+        let metadataText = combinedDetailMetadata(from: html)
+        let magnet = result.magnet?.isEmpty == false
+            ? result.magnet
+            : config.magnetPattern.flatMap { RegexTools.firstCapture(pattern: $0, in: html) }?.htmlDecoded
+
+        let specs = TorrentDetailSpecParser.parse(
+            metadataText,
+            detailTitle: extractDetailPageTitle(from: html),
+            fallbackTitle: result.title
+        )
+        guard metadataText?.isEmpty == false || magnet?.isEmpty == false else { return nil }
+        return TorrentDetailMetadata(text: metadataText, specs: specs, magnet: magnet)
+    }
+
+    private var allSearchURLTemplates: [String] {
+        [config.searchURLTemplate] + config.alternateSearchURLTemplates
+    }
+
+    private var prefersFirstUsableTemplateGroup: Bool {
+        config.id == "1337x"
+    }
+
+    private func searchTemplateGroups() -> [[String]] {
+        let grouped = Dictionary(grouping: allSearchURLTemplates) { template in
+            URL(string: template)?.host ?? template
+        }
+
+        return grouped
+            .sorted { lhs, rhs in
+                let lhsIsPrimary = lhs.value.contains(config.searchURLTemplate)
+                let rhsIsPrimary = rhs.value.contains(config.searchURLTemplate)
+                if lhsIsPrimary != rhsIsPrimary {
+                    return lhsIsPrimary && !rhsIsPrimary
+                }
+                return lhs.key < rhs.key
+            }
+            .map(\.value)
+    }
+
+    private func searchTemplateGroup(
+        _ templates: [String],
+        encodedQueries: [String],
+        onProgress: (@concurrent @Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)?
+    ) async -> SearchTemplateResult {
+        await withTaskGroup(of: SearchTemplateResult.self) { group in
+            for encodedQuery in encodedQueries {
+                for template in templates {
+                    group.addTask {
+                        do {
+                            let results = try await self.fetchSearchResults(
+                                template: template,
+                                encodedQuery: encodedQuery,
+                                onProgress: onProgress
+                            )
+                            return SearchTemplateResult(results: results, error: nil)
+                        } catch {
+                            return SearchTemplateResult(results: [], error: error)
+                        }
+                    }
+                }
+            }
+
+            var collectedResults: [TorrentSearchResult] = []
+            var lastError: Error?
+            for await result in group {
+                if !result.results.isEmpty {
+                    collectedResults.append(contentsOf: result.results)
+                    if self.prefersFirstUsableTemplateGroup {
+                        // 1337x can have many slow/blocked templates; once any template yields parseable
+                        // rows we return immediately and cancel the rest.
+                        group.cancelAll()
+                        return SearchTemplateResult(results: collectedResults, error: nil)
+                    }
+                }
+                if let error = result.error {
+                    lastError = error
+                }
+            }
+
+            if !collectedResults.isEmpty {
+                return SearchTemplateResult(results: collectedResults, error: nil)
+            }
+            return SearchTemplateResult(results: [], error: lastError)
+        }
+    }
+
+    private func fetchSearchResults(
+        template: String,
+        encodedQuery: String,
+        onProgress: (@concurrent @Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)?
+    ) async throws -> [TorrentSearchResult] {
+        let pageCount = searchPageCount(for: template)
+        let requestTimeoutSeconds = searchRequestTimeoutSeconds()
+
+        if pageCount == 1 {
+            let url = try searchURL(template: template, encodedQuery: encodedQuery, page: 1)
+            let html = try await fetchText(url, timeoutSeconds: requestTimeoutSeconds)
+            let blocks = RegexTools.captureMatches(pattern: config.resultBlockPattern, in: html)
+            return try await parseResults(from: blocks, sourceURL: url, onProgress: onProgress)
+        }
+
+        let pageFetch = await withTaskGroup(of: SearchPageEvent.self) { group in
+            for page in 1...pageCount {
+                group.addTask {
+                    do {
+                        let url = try self.searchURL(template: template, encodedQuery: encodedQuery, page: page)
+                        let html = try await self.fetchText(url, timeoutSeconds: requestTimeoutSeconds)
+                        let blocks = RegexTools.captureMatches(pattern: self.config.resultBlockPattern, in: html)
+                        return .page(SearchPageResult(page: page, results: try await self.parseResults(from: blocks, sourceURL: url, onProgress: onProgress), errorMessage: nil))
+                    } catch {
+                        return .page(SearchPageResult(page: page, results: [], errorMessage: self.errorMessage(from: error)))
+                    }
+                }
+            }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(self.searchCollectionTimeoutSeconds()) * 1_000_000_000)
+                return .timeout
+            }
+
+            var resultsByPage: [Int: [TorrentSearchResult]] = [:]
+            var pagesSeen: Set<Int> = []
+            var firstErrorMessage: String?
+            var hitCollectionTimeout = false
+            for await event in group {
+                switch event {
+                case .page(let result):
+                    resultsByPage[result.page] = result.results
+                    pagesSeen.insert(result.page)
+                    if firstErrorMessage == nil {
+                        firstErrorMessage = result.errorMessage
+                    }
+                    if pagesSeen.count >= pageCount {
+                        // All page fetches have completed; don't wait for the collection timeout task.
+                        group.cancelAll()
+                    }
+                case .timeout:
+                    hitCollectionTimeout = true
+                    group.cancelAll()
+                }
+            }
+
+            return (
+                results: (1...pageCount).flatMap { resultsByPage[$0] ?? [] },
+                firstErrorMessage: firstErrorMessage,
+                hitCollectionTimeout: hitCollectionTimeout
+            )
+        }
+
+        if !pageFetch.results.isEmpty {
+            return pageFetch.results
+        }
+        if pageFetch.hitCollectionTimeout {
+            throw ProviderError.timedOut(provider: config.name, seconds: searchCollectionTimeoutSeconds())
+        }
+        if let firstErrorMessage = pageFetch.firstErrorMessage {
+            throw ProviderError.accessBlocked(provider: config.name, reason: firstErrorMessage)
+        }
+        return []
+    }
+
+    private func searchPageCount(for template: String) -> Int {
+        guard template.contains("{{page}}") else { return 1 }
+        return max(1, config.searchPageCount ?? 1)
+    }
+
+    private func searchURL(template: String, encodedQuery: String, page: Int) throws -> URL {
+        let urlString = template
+            .replacingOccurrences(of: "{{query}}", with: encodedQuery)
+            .replacingOccurrences(of: "{{page}}", with: String(page))
+        guard let url = URL(string: urlString) else {
+            throw ProviderError.invalidURL(urlString)
+        }
+        return url
+    }
+
+    private func parseResults(
+        from blocks: [String],
+        sourceURL: URL,
+        onProgress: (@concurrent @Sendable (_ addedResults: [TorrentSearchResult]) async -> Void)?
+    ) async throws -> [TorrentSearchResult] {
+        var results: [TorrentSearchResult] = []
+        for block in blocks {
+            guard let title = RegexTools.firstCapture(pattern: config.titlePattern, in: block)?.htmlDecoded.cleanedText,
+                  !title.isEmpty else { continue }
+
+            let seedersCapture = RegexTools.firstCapture(pattern: config.seedersPattern, in: block)
+            let leechersCapture = RegexTools.firstCapture(pattern: config.leechersPattern, in: block)
+            let parsedSeeders = seedersCapture.flatMap(Int.init)
+            let parsedLeechers = leechersCapture.flatMap(Int.init)
+
+            let seeders = parsedSeeders ?? 0
+            let leechers = parsedLeechers ?? 0
+
+            // Only apply this low-activity drop heuristic when we successfully parsed both values.
+            // Some providers change markup; defaulting to 0/0 and then dropping silently causes false-empty searches.
+            if parsedSeeders != nil && parsedLeechers != nil {
+                guard !(seeders == 0 && leechers < 2) else { continue }
+            }
+            let size = config.sizePattern.flatMap { RegexTools.firstCapture(pattern: $0, in: block) }?.htmlDecoded.cleanedText
+
+            let inlineMagnet = config.magnetPattern.flatMap { RegexTools.firstCapture(pattern: $0, in: block) }?.htmlDecoded
+            let detailURL = extractDetailURL(from: block, sourceURL: sourceURL)
+
+            let magnet: String?
+            if let inlineMagnet {
+                magnet = inlineMagnet
+            } else if config.fetchMagnetFromDetailDuringSearch, let detailURL, let magnetPattern = config.magnetPattern {
+                let detailHTML = try? await fetchText(detailURL, referer: sameSiteHomeURL(for: detailURL))
+                magnet = detailHTML.flatMap { RegexTools.firstCapture(pattern: magnetPattern, in: $0) }?.htmlDecoded
+            } else {
+                magnet = nil
+            }
+
+            let result = TorrentSearchResult(
+                title: title,
+                magnet: magnet,
+                detailURL: detailURL,
+                seeders: seeders,
+                leechers: leechers,
+                provider: config.name,
+                size: size
+            )
+            results.append(result)
+        }
+        if let onProgress, !results.isEmpty {
+            await onProgress(results)
+        }
+        return results
+    }
+
+    private func fetchText(_ url: URL, referer: URL? = nil, timeoutSeconds: Int? = nil) async throws -> String {
+        do {
+            let (data, response) = try await session.data(for: makeRequest(url: url, referer: referer, timeoutSeconds: timeoutSeconds))
+            return try validateResponse(data: data, response: response)
+        } catch let error as ProviderError {
+            if case .badStatus(_, 403) = error, let retried = try await retryAfterBootstrap(url: url) {
+                return retried
+            }
+            throw error
+        }
+    }
+
+    private func retryAfterBootstrap(url: URL) async throws -> String? {
+        guard let host = url.host,
+              let scheme = url.scheme,
+              let homeURL = URL(string: "\(scheme)://\(host)/") else {
+            return nil
+        }
+
+        let bootstrapRequest = makeRequest(url: homeURL, referer: homeURL)
+        _ = try? await session.data(for: bootstrapRequest)
+
+        let retriedRequest = makeRequest(url: url, referer: homeURL)
+        let (data, response) = try await session.data(for: retriedRequest)
+        return try validateResponse(data: data, response: response)
+    }
+
+    private func makeRequest(url: URL, referer: URL? = nil, timeoutSeconds: Int? = nil) -> URLRequest {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = TimeInterval(timeoutSeconds ?? config.timeoutSeconds ?? 20)
+        request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+        request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+        request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
+        request.setValue("gzip, deflate, br", forHTTPHeaderField: "Accept-Encoding")
+        request.setValue("keep-alive", forHTTPHeaderField: "Connection")
+        request.setValue("1", forHTTPHeaderField: "Upgrade-Insecure-Requests")
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        request.setValue("no-cache", forHTTPHeaderField: "Pragma")
+        if let referer {
+            request.setValue(referer.absoluteString, forHTTPHeaderField: "Referer")
+        }
+        return request
+    }
+
+    private func validateResponse(data: Data, response: URLResponse) throws -> String {
+        if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+            throw ProviderError.badStatus(provider: config.name, status: http.statusCode)
+        }
+        let html = String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
+        if html.contains("cf-mitigated") || html.contains("Just a moment...") || html.contains("challenges.cloudflare.com") {
+            throw ProviderError.accessBlocked(provider: config.name, reason: "Cloudflare challenge")
+        }
+        return html
+    }
+
+    private func errorMessage(from error: Error) -> String {
+        (error as? LocalizedError)?.errorDescription ?? String(describing: error)
+    }
+
+    private func extractDetailURL(from block: String, sourceURL: URL) -> URL? {
+        guard let pattern = config.detailURLPattern,
+              let raw = RegexTools.firstCapture(pattern: pattern, in: block)?.htmlDecoded,
+              !raw.isEmpty else { return nil }
+        if let absolute = URL(string: raw), absolute.scheme != nil { return absolute }
+        let baseURL = sameSiteHomeURL(for: sourceURL) ?? config.detailBaseURL.flatMap(URL.init(string:))
+        guard let baseURL else { return nil }
+        return URL(string: raw, relativeTo: baseURL)?.absoluteURL
+    }
+
+    private func extractDetailMetadata(from html: String) -> String? {
+        guard let pattern = config.detailMetadataPattern,
+              let raw = RegexTools.firstCapture(pattern: pattern, in: html)?.htmlDecoded.readableMetadataText,
+              Self.looksLikeUsefulDetailMetadata(raw) else { return nil }
+        return raw
+    }
+
+    private func combinedDetailMetadata(from html: String) -> String? {
+        let primary = extractDetailMetadata(from: html) ?? fallbackDetailMetadata(from: html)
+        let fileList = extractFileListMetadata(from: html)
+        return [primary, fileList]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty }
+            .uniquedPreservingOrder()
+            .joined(separator: "\n\n")
+            .nilIfEmpty
+    }
+
+    private func extractFileListMetadata(from html: String) -> String? {
+        let candidates = [
+            #"<(?:div|section|table|ul|ol)[^>]+(?:id|class)=[\"'][^\"']*(?:file[\s_-]?list|files?|torrent[\s_-]?files?)[^\"']*[\"'][^>]*>([\s\S]*?)</(?:div|section|table|ul|ol)>"#,
+            #"(?i)((?:file\s*list|files?\s*(?:in|inside)?\s*torrent)[\s\S]{0,3000})"#
+        ]
+
+        let blocks = candidates.flatMap { RegexTools.captureMatches(pattern: $0, in: html) }
+        let filenames = blocks
+            .flatMap(Self.releaseFilenames)
+            .uniquedPreservingOrder()
+
+        guard !filenames.isEmpty else { return nil }
+        return (["File list"] + filenames).joined(separator: "\n")
+    }
+
+    private func fallbackDetailMetadata(from html: String) -> String? {
+        let candidates = [
+            #"<a\s+name=[\"']description[\"'][^>]*>[\s\S]*?(?:<legend[^>]*>[\s\S]*?</legend>)?([\s\S]*?)(?=<a\s+name=[\"']usercomments[\"']|<div[^>]+id=[\"']usercomments[\"']|$)"#,
+            #"<pre[^>]*>([\s\S]*?)</pre>"#,
+            #"<textarea[^>]*>([\s\S]*?)</textarea>"#,
+            #"<div[^>]+(?:id|class)=[\"'][^\"']*(?:file[\s_-]?list|files?)[^\"']*[\"'][^>]*>([\s\S]*?)</div>"#,
+            #"<section[^>]+(?:id|class)=[\"'][^\"']*(?:file[\s_-]?list|files?)[^\"']*[\"'][^>]*>([\s\S]*?)</section>"#,
+            #"<table[^>]+(?:id|class)=[\"'][^\"']*(?:file[\s_-]?list|files?)[^\"']*[\"'][^>]*>([\s\S]*?)</table>"#,
+            #"<div[^>]+(?:id|class)=[\"'][^\"']*(?:media[\s_-]?info|nfo|description|technical|file[\s_-]?info|torrent[\s_-]?info)[^\"']*[\"'][^>]*>([\s\S]*?)</div>"#,
+            #"<section[^>]+(?:id|class)=[\"'][^\"']*(?:media[\s_-]?info|nfo|description|technical|file[\s_-]?info|torrent[\s_-]?info)[^\"']*[\"'][^>]*>([\s\S]*?)</section>"#
+        ]
+
+        let bestBlock = candidates
+            .flatMap { RegexTools.captureMatches(pattern: $0, in: html) }
+            .map { $0.htmlDecoded.readableMetadataText }
+            .filter(Self.looksLikeUsefulDetailMetadata)
+            .max { Self.metadataSignalScore($0) < Self.metadataSignalScore($1) }
+
+        if let bestBlock {
+            return bestBlock
+        }
+
+        let pageText = RegexTools.firstCapture(pattern: #"<body[^>]*>([\s\S]*?)</body>"#, in: html)?
+            .htmlDecoded
+            .readableMetadataText
+        guard let pageText,
+              Self.looksLikeUsefulDetailMetadata(pageText) else { return nil }
+        return pageText
+    }
+
+    private func extractDetailPageTitle(from html: String) -> String? {
+        let candidates = [
+            #"<h1[^>]*>([\s\S]*?)</h1>"#,
+            #"<h2[^>]*>([\s\S]*?)</h2>"#,
+            #"<title[^>]*>([\s\S]*?)</title>"#
+        ]
+
+        return candidates
+            .compactMap { RegexTools.firstCapture(pattern: $0, in: html)?.htmlDecoded.readableMetadataText.cleanedDetailPageTitle }
+            .first { !$0.isEmpty }
+    }
+
+    private static func looksLikeUsefulDetailMetadata(_ text: String) -> Bool {
+        let normalized = text.lowercased()
+        guard text.count >= 40 else { return false }
+        guard !isBoilerplateDetailText(normalized) else { return false }
+        return [
+            "mediainfo", "media info", "general", "video", "audio", "duration",
+            "bit rate", "bitrate", "codec", "format", "resolution", "width",
+            "height", "frame rate", "channel", "hdr", "dolby", "dts", "truehd",
+            ".mkv", ".mp4", ".m2ts", ".avi", "1080p", "2160p", "720p", "bluray",
+            "web-dl", "webdl", "webrip", "remux"
+        ].contains { normalized.contains($0) } ||
+            normalized.range(of: #"(^|[^a-z0-9])web[\s._-]?dl([^a-z0-9]|$)"#, options: .regularExpression) != nil
+    }
+
+    private static func isBoilerplateDetailText(_ normalized: String) -> Bool {
+        [
+            "your report will be reviewed",
+            "moderation team",
+            "report this torrent",
+            "report torrent",
+            "dmca",
+            "captcha"
+        ].contains { normalized.contains($0) }
+    }
+
+    private static func metadataSignalScore(_ text: String) -> Int {
+        let normalized = text.lowercased()
+        let signals = [
+            "mediainfo", "media info", "general", "video", "audio", "duration",
+            "bit rate", "bitrate", "codec", "format", "resolution", "width",
+            "height", "frame rate", "channel", "hdr", "dolby", "dts", "truehd",
+            ".mkv", ".mp4", ".m2ts", ".avi", "1080p", "2160p", "720p", "bluray",
+            "web-dl", "webdl", "webrip", "remux"
+        ]
+        let webDLScore = normalized.range(of: #"(^|[^a-z0-9])web[\s._-]?dl([^a-z0-9]|$)"#, options: .regularExpression) != nil ? 1 : 0
+        return signals.reduce(0) { score, signal in
+            score + (normalized.contains(signal) ? 1 : 0)
+        } + webDLScore + min(text.count / 500, 10)
+    }
+
+    private static func releaseFilenames(from raw: String) -> [String] {
+        raw.htmlDecoded.readableMetadataText
+            .components(separatedBy: .newlines)
+            .flatMap { line in
+                RegexTools.captureMatches(
+                    pattern: #"(?i)([A-Za-z0-9][A-Za-z0-9 ._\-\[\]\(\)'&,:]{8,240}\.(?:mkv|mp4|m4v|avi|mov|ts|m2ts))"#,
+                    in: line
+                )
+            }
+            .map { $0.trimmingCharacters(in: CharacterSet(charactersIn: " \t\r\n-:|")) }
+            .filter { filename in
+                let lower = filename.lowercased()
+                return !lower.contains("sample") &&
+                    !lower.contains("trailer") &&
+                    !lower.contains("proof") &&
+                    !lower.contains("screenshot")
+            }
+    }
+
+    private func sameSiteHomeURL(for url: URL) -> URL? {
+        guard let scheme = url.scheme, let host = url.host else { return nil }
+        return URL(string: "\(scheme)://\(host)/")
+    }
+
+    private func encodedSearchQueries(_ query: String) -> [String] {
+        searchQueryVariants(query)
+            .map { $0.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? $0 }
+            .uniquedPreservingOrder()
+    }
+
+    private func searchQueryVariants(_ query: String) -> [String] {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return [query] }
+        guard config.id == "1337x" else { return [trimmed] }
+
+        let withoutTrailingYear = trimmed
+            .replacingOccurrences(
+                of: #"\s*(?:\(\s*)?(?:19|20)\d{2}(?:\s*\))?\s*$"#,
+                with: "",
+                options: .regularExpression
+            )
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let providerQuery = withoutTrailingYear.isEmpty ? trimmed : withoutTrailingYear
+        let tokens = providerQuery.components(separatedBy: .whitespacesAndNewlines).filter { !$0.isEmpty }
+        guard tokens.count > 1,
+              ["a", "an", "the"].contains(tokens[0].lowercased()) else {
+            return [providerQuery]
+        }
+
+        return [providerQuery, tokens.dropFirst().joined(separator: " ")]
+    }
+
+    private func searchRequestTimeoutSeconds() -> Int {
+        let providerTimeout = config.timeoutSeconds ?? 20
+        return max(5, providerTimeout - 2)
+    }
+
+    private func searchCollectionTimeoutSeconds() -> Int {
+        let providerTimeout = config.timeoutSeconds ?? 20
+        return max(5, providerTimeout - 3)
+    }
+}
+
+private struct SearchPageResult: Sendable {
+    let page: Int
+    let results: [TorrentSearchResult]
+    let errorMessage: String?
+}
+
+private enum SearchPageEvent: Sendable {
+    case page(SearchPageResult)
+    case timeout
+}
+
+private struct SearchTemplateResult: Sendable {
+    let results: [TorrentSearchResult]
+    let error: Error?
+}
+
+private extension Array where Element: Hashable {
+    func uniquedPreservingOrder() -> [Element] {
+        var seen = Set<Element>()
+        return filter { seen.insert($0).inserted }
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? {
+        let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
