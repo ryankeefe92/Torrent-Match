@@ -141,6 +141,9 @@ struct MovieSearchView: View {
                         result: result,
                         metadataStatus: detailMetadataStatuses[result.id] ?? .notStarted,
                         navigationDirection: detailNavigationDirection,
+                        downloadTitle: transmissionButtonTitle,
+                        isDownloading: isSendingToTransmission,
+                        onDownload: { sendToTransmission(result) },
                         onPrevious: showPreviousPresentedResult,
                         onNext: showNextPresentedResult
                     )
@@ -290,6 +293,10 @@ struct MovieSearchView: View {
 
     private func sendSelectedToTransmission() {
         guard let selected else { return }
+        sendToTransmission(selected)
+    }
+
+    private func sendToTransmission(_ result: SearchResult) {
         let endpoints: [TransmissionEndpoint]
         do {
             endpoints = try makeTransmissionEndpoints()
@@ -307,11 +314,11 @@ struct MovieSearchView: View {
 
             do {
                 transmissionSendPhase = .fetchingMagnet
-                let magnet = try await resolvedMagnet(for: selected)
+                let magnet = try await resolvedMagnet(for: result)
                 transmissionSendPhase = .connecting
                 try await addMagnetToTransmission(magnet, using: endpoints)
                 await transmissionStore.refreshDownloads()
-                showAlert(title: "Download Started", message: "\(selected.title) has begun downloading.")
+                showAlert(title: "Download Started", message: "\(result.title) has begun downloading.")
             } catch {
                 let presentation = transmissionErrorPresentation(for: error, phase: transmissionSendPhase)
                 showAlert(title: presentation.title, message: presentation.message)
@@ -1926,6 +1933,9 @@ private struct ResultDetailPagerView: View {
     let result: SearchResult
     let metadataStatus: DetailMetadataFetchStatus
     let navigationDirection: Int
+    let downloadTitle: String
+    let isDownloading: Bool
+    var onDownload: () -> Void
     var onPrevious: () -> Void
     var onNext: () -> Void
 
@@ -1942,6 +1952,9 @@ private struct ResultDetailPagerView: View {
             ResultDetailView(
                 result: result,
                 metadataStatus: metadataStatus,
+                downloadTitle: downloadTitle,
+                isDownloading: isDownloading,
+                onDownload: onDownload,
                 onPrevious: onPrevious,
                 onNext: onNext
             )
@@ -1960,6 +1973,9 @@ private struct ResultDetailPagerView: View {
 private struct ResultDetailView: View {
     let result: SearchResult
     let metadataStatus: DetailMetadataFetchStatus
+    let downloadTitle: String
+    let isDownloading: Bool
+    var onDownload: () -> Void
     var onPrevious: () -> Void
     var onNext: () -> Void
 
@@ -1980,6 +1996,12 @@ private struct ResultDetailView: View {
                                     .font(.callout)
                             }
                         }
+                        Spacer(minLength: 12)
+                        Button(action: onDownload) {
+                            Label(downloadTitle, systemImage: "arrow.down.circle.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(isDownloading)
                     }
                 }
 

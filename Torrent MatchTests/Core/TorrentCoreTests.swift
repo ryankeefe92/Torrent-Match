@@ -729,6 +729,16 @@ struct Torrent_MatchTests {
         #expect(parsed.sourceType == .webdl)
     }
 
+    @Test func parserTreatsBareWebReleaseTokenAsWebDL() {
+        let parsed = ReleaseParser.parse("Movie 2025 1080p WEB DDP5 1 H264-GROUP")
+        #expect(parsed.sourceType == .webdl)
+    }
+
+    @Test func parserDoesNotTreatWebInMovieTitleAsWebDL() {
+        let parsed = ReleaseParser.parse("The Web 1995 1080p H264-GROUP")
+        #expect(parsed.sourceType == .unknown)
+    }
+
     @Test func parserTreatsCAMRipAsCAMSource() {
         let parsed = ReleaseParser.parse("Movie.2025.1080p.CAMRip.x264-GROUP")
         #expect(parsed.sourceType == .cam)

@@ -56,6 +56,8 @@ public enum ReleaseParser {
             sourceType = .hdtv
         } else if containsAnyToken(["HDCAM", "CAMRIP", "CAM RIP", "CAM", "TELESYNC", "TS", "TELECINE", "TC"], in: upper) {
             sourceType = .cam
+        } else if containsBareWebSourceToken(in: upper) {
+            sourceType = .webdl
         } else {
             sourceType = .unknown
         }
@@ -218,6 +220,30 @@ public enum ReleaseParser {
     private static func containsWebDL(in text: String) -> Bool {
         matches(#"(^|[^A-Z0-9])WEB[\s._-]+DL([^A-Z0-9]|$)"#, in: text) ||
             matches(#"(^|[^A-Z0-9])WEBDL([^A-Z0-9]|$)"#, in: text)
+    }
+
+    /// A bare WEB source tag is usually adjacent to release metadata. Requiring
+    /// that context keeps titles such as "The Web 1995 1080p" from becoming WEB-DL.
+    private static func containsBareWebSourceToken(in text: String) -> Bool {
+        let pattern = #"(^|[^A-Z0-9])WEB(?=$|[^A-Z0-9])"#
+        guard let expression = try? NSRegularExpression(pattern: pattern) else { return false }
+        let range = NSRange(text.startIndex..., in: text)
+
+        return expression.matches(in: text, range: range).contains { match in
+            guard let tokenRange = Range(match.range, in: text) else { return false }
+            let prefix = String(text[..<tokenRange.lowerBound])
+            let suffix = String(text[tokenRange.upperBound...])
+            let hasReleaseMetadataBefore = matches(
+                #"(?:2160P|1080P|720P|576P|540P|480P|4K|UHD)(?:$|[^A-Z0-9])"#,
+                in: prefix
+            )
+            let hasYearBefore = matches(#"(?:19|20)\d{2}(?:$|[^0-9])"#, in: prefix)
+            let hasReleaseMetadataAfter = matches(
+                #"(?:2160P|1080P|720P|576P|540P|480P|4K|UHD|AV1|HEVC|X26[45]|H[ .]?26[45]|HDR(?:10(?:\+|PLUS)?)?|DOVI|DDP?|TRUEHD|DTS)(?:$|[^A-Z0-9])"#,
+                in: suffix
+            )
+            return hasReleaseMetadataBefore || (hasYearBefore && hasReleaseMetadataAfter)
+        }
     }
 
     private static func containsNonDownscaled4K(in text: String) -> Bool {
